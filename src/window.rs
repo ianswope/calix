@@ -1,7 +1,11 @@
-use crate::date_util::{month_start, shift_months, shift_weeks, week_dates, week_start};
+use crate::date_util::{
+    month_grid_bounds, month_start, shift_months, shift_weeks, week_bounds, week_dates, week_start,
+};
+use crate::event_dialog;
+use crate::store::{self, Event, Store};
 use crate::views::{month_view, week_view};
 use adw::prelude::*;
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use gtk::glib;
 use gtk::glib::clone;
 use std::cell::{Cell, RefCell};
@@ -37,13 +41,6 @@ impl State {
         }
     }
 
-    fn build_page(&self, date: NaiveDate) -> gtk::Widget {
-        match self.view_mode {
-            ViewMode::Month => month_view::build(date),
-            ViewMode::Week => week_view::build(date),
-        }
-    }
-
     fn title(&self) -> String {
         match self.view_mode {
             ViewMode::Month => self.period_anchor().format("%B %Y").to_string(),
@@ -66,6 +63,7 @@ struct Ui {
     carousel: adw::Carousel,
     title_label: gtk::Label,
     state: Rc<RefCell<State>>,
+    store: Rc<Store>,
     rebuilding: Rc<Cell<bool>>,
 }
 
@@ -78,7 +76,7 @@ impl Ui {
     /// wrong page the rest). `append` on an empty carousel making position
     /// 0 correct by construction, then `prepend`ing `prev`, sidesteps the
     /// bug entirely: no jump is ever requested, only structural inserts.
-    fn reset(&self) {
+    fn reset(self: &Rc<Self>) {
         self.rebuilding.set(true);
 
         let mut child = self.carousel.first_child();
@@ -89,12 +87,16 @@ impl Ui {
         }
 
         let state = self.state.borrow();
+        let view_mode = state.view_mode;
         let anchor = state.period_anchor();
-        let current_page = state.build_page(anchor);
-        let prev_page = state.build_page(state.shift_from(anchor, -1));
-        let next_page = state.build_page(state.shift_from(anchor, 1));
+        let prev_date = state.shift_from(anchor, -1);
+        let next_date = state.shift_from(anchor, 1);
         let title = state.title();
         drop(state);
+
+        let current_page = self.build_page(view_mode, anchor);
+        let prev_page = self.build_page(view_mode, prev_date);
+        let next_page = self.build_page(view_mode, next_date);
 
         self.carousel.append(&current_page);
         self.carousel.prepend(&prev_page);
@@ -102,6 +104,57 @@ impl Ui {
 
         self.rebuilding.set(false);
         self.title_label.set_label(&title);
+    }
+
+    /// Builds one page (month grid or week grid) for `date`, wired up to
+    /// query this page's events from the store and to open the event
+    /// dialog on create/edit clicks.
+    fn build_page(self: &Rc<Self>, view_mode: ViewMode, date: NaiveDate) -> gtk::Widget {
+        let on_create: Rc<dyn Fn(DateTime<Local>)> = {
+            let ui = self.clone();
+            Rc::new(move |start: DateTime<Local>| {
+                let calendar_id = ui.store.default_calendar_id();
+                let ui_for_saved = ui.clone();
+                event_dialog::open(&ui.carousel, ui.store.clone(), calendar_id, None, start, move || {
+                    ui_for_saved.reset()
+                });
+            })
+        };
+        let on_edit: Rc<dyn Fn(Event)> = {
+            let ui = self.clone();
+            Rc::new(move |event: Event| {
+                let calendar_id = event.calendar_id;
+                let start = event.start;
+                let ui_for_saved = ui.clone();
+                event_dialog::open(
+                    &ui.carousel,
+                    ui.store.clone(),
+                    calendar_id,
+                    Some(event),
+                    start,
+                    move || ui_for_saved.reset(),
+                );
+            })
+        };
+
+        match view_mode {
+            ViewMode::Month => {
+                let (range_start, range_end) = month_grid_bounds(date);
+                let events = self
+                    .store
+                    .events_between(store::day_start(range_start), store::day_start(range_end))
+                    .unwrap_or_default();
+                month_view::build(date, &events, on_create, on_edit)
+            }
+            ViewMode::Week => {
+                let (range_start, range_end) = week_bounds(date);
+                let events = self
+                    .store
+                    .events_between(store::day_start(range_start), store::day_start(range_end))
+                    .unwrap_or_default();
+                week_view::build(date, &events, on_create, on_edit)
+            }
+        }
     }
 }
 
@@ -117,10 +170,13 @@ pub fn build(app: &adw::Application) {
         .vexpand(true)
         .build();
 
+    let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
+
     let ui = Rc::new(Ui {
         carousel: carousel.clone(),
         title_label: gtk::Label::builder().css_classes(["title"]).build(),
         state,
+        store,
         // Guards against `page-changed`/`toggled` firing (and reentering
         // `rebuild`) as a side effect of our own programmatic changes.
         rebuilding: Rc::new(Cell::new(false)),
@@ -147,11 +203,27 @@ pub fn build(app: &adw::Application) {
     view_toggle_box.append(&month_toggle);
     view_toggle_box.append(&week_toggle);
 
+    let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
+    new_event_button.set_tooltip_text(Some("New Event"));
+    new_event_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        move |_| {
+            let calendar_id = ui.store.default_calendar_id();
+            let start = next_half_hour();
+            let ui2 = ui.clone();
+            event_dialog::open(&ui.carousel, ui.store.clone(), calendar_id, None, start, move || {
+                ui2.reset()
+            });
+        }
+    ));
+
     let header = adw::HeaderBar::new();
     header.pack_start(&today_button);
     header.pack_start(&nav_box);
     header.set_title_widget(Some(&ui.title_label));
     header.pack_end(&view_toggle_box);
+    header.pack_end(&new_event_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -283,4 +355,17 @@ fn connect_handlers(
             }
         }
     ));
+}
+
+/// Now, rounded up to the next :00 or :30 — a sensible default start time
+/// for a brand new event created via the header button (as opposed to
+/// clicking a specific day/slot, which uses that exact time instead).
+fn next_half_hour() -> DateTime<Local> {
+    use chrono::Timelike;
+    let now = Local::now();
+    let minutes_to_add = 30 - (now.minute() % 30);
+    (now + chrono::Duration::minutes(minutes_to_add as i64))
+        .with_second(0)
+        .and_then(|dt| dt.with_nanosecond(0))
+        .unwrap_or(now)
 }

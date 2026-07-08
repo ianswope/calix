@@ -2,6 +2,8 @@ use adw::prelude::*;
 use gtk::glib;
 
 mod date_util;
+mod event_dialog;
+mod store;
 mod style;
 mod views;
 mod window;
