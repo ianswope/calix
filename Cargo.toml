@@ -8,3 +8,9 @@ adw = { version = "0.9.2", package = "libadwaita", features = ["v1_9"] }
 gtk = { version = "0.11.4", package = "gtk4", features = ["v4_22"] }
 chrono = "0.4"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+oauth2 = { version = "5.0.0", features = ["reqwest-blocking"] }
+serde_json = "1.0.150"
+url = "2.5.8"
+keyring = { version = "4.1.4", default-features = false, features = ["v1", "zbus-secret-service-keyring-store"] }
