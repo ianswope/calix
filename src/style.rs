@@ -26,6 +26,31 @@ const CSS: &str = "
 .now-line {
     background-color: @destructive_bg_color;
 }
+
+.event-chip {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 6px;
+    padding: 1px 6px;
+    margin: 0 4px;
+    font-size: 0.85em;
+}
+
+.event-chip label {
+    color: @accent_fg_color;
+}
+
+.event-block {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 6px;
+    padding: 2px 6px;
+    font-size: 0.85em;
+}
+
+.event-block label {
+    color: @accent_fg_color;
+}
 ";
 
 pub fn load() {

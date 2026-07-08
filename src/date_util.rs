@@ -27,6 +27,18 @@ pub fn month_grid(date: NaiveDate) -> [NaiveDate; 42] {
     std::array::from_fn(|i| grid_start + chrono::Duration::days(i as i64))
 }
 
+/// Half-open [start, end) date range covering everything `month_grid` shows.
+pub fn month_grid_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let grid = month_grid(date);
+    (grid[0], grid[41] + chrono::Duration::days(1))
+}
+
+/// Half-open [start, end) date range covering the week containing `date`.
+pub fn week_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let start = week_start(date);
+    (start, start + chrono::Duration::days(7))
+}
+
 /// Shift `date` forward (delta > 0) or backward (delta < 0) by whole months,
 /// clamping the day-of-month if the target month is shorter.
 pub fn shift_months(date: NaiveDate, delta: i32) -> NaiveDate {
