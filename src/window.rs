@@ -1,7 +1,9 @@
+use crate::config::Config;
 use crate::date_util::{
     month_grid_bounds, month_start, shift_months, shift_weeks, week_bounds, week_dates, week_start,
 };
 use crate::event_dialog;
+use crate::google;
 use crate::store::{self, Event, Store};
 use crate::views::{month_view, week_view};
 use adw::prelude::*;
@@ -10,6 +12,8 @@ use gtk::glib;
 use gtk::glib::clone;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -62,8 +66,10 @@ impl State {
 struct Ui {
     carousel: adw::Carousel,
     title_label: gtk::Label,
+    toast_overlay: adw::ToastOverlay,
     state: Rc<RefCell<State>>,
     store: Rc<Store>,
+    config: Rc<Config>,
     rebuilding: Rc<Cell<bool>>,
 }
 
@@ -175,8 +181,10 @@ pub fn build(app: &adw::Application) {
     let ui = Rc::new(Ui {
         carousel: carousel.clone(),
         title_label: gtk::Label::builder().css_classes(["title"]).build(),
+        toast_overlay: adw::ToastOverlay::new(),
         state,
         store,
+        config: Rc::new(Config::load()),
         // Guards against `page-changed`/`toggled` firing (and reentering
         // `rebuild`) as a side effect of our own programmatic changes.
         rebuilding: Rc::new(Cell::new(false)),
@@ -218,23 +226,36 @@ pub fn build(app: &adw::Application) {
         }
     ));
 
+    let google_button = gtk::Button::new();
+    set_google_button_label(&google_button);
+    google_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        google_button,
+        move |_| connect_or_disconnect_google(&ui, &google_button)
+    ));
+
     let header = adw::HeaderBar::new();
     header.pack_start(&today_button);
     header.pack_start(&nav_box);
     header.set_title_widget(Some(&ui.title_label));
     header.pack_end(&view_toggle_box);
     header.pack_end(&new_event_button);
+    header.pack_end(&google_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&carousel));
+
+    ui.toast_overlay.set_child(Some(&toolbar_view));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Calix")
         .default_width(1100)
         .default_height(750)
-        .content(&toolbar_view)
+        .content(&ui.toast_overlay)
         .build();
 
     window.present();
@@ -368,4 +389,83 @@ fn next_half_hour() -> DateTime<Local> {
         .with_second(0)
         .and_then(|dt| dt.with_nanosecond(0))
         .unwrap_or(now)
+}
+
+fn set_google_button_label(button: &gtk::Button) {
+    if google::oauth::has_saved_account() {
+        button.set_label("Google Connected");
+    } else {
+        button.set_label("Connect Google");
+    }
+}
+
+/// If no Google account is connected yet, runs the full OAuth sign-in flow
+/// (opens the browser, waits for the redirect, stores the refresh token)
+/// and verifies it by fetching the account's calendar list. If one is
+/// already connected, disconnects it instead. The network/browser-waiting
+/// part runs on a background thread — GTK widgets aren't `Send`, so the
+/// result comes back over a channel polled from a main-thread timeout
+/// rather than being touched directly from that thread.
+fn connect_or_disconnect_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
+    let Some(google_config) = ui.config.google.clone() else {
+        ui.toast_overlay.add_toast(adw::Toast::new(
+            "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
+        ));
+        return;
+    };
+
+    if google::oauth::has_saved_account() {
+        google::oauth::sign_out();
+        set_google_button_label(google_button);
+        ui.toast_overlay.add_toast(adw::Toast::new("Disconnected Google account"));
+        return;
+    }
+
+    google_button.set_sensitive(false);
+    google_button.set_label("Connecting…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<usize, String> {
+            google::oauth::sign_in(&google_config).map_err(|e| e.to_string())?;
+            let token = google::oauth::get_access_token(&google_config)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "no access token after sign-in".to_string())?;
+            let calendars = google::calendar_api::list_calendars(&token).map_err(|e| e.to_string())?;
+            Ok(calendars.len())
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            google_button,
+            move || match rx.try_recv() {
+                Ok(Ok(count)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Connected — found {count} calendar(s)")));
+                    set_google_button_label(&google_button);
+                    google_button.set_sensitive(true);
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Google sign-in failed: {error}")));
+                    set_google_button_label(&google_button);
+                    google_button.set_sensitive(true);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    set_google_button_label(&google_button);
+                    google_button.set_sensitive(true);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
 }
