@@ -399,6 +399,15 @@ fn next_half_hour() -> DateTime<Local> {
         .unwrap_or(now)
 }
 
+/// Google API errors carry the full HTML error page as their body; showing
+/// all of that in a toast is unreadable (and was actually crashing the
+/// toast's markup parser on the `<html lang=e...>` tag). Just the first
+/// line — `Google API error (404 Not Found): <!DOCTYPE html>` — is plenty
+/// to identify what went wrong.
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or(s)
+}
+
 fn set_google_button_label(button: &gtk::Button) {
     if google::oauth::has_saved_account() {
         button.set_label("Sync Google");
@@ -465,8 +474,9 @@ fn connect_or_sync_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Google sync failed: {error}")));
+                    ui.toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(
+                        &format!("Google sync failed: {}", first_line(&error)),
+                    )));
                     set_google_button_label(&google_button);
                     google_button.set_sensitive(true);
                     glib::ControlFlow::Break
