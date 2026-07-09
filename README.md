@@ -97,10 +97,6 @@ This file lives outside the repo and is never read by anything that gets committ
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
 - `src/icloud/` — CalDAV discovery/sync for iCloud calendars using an Apple app-specific password stored in the system keyring.
 
-### A carousel gotcha worth knowing
-
-Page navigation deliberately avoids `AdwCarousel::scroll_to()`. In the libadwaita version this was built against, `scroll_to()` is unreliable when the target widget was just appended in the same call — it silently leaves the carousel on the wrong page some fraction of the time rather than erroring. Instead, `Ui::reset()` in `window.rs` clears the carousel and repopulates it via `append` (making position 0 correct by construction, since it's the only child) followed by `prepend` for the previous page — no jump is ever requested, so there's nothing to fail.
-
 ## Roadmap
 
 - [x] Swipeable month/week grid

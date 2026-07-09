@@ -57,6 +57,10 @@ pub fn open(
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
+    let calendar_name = editing
+        .as_ref()
+        .map(|event| event.calendar_name.clone())
+        .unwrap_or_else(|| "Local".to_string());
 
     match &editing {
         Some(ev) => {
@@ -75,6 +79,12 @@ pub fn open(
     }
 
     let group = adw::PreferencesGroup::new();
+    let calendar_row = adw::ActionRow::builder()
+        .title("Calendar")
+        .subtitle(gtk::glib::markup_escape_text(&calendar_name))
+        .build();
+    calendar_row.set_subtitle_lines(1);
+    group.add(&calendar_row);
     group.add(&title_row);
     group.add(&all_day_row);
     group.add(&start_row);
