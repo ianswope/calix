@@ -56,7 +56,11 @@ pub fn build(
     // Land on a sensible starting scroll position (a couple hours before
     // now, or 8 AM for weeks that don't include today) once layout settles.
     let scroll_hour = if days.contains(&today) {
-        today.and_time(Local::now().time()).time().hour().saturating_sub(2)
+        today
+            .and_time(Local::now().time())
+            .time()
+            .hour()
+            .saturating_sub(2)
     } else {
         8
     };
@@ -180,15 +184,12 @@ fn day_column(
             24.0
         };
         let top = (start_h * HOUR_ROW_HEIGHT as f64).round() as i32;
-        let height =
-            (((end_h - start_h) * HOUR_ROW_HEIGHT as f64).round() as i32).max(MIN_EVENT_BLOCK_HEIGHT);
+        let height = (((end_h - start_h) * HOUR_ROW_HEIGHT as f64).round() as i32)
+            .max(MIN_EVENT_BLOCK_HEIGHT);
 
-        let block = gtk::Button::builder()
-            .label(event.title.as_str())
-            .css_classes(["event-block"])
-            .valign(gtk::Align::Start)
-            .halign(gtk::Align::Fill)
-            .build();
+        let block = event_button(event.title.as_str(), "event-block");
+        block.set_valign(gtk::Align::Start);
+        block.set_halign(gtk::Align::Fill);
         block.set_margin_top(top);
         block.set_size_request(-1, height);
         block.set_margin_start(2);
@@ -211,4 +212,19 @@ fn hour_label(hour: u32) -> String {
         12 => "12 PM".to_string(),
         _ => format!("{} PM", hour - 12),
     }
+}
+
+fn event_button(title: &str, css_class: &str) -> gtk::Button {
+    let label = gtk::Label::new(None);
+    label.set_markup(&gtk::glib::markup_escape_text(title));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_single_line_mode(true);
+    label.set_width_chars(1);
+
+    let button = gtk::Button::builder().label("").css_classes([css_class]).build();
+    button.set_label("");
+    button.set_child(Some(&label));
+    button
 }

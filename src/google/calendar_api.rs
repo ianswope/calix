@@ -9,6 +9,7 @@ pub struct CalendarListEntry {
     pub summary: String,
     #[serde(rename = "backgroundColor")]
     pub background_color: Option<String>,
+    pub primary: Option<bool>,
     /// Whether the user has this calendar shown in their Google Calendar
     /// UI. Missing means shown (Google omits it rather than send `true`
     /// for a calendar's default state in some cases); only an explicit
@@ -66,7 +67,9 @@ impl EventDateTime {
             return Some((parsed.with_timezone(&Local), false));
         }
         let date = NaiveDate::parse_from_str(self.date.as_deref()?, "%Y-%m-%d").ok()?;
-        let start_of_day = Local.from_local_datetime(&date.and_hms_opt(0, 0, 0)?).single()?;
+        let start_of_day = Local
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+            .single()?;
         Some((start_of_day, true))
     }
 }
@@ -91,7 +94,8 @@ pub fn list_events(
     // path's current last segment, so a trailing "/" here (an empty final
     // segment) would leave a stray "//" before `calendar_id` — which Google
     // 404s on.
-    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars").map_err(|e| e.to_string())?;
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars")
+        .map_err(|e| e.to_string())?;
     url.path_segments_mut()
         .map_err(|_| "invalid calendar API base URL".to_string())?
         .push(calendar_id)
@@ -104,7 +108,11 @@ pub fn list_events(
 
     let body = get(access_token, url.as_str())?;
     let parsed: EventListResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(parsed.items.into_iter().filter(|e| e.status != "cancelled").collect())
+    Ok(parsed
+        .items
+        .into_iter()
+        .filter(|e| e.status != "cancelled")
+        .collect())
 }
 
 fn get(access_token: &str, url: &str) -> Result<String, String> {

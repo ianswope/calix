@@ -1,3 +1,4 @@
+use crate::calendar_dialog;
 use crate::config::Config;
 use crate::date_util::{
     month_grid_bounds, month_start, shift_months, shift_weeks, week_bounds, week_dates, week_start,
@@ -65,6 +66,7 @@ impl State {
 /// they don't have to be threaded through as a long parameter list.
 struct Ui {
     carousel: adw::Carousel,
+    calendar_sidebar: gtk::Box,
     title_label: gtk::Label,
     toast_overlay: adw::ToastOverlay,
     state: Rc<RefCell<State>>,
@@ -112,6 +114,27 @@ impl Ui {
         self.title_label.set_label(&title);
     }
 
+    fn reset_calendar_sidebar(self: &Rc<Self>) {
+        let mut child = self.calendar_sidebar.first_child();
+        while let Some(widget) = child {
+            let next = widget.next_sibling();
+            self.calendar_sidebar.remove(&widget);
+            child = next;
+        }
+
+        let ui = self.clone();
+        self.calendar_sidebar.append(&calendar_dialog::build_list(
+            self.store.clone(),
+            move || {
+                let ui = ui.clone();
+                glib::idle_add_local_once(move || {
+                    ui.reset();
+                    ui.reset_calendar_sidebar();
+                });
+            },
+        ));
+    }
+
     /// Builds one page (month grid or week grid) for `date`, wired up to
     /// query this page's events from the store and to open the event
     /// dialog on create/edit clicks.
@@ -121,9 +144,14 @@ impl Ui {
             Rc::new(move |start: DateTime<Local>| {
                 let calendar_id = ui.store.default_calendar_id();
                 let ui_for_saved = ui.clone();
-                event_dialog::open(&ui.carousel, ui.store.clone(), calendar_id, None, start, move || {
-                    ui_for_saved.reset()
-                });
+                event_dialog::open(
+                    &ui.carousel,
+                    ui.store.clone(),
+                    calendar_id,
+                    None,
+                    start,
+                    move || ui_for_saved.reset(),
+                );
             })
         };
         let on_edit: Rc<dyn Fn(Event)> = {
@@ -183,11 +211,15 @@ pub fn build(app: &adw::Application) {
         .hexpand(true)
         .vexpand(true)
         .build();
+    let calendar_sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    calendar_sidebar.set_size_request(340, -1);
+    calendar_sidebar.add_css_class("calendar-sidebar");
 
     let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
 
     let ui = Rc::new(Ui {
         carousel: carousel.clone(),
+        calendar_sidebar: calendar_sidebar.clone(),
         title_label: gtk::Label::builder().css_classes(["title"]).build(),
         toast_overlay: adw::ToastOverlay::new(),
         state,
@@ -228,20 +260,53 @@ pub fn build(app: &adw::Application) {
             let calendar_id = ui.store.default_calendar_id();
             let start = next_half_hour();
             let ui2 = ui.clone();
-            event_dialog::open(&ui.carousel, ui.store.clone(), calendar_id, None, start, move || {
-                ui2.reset()
-            });
+            event_dialog::open(
+                &ui.carousel,
+                ui.store.clone(),
+                calendar_id,
+                None,
+                start,
+                move || ui2.reset(),
+            );
         }
     ));
 
-    let google_button = gtk::Button::new();
-    set_google_button_label(&google_button);
-    google_button.connect_clicked(clone!(
+    let google_sync_button = gtk::Button::with_label("Sync Google");
+    update_google_sync_button(&ui, &google_sync_button);
+    google_sync_button.connect_clicked(clone!(
         #[strong]
         ui,
         #[weak]
-        google_button,
-        move |_| connect_or_sync_google(&ui, &google_button)
+        google_sync_button,
+        move |_| sync_google_accounts(&ui, &google_sync_button)
+    ));
+
+    let google_add_button = gtk::Button::with_label("Add Google");
+    google_add_button.set_tooltip_text(Some("Connect another Google account"));
+    google_add_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        google_add_button,
+        #[weak]
+        google_sync_button,
+        move |_| add_google_account(&ui, &google_add_button, &google_sync_button)
+    ));
+
+    ui.reset_calendar_sidebar();
+
+    let calendars_button = gtk::ToggleButton::new();
+    calendars_button.set_child(Some(&gtk::Image::from_icon_name(
+        "x-office-calendar-symbolic",
+    )));
+    calendars_button.set_tooltip_text(Some("Show Calendars"));
+    calendars_button.set_active(true);
+    calendars_button.connect_clicked(clone!(
+        #[strong]
+        calendar_sidebar,
+        move |button| {
+            calendar_sidebar.set_visible(button.is_active());
+        }
     ));
 
     let header = adw::HeaderBar::new();
@@ -250,11 +315,19 @@ pub fn build(app: &adw::Application) {
     header.set_title_widget(Some(&ui.title_label));
     header.pack_end(&view_toggle_box);
     header.pack_end(&new_event_button);
-    header.pack_end(&google_button);
+    header.pack_end(&calendars_button);
+    header.pack_end(&google_sync_button);
+    header.pack_end(&google_add_button);
+
+    let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+    paned.set_start_child(Some(&calendar_sidebar));
+    paned.set_resize_start_child(false);
+    paned.set_shrink_start_child(false);
+    paned.set_end_child(Some(&carousel));
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&carousel));
+    toolbar_view.set_content(Some(&paned));
 
     ui.toast_overlay.set_child(Some(&toolbar_view));
 
@@ -408,29 +481,29 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }
 
-fn set_google_button_label(button: &gtk::Button) {
-    if google::oauth::has_saved_account() {
-        button.set_label("Sync Google");
-        button.set_tooltip_text(Some("Click to fetch the latest events from your Google calendars"));
+fn update_google_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
+    let account_count = ui
+        .store
+        .google_accounts()
+        .map(|accounts| accounts.len())
+        .unwrap_or(0);
+    button.set_sensitive(true);
+    button.set_tooltip_text(if account_count > 0 {
+        Some("Fetch the latest events from connected Google accounts")
     } else {
-        button.set_label("Connect Google");
-        button.set_tooltip_text(None);
-    }
+        Some("Fetch calendars from connected Google accounts")
+    });
 }
 
-/// If no Google account is connected yet, runs the full OAuth sign-in flow
-/// (opens the browser, waits for the redirect, stores the refresh token).
-/// Either way, then syncs: fetches every visible Google calendar and its
-/// events and upserts them into the local store, so this doubles as
-/// "connect" and "sync now" depending on prior state.
-///
-/// The network/browser-waiting part runs on a background thread — GTK
-/// widgets aren't `Send`, so the result comes back over a channel polled
-/// from a main-thread timeout rather than being touched directly from
-/// that thread. That thread opens its own `Store` (a fresh connection to
-/// the same database file) rather than sharing `ui.store`, since
-/// `rusqlite::Connection` isn't `Send` either.
-fn connect_or_sync_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
+struct GoogleAddResult {
+    display_name: String,
+    calendars_synced: usize,
+}
+
+/// Runs the interactive OAuth flow for a new Google account, identifies the
+/// signed-in account from its primary calendar, saves that account-specific
+/// refresh token, and immediately performs an initial sync.
+fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
     let Some(google_config) = ui.config.google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
@@ -438,21 +511,28 @@ fn connect_or_sync_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
         return;
     };
 
-    let already_connected = google::oauth::has_saved_account();
-    google_button.set_sensitive(false);
-    google_button.set_label(if already_connected { "Syncing…" } else { "Connecting…" });
+    add_button.set_sensitive(false);
+    add_button.set_label("Connecting…");
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<usize, String> {
-            if !already_connected {
-                google::oauth::sign_in(&google_config).map_err(|e| e.to_string())?;
-            }
-            let token = google::oauth::get_access_token(&google_config)
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "no access token after sign-in".to_string())?;
+        let result = (|| -> Result<GoogleAddResult, String> {
+            let tokens = google::oauth::sign_in(&google_config).map_err(|e| e.to_string())?;
+            let (provider_account_id, display_name) =
+                google::sync::account_identity(&tokens.access_token)?;
+            let token_key = google::oauth::token_key(&provider_account_id);
             let store = Store::open().map_err(|e| e.to_string())?;
-            google::sync::sync(&token, &store)
+            let account_id = store
+                .upsert_google_account(&provider_account_id, &display_name, &token_key)
+                .map_err(|e| e.to_string())?;
+            google::oauth::save_refresh_token(&token_key, &tokens.refresh_token)
+                .map_err(|e| e.to_string())?;
+            let calendars_synced =
+                google::sync::sync_account(&tokens.access_token, &store, account_id)?;
+            Ok(GoogleAddResult {
+                display_name,
+                calendars_synced,
+            })
         })();
         let _ = tx.send(result);
     });
@@ -463,28 +543,140 @@ fn connect_or_sync_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
             #[strong]
             ui,
             #[strong]
-            google_button,
+            add_button,
+            #[strong]
+            sync_button,
             move || match rx.try_recv() {
-                Ok(Ok(count)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Synced {count} calendar(s)")));
-                    set_google_button_label(&google_button);
-                    google_button.set_sensitive(true);
+                Ok(Ok(result)) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Added {} and synced {} calendar(s)",
+                        result.display_name, result.calendars_synced
+                    )));
+                    add_button.set_label("Add Google");
+                    add_button.set_sensitive(true);
+                    update_google_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
                     ui.reset();
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(
-                        &format!("Google sync failed: {}", first_line(&error)),
-                    )));
-                    set_google_button_label(&google_button);
-                    google_button.set_sensitive(true);
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "Google connect failed: {}",
+                            first_line(&error)
+                        ))));
+                    add_button.set_label("Add Google");
+                    add_button.set_sensitive(true);
+                    update_google_sync_button(&ui, &sync_button);
                     glib::ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    set_google_button_label(&google_button);
-                    google_button.set_sensitive(true);
+                    add_button.set_label("Add Google");
+                    add_button.set_sensitive(true);
+                    update_google_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
+}
+
+/// Syncs every connected Google account. The network work runs on a
+/// background thread; the thread opens its own SQLite connection because
+/// `Store` wraps a `rusqlite::Connection`, which is not `Send`.
+fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+    let Some(google_config) = ui.config.google.clone() else {
+        ui.toast_overlay.add_toast(adw::Toast::new(
+            "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
+        ));
+        return;
+    };
+
+    sync_button.set_sensitive(false);
+    sync_button.set_label("Syncing…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(usize, usize), String> {
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let mut accounts = store.google_accounts().map_err(|e| e.to_string())?;
+            if accounts.is_empty() {
+                if let Some(token) = google::oauth::get_access_token(
+                    &google_config,
+                    google::oauth::legacy_token_key(),
+                )
+                .map_err(|e| e.to_string())?
+                {
+                    let (provider_account_id, display_name) =
+                        google::sync::account_identity(&token)?;
+                    let token_key = google::oauth::token_key(&provider_account_id);
+                    google::oauth::copy_refresh_token(
+                        google::oauth::legacy_token_key(),
+                        &token_key,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    store
+                        .upsert_google_account(&provider_account_id, &display_name, &token_key)
+                        .map_err(|e| e.to_string())?;
+                    accounts = store.google_accounts().map_err(|e| e.to_string())?;
+                }
+            }
+            if accounts.is_empty() {
+                return Err("No Google accounts connected. Use Add Google first.".to_string());
+            }
+            let account_count = accounts.len();
+            let mut calendar_count = 0;
+
+            for account in accounts {
+                let token = google::oauth::get_access_token(&google_config, &account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing saved token for {} ({})",
+                            account.display_name, account.provider_account_id
+                        )
+                    })?;
+                calendar_count += google::sync::sync_account(&token, &store, account.id)?;
+            }
+
+            Ok((account_count, calendar_count))
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            sync_button,
+            move || match rx.try_recv() {
+                Ok(Ok((account_count, calendar_count))) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Synced {calendar_count} calendar(s) from {account_count} account(s)"
+                    )));
+                    sync_button.set_label("Sync Google");
+                    update_google_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
+                    ui.reset();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "Google sync failed: {}",
+                            first_line(&error)
+                        ))));
+                    sync_button.set_label("Sync Google");
+                    update_google_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    sync_button.set_label("Sync Google");
+                    update_google_sync_button(&ui, &sync_button);
                     glib::ControlFlow::Break
                 }
             }

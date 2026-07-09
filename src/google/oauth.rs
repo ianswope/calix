@@ -10,10 +10,16 @@ use std::net::TcpListener;
 use url::Url;
 
 const KEYRING_SERVICE: &str = "com.ianswope.Calix";
-const KEYRING_USERNAME: &str = "google-refresh-token";
+const KEYRING_USERNAME_PREFIX: &str = "google-refresh-token";
+const LEGACY_KEYRING_USERNAME: &str = "google-refresh-token";
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
+
+pub struct SignInTokens {
+    pub access_token: String,
+    pub refresh_token: String,
+}
 
 #[derive(Debug)]
 pub enum AuthError {
@@ -35,27 +41,45 @@ impl std::fmt::Display for AuthError {
             }
             AuthError::StateMismatch => write!(f, "OAuth state mismatch (possible CSRF)"),
             AuthError::NoRefreshToken => {
-                write!(f, "Google didn't return a refresh token — try disconnecting and reconnecting")
+                write!(
+                    f,
+                    "Google didn't return a refresh token — try disconnecting and reconnecting"
+                )
             }
             AuthError::Keyring(e) => write!(f, "couldn't access the system keyring: {e}"),
         }
     }
 }
 
-fn keyring_entry() -> Result<keyring::Entry, AuthError> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USERNAME).map_err(AuthError::Keyring)
+fn keyring_entry(token_key: &str) -> Result<keyring::Entry, AuthError> {
+    keyring::Entry::new(KEYRING_SERVICE, token_key).map_err(AuthError::Keyring)
 }
 
-pub fn has_saved_account() -> bool {
-    keyring_entry().and_then(|e| e.get_password().map_err(AuthError::Keyring)).is_ok()
+pub fn token_key(provider_account_id: &str) -> String {
+    format!("{KEYRING_USERNAME_PREFIX}:{provider_account_id}")
+}
+
+pub fn legacy_token_key() -> &'static str {
+    LEGACY_KEYRING_USERNAME
+}
+
+pub fn copy_refresh_token(from_token_key: &str, to_token_key: &str) -> Result<bool, AuthError> {
+    let from_entry = keyring_entry(from_token_key)?;
+    let refresh_token = match from_entry.get_password() {
+        Ok(token) => token,
+        Err(keyring::Error::NoEntry) => return Ok(false),
+        Err(e) => return Err(AuthError::Keyring(e)),
+    };
+    save_refresh_token(to_token_key, &refresh_token)?;
+    Ok(true)
 }
 
 // Not wired into any UI yet — there's no "disconnect" action in the
 // header, just connect/sync. Kept ready for whenever a settings view
 // exists to put it in.
 #[allow(dead_code)]
-pub fn sign_out() {
-    if let Ok(entry) = keyring_entry() {
+pub fn sign_out(token_key: &str) {
+    if let Ok(entry) = keyring_entry(token_key) {
         let _ = entry.delete_credential();
     }
 }
@@ -67,7 +91,7 @@ pub fn sign_out() {
 /// This blocks the calling thread on network I/O and the user's browser
 /// interaction — always call it from a background thread, never the GTK
 /// main thread.
-pub fn sign_in(config: &GoogleConfig) -> Result<(), AuthError> {
+pub fn sign_in(config: &GoogleConfig) -> Result<SignInTokens, AuthError> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(AuthError::Io)?;
     let port = listener.local_addr().map_err(AuthError::Io)?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
@@ -106,18 +130,27 @@ pub fn sign_in(config: &GoogleConfig) -> Result<(), AuthError> {
         .map_err(|e| AuthError::Oauth(e.to_string()))?;
 
     let refresh_token = token.refresh_token().ok_or(AuthError::NoRefreshToken)?;
-    keyring_entry()?
-        .set_password(refresh_token.secret())
-        .map_err(AuthError::Keyring)?;
 
-    Ok(())
+    Ok(SignInTokens {
+        access_token: token.access_token().secret().clone(),
+        refresh_token: refresh_token.secret().clone(),
+    })
+}
+
+pub fn save_refresh_token(token_key: &str, refresh_token: &str) -> Result<(), AuthError> {
+    keyring_entry(token_key)?
+        .set_password(refresh_token)
+        .map_err(AuthError::Keyring)
 }
 
 /// Exchanges the saved refresh token for a fresh access token. Returns
 /// `Ok(None)` if no account has been connected yet. Blocks on network I/O —
 /// call from a background thread.
-pub fn get_access_token(config: &GoogleConfig) -> Result<Option<String>, AuthError> {
-    let entry = keyring_entry()?;
+pub fn get_access_token(
+    config: &GoogleConfig,
+    token_key: &str,
+) -> Result<Option<String>, AuthError> {
+    let entry = keyring_entry(token_key)?;
     let refresh_token = match entry.get_password() {
         Ok(token) => token,
         Err(keyring::Error::NoEntry) => return Ok(None),
