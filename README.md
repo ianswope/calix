@@ -10,6 +10,7 @@ Requires a Rust toolchain and GTK4 + libadwaita development headers (on Arch: `g
 
 ```sh
 cargo build
+cargo test
 cargo run
 ```
 
@@ -28,6 +29,14 @@ Google requires every app to bring its own OAuth client — there's no shared on
    client_secret = "your-client-secret"
    ```
 6. Run Calix and click **Add Google** in the header. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
+
+If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
+
+## Using Calendars
+
+The left sidebar lists local calendars and synced Google calendars. Use the switch next to each calendar to show or hide it in the month/week grid. Google calendars are currently read-only in Calix, but their visibility choice is local and is preserved across later syncs.
+
+The calendar button in the header toggles the sidebar. **Sync Google** refreshes calendars and events for all connected Google accounts.
 
 This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
 
