@@ -14,6 +14,36 @@ cargo test
 cargo run
 ```
 
+## Installing Locally
+
+For a user-local install from a checkout:
+
+```sh
+scripts/install-local.sh
+```
+
+This builds `target/release/calix` and installs:
+
+- `~/.local/bin/calix`
+- `~/.local/share/applications/com.ianswope.Calix.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg`
+
+Uninstall with:
+
+```sh
+scripts/uninstall-local.sh
+```
+
+## Release Tarball
+
+To build a Linux release archive:
+
+```sh
+scripts/build-release.sh
+```
+
+The archive is written to `target/dist/calix-<version>-linux-<arch>.tar.gz`. It contains the release binary, desktop entry, icon, docs, and an `install.sh` script that installs to `~/.local` by default. Users still need GTK4 + libadwaita runtime libraries available from their distribution.
+
 ## Connecting Google Calendar
 
 Google requires every app to bring its own OAuth client — there's no shared one you can just use. Setup takes about 10 minutes:
