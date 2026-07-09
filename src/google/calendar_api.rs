@@ -87,7 +87,11 @@ pub fn list_events(
     time_min: DateTime<Local>,
     time_max: DateTime<Local>,
 ) -> Result<Vec<EventItem>, String> {
-    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars/").map_err(|e| e.to_string())?;
+    // No trailing slash: `path_segments_mut().push()` appends *after* the
+    // path's current last segment, so a trailing "/" here (an empty final
+    // segment) would leave a stray "//" before `calendar_id` — which Google
+    // 404s on.
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars").map_err(|e| e.to_string())?;
     url.path_segments_mut()
         .map_err(|_| "invalid calendar API base URL".to_string())?
         .push(calendar_id)
