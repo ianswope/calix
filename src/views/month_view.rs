@@ -1,5 +1,6 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
+use crate::views::event_widget;
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
 use std::rc::Rc;
@@ -78,6 +79,9 @@ fn day_cell(
 ) -> gtk::Widget {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
     cell.add_css_class("month-cell");
+    if date == today {
+        cell.add_css_class("today-cell");
+    }
 
     let number_label = gtk::Label::new(Some(&date.day().to_string()));
     number_label.set_halign(gtk::Align::Start);
@@ -94,7 +98,7 @@ fn day_cell(
 
     let shown = day_events.len().min(MAX_CHIPS_PER_CELL);
     for event in &day_events[..shown] {
-        let chip = event_button(event.title.as_str(), "event-chip");
+        let chip = event_widget::event_button(event, "event-chip", 20);
         let ev = event.clone();
         let on_edit = on_edit.clone();
         chip.connect_clicked(move |_| on_edit(ev.clone()));
@@ -129,19 +133,4 @@ fn day_cell(
     cell.add_controller(click);
 
     cell.upcast()
-}
-
-fn event_button(title: &str, css_class: &str) -> gtk::Button {
-    let label = gtk::Label::new(None);
-    label.set_markup(&gtk::glib::markup_escape_text(title));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_single_line_mode(true);
-    label.set_width_chars(1);
-
-    let button = gtk::Button::builder().label("").css_classes([css_class]).build();
-    button.set_label("");
-    button.set_child(Some(&label));
-    button
 }

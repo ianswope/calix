@@ -6,6 +6,7 @@ mod config;
 mod date_util;
 mod event_dialog;
 mod google;
+mod icloud;
 mod store;
 mod style;
 mod views;

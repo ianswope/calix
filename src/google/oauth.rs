@@ -12,7 +12,10 @@ use url::Url;
 const KEYRING_SERVICE: &str = "com.ianswope.Calix";
 const KEYRING_USERNAME_PREFIX: &str = "google-refresh-token";
 const LEGACY_KEYRING_USERNAME: &str = "google-refresh-token";
-const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
+const SCOPES: [&str; 2] = [
+    "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+];
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
 
@@ -104,15 +107,18 @@ pub fn sign_in(config: &GoogleConfig) -> Result<SignInTokens, AuthError> {
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, csrf_token) = client
-        .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new(SCOPE.to_string()))
+    let mut auth_request = client.authorize_url(CsrfToken::new_random);
+    for scope in SCOPES {
+        auth_request = auth_request.add_scope(Scope::new(scope.to_string()));
+    }
+
+    let (auth_url, csrf_token) = auth_request
         .set_pkce_challenge(pkce_challenge)
         // offline + consent ensures Google actually issues a refresh token,
         // not just an access token — without these it only does on first
         // ever consent, which breaks re-connecting after a sign-out.
         .add_extra_param("access_type", "offline")
-        .add_extra_param("prompt", "consent")
+        .add_extra_param("prompt", "select_account consent")
         .url();
 
     open_in_browser(auth_url.as_str());

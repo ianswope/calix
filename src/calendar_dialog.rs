@@ -14,12 +14,66 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
     content.set_margin_start(18);
     content.set_margin_end(18);
 
-    match store.google_accounts() {
+    add_account_sections(
+        &content,
+        store.clone(),
+        on_changed.clone(),
+        "iCloud",
+        "icloud",
+    );
+    add_account_sections(
+        &content,
+        store.clone(),
+        on_changed.clone(),
+        "Google",
+        "google",
+    );
+
+    if let Ok(local_calendars) = store.local_calendars() {
+        if !local_calendars.is_empty() {
+            content.append(&calendar_group(
+                "On My Computer",
+                None,
+                local_calendars,
+                store.clone(),
+                on_changed.clone(),
+            ));
+        }
+    }
+
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&content)
+        .build()
+        .upcast()
+}
+
+fn add_account_sections(
+    content: &gtk::Box,
+    store: Rc<Store>,
+    on_changed: Rc<dyn Fn()>,
+    title: &str,
+    provider: &str,
+) {
+    let accounts = match provider {
+        "google" => store.google_accounts(),
+        "icloud" => store.icloud_accounts(),
+        _ => return,
+    };
+
+    match accounts {
         Ok(accounts) if accounts.is_empty() => {
-            let empty_group = adw::PreferencesGroup::builder().title("Google").build();
+            let empty_group = adw::PreferencesGroup::builder().title(title).build();
+            let account_name = if provider == "icloud" {
+                "iCloud"
+            } else {
+                "Google"
+            };
             let row = adw::ActionRow::builder()
-                .title("No Google accounts connected")
-                .subtitle("Use Add Google, or Sync Google to migrate an older connection")
+                .title(format!("No {account_name} accounts connected"))
+                .subtitle(format!("Use Add {account_name} to connect an account"))
                 .build();
             empty_group.add(&row);
             content.append(&empty_group);
@@ -31,11 +85,16 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
                 .filter_map(|account| store.calendars_for_account(account.id).ok())
                 .map(|calendars| calendars.len())
                 .sum::<usize>();
-            let summary_group = adw::PreferencesGroup::builder().title("Google").build();
+            let account_name = if provider == "icloud" {
+                "iCloud"
+            } else {
+                "Google"
+            };
+            let summary_group = adw::PreferencesGroup::builder().title(title).build();
             summary_group.add(
                 &adw::ActionRow::builder()
                     .title(format!(
-                        "{calendar_count} calendar{} from {account_count} account{}",
+                        "{calendar_count} calendar{} from {account_count} {account_name} account{}",
                         if calendar_count == 1 { "" } else { "s" },
                         if account_count == 1 { "" } else { "s" }
                     ))
@@ -64,26 +123,6 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
             content.append(&error_group);
         }
     }
-
-    if let Ok(local_calendars) = store.local_calendars() {
-        if !local_calendars.is_empty() {
-            content.append(&calendar_group(
-                "On My Computer",
-                None,
-                local_calendars,
-                store.clone(),
-                on_changed.clone(),
-            ));
-        }
-    }
-
-    gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .hexpand(true)
-        .vexpand(true)
-        .child(&content)
-        .build()
-        .upcast()
 }
 
 fn calendar_group(
@@ -118,10 +157,15 @@ fn calendar_group(
 }
 
 fn calendar_row(calendar: Calendar, store: Rc<Store>, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
-    let subtitle = match (calendar.read_only, calendar.google_calendar_id.as_deref()) {
-        (true, Some(_)) => "Read-only Google calendar",
-        (true, None) => "Read-only calendar",
-        (false, _) => "Local calendar",
+    let subtitle = match (
+        calendar.read_only,
+        calendar.google_calendar_id.as_deref(),
+        calendar.icloud_calendar_id.as_deref(),
+    ) {
+        (true, Some(_), _) => "Read-only Google calendar",
+        (true, _, Some(_)) => "Read-only iCloud calendar",
+        (true, _, _) => "Read-only calendar",
+        (false, _, _) => "Local calendar",
     };
 
     let row = adw::ActionRow::builder()

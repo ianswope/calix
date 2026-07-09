@@ -39,6 +39,11 @@ pub fn week_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
     (start, start + chrono::Duration::days(7))
 }
 
+/// Half-open [start, end) date range covering a single day.
+pub fn day_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
+    (date, date + chrono::Duration::days(1))
+}
+
 /// Shift `date` forward (delta > 0) or backward (delta < 0) by whole months,
 /// clamping the day-of-month if the target month is shorter.
 pub fn shift_months(date: NaiveDate, delta: i32) -> NaiveDate {
@@ -53,6 +58,11 @@ pub fn shift_months(date: NaiveDate, delta: i32) -> NaiveDate {
 /// Shift `date` forward/backward by whole weeks.
 pub fn shift_weeks(date: NaiveDate, delta: i32) -> NaiveDate {
     date + chrono::Duration::weeks(delta as i64)
+}
+
+/// Shift `date` forward/backward by whole days.
+pub fn shift_days(date: NaiveDate, delta: i32) -> NaiveDate {
+    date + chrono::Duration::days(delta as i64)
 }
 
 #[cfg(test)]
@@ -100,5 +110,11 @@ mod tests {
     fn shift_weeks_moves_by_seven_days() {
         assert_eq!(shift_weeks(d(2026, 7, 8), 1), d(2026, 7, 15));
         assert_eq!(shift_weeks(d(2026, 7, 8), -1), d(2026, 7, 1));
+    }
+
+    #[test]
+    fn shift_days_moves_by_one_day() {
+        assert_eq!(shift_days(d(2026, 7, 8), 1), d(2026, 7, 9));
+        assert_eq!(shift_days(d(2026, 7, 8), -1), d(2026, 7, 7));
     }
 }

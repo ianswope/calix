@@ -1,10 +1,12 @@
 use crate::calendar_dialog;
 use crate::config::Config;
 use crate::date_util::{
-    month_grid_bounds, month_start, shift_months, shift_weeks, week_bounds, week_dates, week_start,
+    day_bounds, month_grid_bounds, month_start, shift_days, shift_months, shift_weeks, week_bounds,
+    week_dates, week_start,
 };
 use crate::event_dialog;
 use crate::google;
+use crate::icloud;
 use crate::store::{self, Event, Store};
 use crate::views::{month_view, week_view};
 use adw::prelude::*;
@@ -20,6 +22,27 @@ use std::time::Duration;
 enum ViewMode {
     Month,
     Week,
+    Day,
+}
+
+impl ViewMode {
+    const SETTING_KEY: &'static str = "view_mode";
+
+    fn from_setting(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("day") => ViewMode::Day,
+            Some("week") => ViewMode::Week,
+            _ => ViewMode::Month,
+        }
+    }
+
+    fn as_setting(self) -> &'static str {
+        match self {
+            ViewMode::Month => "month",
+            ViewMode::Week => "week",
+            ViewMode::Day => "day",
+        }
+    }
 }
 
 struct State {
@@ -32,6 +55,7 @@ impl State {
         match self.view_mode {
             ViewMode::Month => month_start(self.current_date),
             ViewMode::Week => week_start(self.current_date),
+            ViewMode::Day => self.current_date,
         }
     }
 
@@ -43,6 +67,7 @@ impl State {
         match self.view_mode {
             ViewMode::Month => shift_months(date, delta),
             ViewMode::Week => shift_weeks(date, delta),
+            ViewMode::Day => shift_days(date, delta),
         }
     }
 
@@ -58,6 +83,7 @@ impl State {
                     format!("{} – {}", start.format("%b %-d"), end.format("%b %-d, %Y"))
                 }
             }
+            ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
         }
     }
 }
@@ -66,7 +92,7 @@ impl State {
 /// they don't have to be threaded through as a long parameter list.
 struct Ui {
     carousel: adw::Carousel,
-    calendar_sidebar: gtk::Box,
+    calendar_list: gtk::Box,
     title_label: gtk::Label,
     toast_overlay: adw::ToastOverlay,
     state: Rc<RefCell<State>>,
@@ -77,13 +103,7 @@ struct Ui {
 
 impl Ui {
     /// Clears the carousel and rebuilds it with prev/current/next pages
-    /// centered on the current period. Deliberately avoids `scroll_to`:
-    /// in this libadwaita version it's unreliable when the target was
-    /// just appended in the same call (confirmed by trial — it works
-    /// maybe half the time, silently leaving the carousel parked on the
-    /// wrong page the rest). `append` on an empty carousel making position
-    /// 0 correct by construction, then `prepend`ing `prev`, sidesteps the
-    /// bug entirely: no jump is ever requested, only structural inserts.
+    /// centered on the selected date.
     fn reset(self: &Rc<Self>) {
         self.rebuilding.set(true);
 
@@ -96,34 +116,47 @@ impl Ui {
 
         let state = self.state.borrow();
         let view_mode = state.view_mode;
-        let anchor = state.period_anchor();
-        let prev_date = state.shift_from(anchor, -1);
-        let next_date = state.shift_from(anchor, 1);
+        self.carousel.set_orientation(match view_mode {
+            ViewMode::Month => gtk::Orientation::Vertical,
+            ViewMode::Week | ViewMode::Day => gtk::Orientation::Horizontal,
+        });
+        let current_date = state.current_date;
+        let prev_date = state.shift_from(current_date, -1);
+        let next_date = state.shift_from(current_date, 1);
         let title = state.title();
         drop(state);
 
-        let current_page = self.build_page(view_mode, anchor);
+        let current_page = self.build_page(view_mode, current_date);
         let prev_page = self.build_page(view_mode, prev_date);
         let next_page = self.build_page(view_mode, next_date);
 
+        self.carousel.append(&prev_page);
         self.carousel.append(&current_page);
-        self.carousel.prepend(&prev_page);
         self.carousel.append(&next_page);
 
-        self.rebuilding.set(false);
         self.title_label.set_label(&title);
+
+        let ui = self.clone();
+        glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            ui.carousel.scroll_to(&current_page, false);
+            let ui = ui.clone();
+            glib::timeout_add_local_once(Duration::from_millis(50), move || {
+                ui.carousel.scroll_to(&current_page, false);
+                ui.rebuilding.set(false);
+            });
+        });
     }
 
     fn reset_calendar_sidebar(self: &Rc<Self>) {
-        let mut child = self.calendar_sidebar.first_child();
+        let mut child = self.calendar_list.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
-            self.calendar_sidebar.remove(&widget);
+            self.calendar_list.remove(&widget);
             child = next;
         }
 
         let ui = self.clone();
-        self.calendar_sidebar.append(&calendar_dialog::build_list(
+        self.calendar_list.append(&calendar_dialog::build_list(
             self.store.clone(),
             move || {
                 let ui = ui.clone();
@@ -157,12 +190,8 @@ impl Ui {
         let on_edit: Rc<dyn Fn(Event)> = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
-                if event.google_event_id.is_some() {
-                    // Editing would just get silently overwritten by the
-                    // next sync, so don't pretend it's supported.
-                    ui.toast_overlay.add_toast(adw::Toast::new(
-                        "Editing synced Google events isn't supported yet",
-                    ));
+                if event.google_event_id.is_some() || event.icloud_event_id.is_some() {
+                    event_dialog::open_read_only(&ui.carousel, event);
                     return;
                 }
                 let calendar_id = event.calendar_id;
@@ -196,13 +225,24 @@ impl Ui {
                     .unwrap_or_default();
                 week_view::build(date, &events, on_create, on_edit)
             }
+            ViewMode::Day => {
+                let (range_start, range_end) = day_bounds(date);
+                let events = self
+                    .store
+                    .events_between(store::day_start(range_start), store::day_start(range_end))
+                    .unwrap_or_default();
+                week_view::build_day(date, &events, on_create, on_edit)
+            }
         }
     }
 }
 
 pub fn build(app: &adw::Application) {
+    let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
+    let initial_view_mode =
+        ViewMode::from_setting(store.setting(ViewMode::SETTING_KEY).unwrap_or_default());
     let state = Rc::new(RefCell::new(State {
-        view_mode: ViewMode::Month,
+        view_mode: initial_view_mode,
         current_date: Local::now().date_naive(),
     }));
 
@@ -212,15 +252,21 @@ pub fn build(app: &adw::Application) {
         .vexpand(true)
         .build();
     let calendar_sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    calendar_sidebar.set_size_request(340, -1);
+    calendar_sidebar.set_size_request(300, -1);
+    calendar_sidebar.set_visible(false);
     calendar_sidebar.add_css_class("calendar-sidebar");
-
-    let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
+    let calendar_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    calendar_list.set_hexpand(true);
+    calendar_list.set_vexpand(true);
+    let title_label = gtk::Label::builder().css_classes(["title"]).build();
+    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title_label.set_width_chars(12);
+    title_label.set_max_width_chars(28);
 
     let ui = Rc::new(Ui {
         carousel: carousel.clone(),
-        calendar_sidebar: calendar_sidebar.clone(),
-        title_label: gtk::Label::builder().css_classes(["title"]).build(),
+        calendar_list: calendar_list.clone(),
+        title_label,
         toast_overlay: adw::ToastOverlay::new(),
         state,
         store,
@@ -240,16 +286,23 @@ pub fn build(app: &adw::Application) {
 
     let month_toggle = gtk::ToggleButton::builder()
         .label("Month")
-        .active(true)
+        .active(initial_view_mode == ViewMode::Month)
         .build();
     let week_toggle = gtk::ToggleButton::builder()
         .label("Week")
         .group(&month_toggle)
+        .active(initial_view_mode == ViewMode::Week)
+        .build();
+    let day_toggle = gtk::ToggleButton::builder()
+        .label("Day")
+        .group(&month_toggle)
+        .active(initial_view_mode == ViewMode::Day)
         .build();
     let view_toggle_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     view_toggle_box.add_css_class("linked");
     view_toggle_box.append(&month_toggle);
     view_toggle_box.append(&week_toggle);
+    view_toggle_box.append(&day_toggle);
 
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
@@ -293,6 +346,35 @@ pub fn build(app: &adw::Application) {
         move |_| add_google_account(&ui, &google_add_button, &google_sync_button)
     ));
 
+    let icloud_sync_button = gtk::Button::with_label("Sync iCloud");
+    update_icloud_sync_button(&ui, &icloud_sync_button);
+    icloud_sync_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        icloud_sync_button,
+        move |_| sync_icloud_accounts(&ui, &icloud_sync_button)
+    ));
+
+    let icloud_add_button = gtk::Button::with_label("Add iCloud");
+    icloud_add_button.set_tooltip_text(Some("Connect an iCloud account"));
+    icloud_add_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        icloud_add_button,
+        #[weak]
+        icloud_sync_button,
+        move |_| open_icloud_account_dialog(&ui, &icloud_add_button, &icloud_sync_button)
+    ));
+
+    calendar_sidebar.append(&sidebar_actions(
+        &google_add_button,
+        &google_sync_button,
+        &icloud_add_button,
+        &icloud_sync_button,
+    ));
+    calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
 
     let calendars_button = gtk::ToggleButton::new();
@@ -300,7 +382,7 @@ pub fn build(app: &adw::Application) {
         "x-office-calendar-symbolic",
     )));
     calendars_button.set_tooltip_text(Some("Show Calendars"));
-    calendars_button.set_active(true);
+    calendars_button.set_active(false);
     calendars_button.connect_clicked(clone!(
         #[strong]
         calendar_sidebar,
@@ -316,8 +398,6 @@ pub fn build(app: &adw::Application) {
     header.pack_end(&view_toggle_box);
     header.pack_end(&new_event_button);
     header.pack_end(&calendars_button);
-    header.pack_end(&google_sync_button);
-    header.pack_end(&google_add_button);
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_start_child(Some(&calendar_sidebar));
@@ -363,23 +443,91 @@ pub fn build(app: &adw::Application) {
         month_toggle,
         #[strong]
         week_toggle,
+        #[strong]
+        day_toggle,
         move |carousel, _clock| {
             if carousel.width() <= 0 {
                 return glib::ControlFlow::Continue;
             }
 
+            ui.state.borrow_mut().current_date = Local::now().date_naive();
             ui.reset();
-            connect_handlers(
-                &ui,
-                &today_button,
-                &prev_button,
-                &next_button,
-                &month_toggle,
-                &week_toggle,
+            glib::timeout_add_local_once(
+                Duration::from_millis(125),
+                clone!(
+                    #[strong]
+                    ui,
+                    #[strong]
+                    today_button,
+                    #[strong]
+                    prev_button,
+                    #[strong]
+                    next_button,
+                    #[strong]
+                    month_toggle,
+                    #[strong]
+                    week_toggle,
+                    #[strong]
+                    day_toggle,
+                    move || {
+                        connect_handlers(
+                            &ui,
+                            &today_button,
+                            &prev_button,
+                            &next_button,
+                            &month_toggle,
+                            &week_toggle,
+                            &day_toggle,
+                        );
+                    }
+                ),
             );
             glib::ControlFlow::Break
         }
     ));
+}
+
+fn sidebar_actions(
+    google_add_button: &gtk::Button,
+    google_sync_button: &gtk::Button,
+    icloud_add_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+) -> gtk::Widget {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    section.add_css_class("sidebar-actions");
+    section.set_margin_top(12);
+    section.set_margin_bottom(8);
+    section.set_margin_start(12);
+    section.set_margin_end(12);
+
+    let title = gtk::Label::new(Some("Accounts"));
+    title.add_css_class("caption-heading");
+    title.add_css_class("dim-label");
+    title.set_xalign(0.0);
+    section.append(&title);
+
+    let google_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    google_row.append(google_add_button);
+    google_row.append(google_sync_button);
+    section.append(&google_row);
+
+    let icloud_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    icloud_row.append(icloud_add_button);
+    icloud_row.append(icloud_sync_button);
+    section.append(&icloud_row);
+
+    for button in [
+        google_add_button,
+        google_sync_button,
+        icloud_add_button,
+        icloud_sync_button,
+    ] {
+        button.set_hexpand(true);
+        button.set_halign(gtk::Align::Fill);
+        button.add_css_class("sidebar-action-button");
+    }
+
+    section.upcast()
 }
 
 fn connect_handlers(
@@ -389,6 +537,7 @@ fn connect_handlers(
     next_button: &gtk::Button,
     month_toggle: &gtk::ToggleButton,
     week_toggle: &gtk::ToggleButton,
+    day_toggle: &gtk::ToggleButton,
 ) {
     ui.carousel.connect_page_changed(clone!(
         #[strong]
@@ -409,7 +558,8 @@ fn connect_handlers(
         #[strong]
         ui,
         move |_| {
-            ui.state.borrow_mut().current_date = Local::now().date_naive();
+            let today = Local::now().date_naive();
+            ui.state.borrow_mut().current_date = today;
             ui.reset();
         }
     ));
@@ -441,7 +591,7 @@ fn connect_handlers(
         ui,
         move |btn| {
             if btn.is_active() {
-                ui.state.borrow_mut().view_mode = ViewMode::Month;
+                set_view_mode(&ui, ViewMode::Month);
                 ui.reset();
             }
         }
@@ -452,11 +602,31 @@ fn connect_handlers(
         ui,
         move |btn| {
             if btn.is_active() {
-                ui.state.borrow_mut().view_mode = ViewMode::Week;
+                ui.state.borrow_mut().current_date = Local::now().date_naive();
+                set_view_mode(&ui, ViewMode::Week);
                 ui.reset();
             }
         }
     ));
+
+    day_toggle.connect_toggled(clone!(
+        #[strong]
+        ui,
+        move |btn| {
+            if btn.is_active() {
+                ui.state.borrow_mut().current_date = Local::now().date_naive();
+                set_view_mode(&ui, ViewMode::Day);
+                ui.reset();
+            }
+        }
+    ));
+}
+
+fn set_view_mode(ui: &Rc<Ui>, view_mode: ViewMode) {
+    ui.state.borrow_mut().view_mode = view_mode;
+    let _ = ui
+        .store
+        .set_setting(ViewMode::SETTING_KEY, view_mode.as_setting());
 }
 
 /// Now, rounded up to the next :00 or :30 — a sensible default start time
@@ -492,6 +662,20 @@ fn update_google_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
         Some("Fetch the latest events from connected Google accounts")
     } else {
         Some("Fetch calendars from connected Google accounts")
+    });
+}
+
+fn update_icloud_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
+    let account_count = ui
+        .store
+        .icloud_accounts()
+        .map(|accounts| accounts.len())
+        .unwrap_or(0);
+    button.set_sensitive(true);
+    button.set_tooltip_text(if account_count > 0 {
+        Some("Fetch the latest events from connected iCloud accounts")
+    } else {
+        Some("Fetch calendars from connected iCloud accounts")
     });
 }
 
@@ -575,6 +759,169 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
                     update_google_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
+}
+
+struct IcloudAddResult {
+    display_name: String,
+    calendars_synced: usize,
+}
+
+fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
+    let dialog = adw::Dialog::builder()
+        .title("Add iCloud")
+        .content_width(420)
+        .build();
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let connect_button = gtk::Button::builder()
+        .label("Connect")
+        .css_classes(["suggested-action"])
+        .build();
+
+    let header = adw::HeaderBar::new();
+    header.pack_start(&cancel_button);
+    header.pack_end(&connect_button);
+
+    let apple_id_row = adw::EntryRow::builder()
+        .title("Apple Account Email")
+        .build();
+    let password_row = adw::PasswordEntryRow::builder()
+        .title("App-Specific Password")
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+    group.add(&apple_id_row);
+    group.add(&password_row);
+
+    let note = gtk::Label::new(Some(
+        "Use an app-specific password from account.apple.com, not your Apple Account password.",
+    ));
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    note.add_css_class("dim-label");
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(&group);
+    content.append(&note);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar_view));
+
+    cancel_button.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+
+    connect_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[strong]
+        add_button,
+        #[strong]
+        sync_button,
+        #[weak]
+        dialog,
+        move |_| {
+            let apple_id = apple_id_row.text().trim().to_string();
+            let app_password = password_row.text().trim().to_string();
+            if apple_id.is_empty() || app_password.is_empty() {
+                return;
+            }
+            dialog.close();
+            add_icloud_account(&ui, &add_button, &sync_button, apple_id, app_password);
+        }
+    ));
+
+    dialog.present(Some(&ui.carousel));
+}
+
+fn add_icloud_account(
+    ui: &Rc<Ui>,
+    add_button: &gtk::Button,
+    sync_button: &gtk::Button,
+    apple_id: String,
+    app_password: String,
+) {
+    add_button.set_sensitive(false);
+    add_button.set_label("Connecting…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<IcloudAddResult, String> {
+            let credentials = icloud::caldav::Credentials {
+                apple_id: apple_id.clone(),
+                app_password,
+            };
+            icloud::caldav::discover_calendars(&credentials)?;
+
+            let token_key = icloud::credentials::token_key(&apple_id);
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let account_id = store
+                .upsert_icloud_account(&apple_id, &apple_id, &token_key)
+                .map_err(|e| e.to_string())?;
+            icloud::credentials::save_app_password(&token_key, &credentials.app_password)
+                .map_err(|e| e.to_string())?;
+            let calendars_synced = icloud::sync::sync_account(&credentials, &store, account_id)?;
+            Ok(IcloudAddResult {
+                display_name: apple_id,
+                calendars_synced,
+            })
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            add_button,
+            #[strong]
+            sync_button,
+            move || match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Added {} and synced {} iCloud calendar(s)",
+                        result.display_name, result.calendars_synced
+                    )));
+                    add_button.set_label("Add iCloud");
+                    add_button.set_sensitive(true);
+                    update_icloud_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
+                    ui.reset();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "iCloud connect failed: {}",
+                            first_line(&error)
+                        ))));
+                    add_button.set_label("Add iCloud");
+                    add_button.set_sensitive(true);
+                    update_icloud_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    add_button.set_label("Add iCloud");
+                    add_button.set_sensitive(true);
+                    update_icloud_sync_button(&ui, &sync_button);
                     glib::ControlFlow::Break
                 }
             }
@@ -677,6 +1024,82 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     sync_button.set_label("Sync Google");
                     update_google_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
+}
+
+fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+    sync_button.set_sensitive(false);
+    sync_button.set_label("Syncing…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(usize, usize), String> {
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let accounts = store.icloud_accounts().map_err(|e| e.to_string())?;
+            if accounts.is_empty() {
+                return Err("No iCloud accounts connected. Use Add iCloud first.".to_string());
+            }
+
+            let account_count = accounts.len();
+            let mut calendar_count = 0;
+            for account in accounts {
+                let app_password = icloud::credentials::app_password(&account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "missing saved app-specific password for {}",
+                            account.display_name
+                        )
+                    })?;
+                let credentials = icloud::caldav::Credentials {
+                    apple_id: account.provider_account_id.clone(),
+                    app_password,
+                };
+                calendar_count += icloud::sync::sync_account(&credentials, &store, account.id)?;
+            }
+
+            Ok((account_count, calendar_count))
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            sync_button,
+            move || match rx.try_recv() {
+                Ok(Ok((account_count, calendar_count))) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Synced {calendar_count} iCloud calendar(s) from {account_count} account(s)"
+                    )));
+                    sync_button.set_label("Sync iCloud");
+                    update_icloud_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
+                    ui.reset();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "iCloud sync failed: {}",
+                            first_line(&error)
+                        ))));
+                    sync_button.set_label("Sync iCloud");
+                    update_icloud_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    sync_button.set_label("Sync iCloud");
+                    sync_button.set_sensitive(true);
+                    update_icloud_sync_button(&ui, &sync_button);
                     glib::ControlFlow::Break
                 }
             }
