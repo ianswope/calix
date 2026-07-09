@@ -19,15 +19,15 @@ pub struct Event {
     pub calendar_name: String,
     pub calendar_color: String,
     pub account_provider: Option<String>,
+    pub account_provider_id: Option<String>,
+    pub account_token_key: Option<String>,
+    pub google_calendar_id: Option<String>,
     pub title: String,
     pub start: DateTime<Local>,
     pub end: DateTime<Local>,
     pub all_day: bool,
     pub location: Option<String>,
     pub notes: Option<String>,
-    /// `Some` for events synced from a remote provider — editing these
-    /// locally isn't supported yet (a sync would just overwrite the edit),
-    /// so the UI uses this to show them read-only.
     pub google_event_id: Option<String>,
     pub icloud_event_id: Option<String>,
 }
@@ -349,7 +349,9 @@ impl Store {
     ) -> rusqlite::Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT events.id, events.calendar_id, calendars.name, calendars.color,
-                    accounts.provider, events.title, events.start_at,
+                    accounts.provider, accounts.provider_account_id, accounts.token_key,
+                    calendars.google_calendar_id,
+                    events.title, events.start_at,
                     events.end_at, events.all_day, events.location, events.notes,
                     events.google_event_id, events.icloud_event_id
              FROM events
@@ -598,22 +600,25 @@ fn ensure_column(
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
-    let start_at: String = row.get(6)?;
-    let end_at: String = row.get(7)?;
+    let start_at: String = row.get(9)?;
+    let end_at: String = row.get(10)?;
     Ok(Event {
         id: row.get(0)?,
         calendar_id: row.get(1)?,
         calendar_name: row.get(2)?,
         calendar_color: row.get(3)?,
         account_provider: row.get(4)?,
-        title: row.get(5)?,
+        account_provider_id: row.get(5)?,
+        account_token_key: row.get(6)?,
+        google_calendar_id: row.get(7)?,
+        title: row.get(8)?,
         start: parse_rfc3339(&start_at),
         end: parse_rfc3339(&end_at),
-        all_day: row.get::<_, i64>(8)? != 0,
-        location: row.get(9)?,
-        notes: row.get(10)?,
-        google_event_id: row.get(11)?,
-        icloud_event_id: row.get(12)?,
+        all_day: row.get::<_, i64>(11)? != 0,
+        location: row.get(12)?,
+        notes: row.get(13)?,
+        google_event_id: row.get(14)?,
+        icloud_event_id: row.get(15)?,
     })
 }
 

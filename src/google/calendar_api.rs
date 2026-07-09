@@ -1,6 +1,7 @@
+use chrono::Datelike;
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use oauth2::reqwest;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +139,125 @@ fn get(access_token: &str, url: &str) -> Result<String, String> {
         return Err(format!("Google API error ({status}): {body}"));
     }
     Ok(body)
+}
+
+pub fn update_event(
+    access_token: &str,
+    calendar_id: &str,
+    event_id: &str,
+    draft: &crate::store::EventDraft,
+) -> Result<(), String> {
+    let url = event_url(calendar_id, event_id)?;
+    let body = GoogleEventPatch::from_draft(draft);
+    request_json(
+        access_token,
+        reqwest::Method::PATCH,
+        url.as_str(),
+        Some(&body),
+    )
+}
+
+pub fn delete_event(access_token: &str, calendar_id: &str, event_id: &str) -> Result<(), String> {
+    let url = event_url(calendar_id, event_id)?;
+    request_json::<()>(access_token, reqwest::Method::DELETE, url.as_str(), None)
+}
+
+fn event_url(calendar_id: &str, event_id: &str) -> Result<Url, String> {
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars")
+        .map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid calendar API base URL".to_string())?
+        .push(calendar_id)
+        .push("events")
+        .push(event_id);
+    Ok(url)
+}
+
+fn request_json<T: Serialize>(
+    access_token: &str,
+    method: reqwest::Method,
+    url: &str,
+    body: Option<&T>,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::new();
+    let mut request = client.request(method, url).bearer_auth(access_token);
+    if let Some(body) = body {
+        request = request
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(body).map_err(|e| e.to_string())?);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Google API error ({status}): {body}"));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct GoogleEventPatch {
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    start: GoogleEventDateTime,
+    end: GoogleEventDateTime,
+}
+
+impl GoogleEventPatch {
+    fn from_draft(draft: &crate::store::EventDraft) -> Self {
+        Self {
+            summary: draft.title.clone(),
+            location: draft.location.clone(),
+            description: draft.notes.clone(),
+            start: GoogleEventDateTime::from_start(draft),
+            end: GoogleEventDateTime::from_end(draft),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct GoogleEventDateTime {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date: Option<String>,
+    #[serde(rename = "dateTime", skip_serializing_if = "Option::is_none")]
+    date_time: Option<String>,
+}
+
+impl GoogleEventDateTime {
+    fn from_start(draft: &crate::store::EventDraft) -> Self {
+        if draft.all_day {
+            Self {
+                date: Some(date_string(draft.start)),
+                date_time: None,
+            }
+        } else {
+            Self {
+                date: None,
+                date_time: Some(draft.start.to_rfc3339()),
+            }
+        }
+    }
+
+    fn from_end(draft: &crate::store::EventDraft) -> Self {
+        if draft.all_day {
+            Self {
+                date: Some(date_string(draft.end)),
+                date_time: None,
+            }
+        } else {
+            Self {
+                date: None,
+                date_time: Some(draft.end.to_rfc3339()),
+            }
+        }
+    }
+}
+
+fn date_string(date: DateTime<Local>) -> String {
+    format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
 }
 
 #[cfg(test)]

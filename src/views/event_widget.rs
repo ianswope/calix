@@ -1,4 +1,5 @@
 use crate::store::Event;
+use gtk::gdk;
 use gtk::prelude::*;
 use std::f64::consts::PI;
 
@@ -77,7 +78,23 @@ fn event_button_with_padding(
         .build();
     button.set_label("");
     button.set_child(Some(&overlay));
+    make_draggable_if_local(&button, event);
     button
+}
+
+fn make_draggable_if_local(button: &gtk::Button, event: &Event) {
+    if event.google_event_id.is_some() || event.icloud_event_id.is_some() {
+        return;
+    }
+
+    let drag = gtk::DragSource::builder()
+        .actions(gdk::DragAction::MOVE)
+        .build();
+    let event_id = event.id.to_string();
+    drag.connect_prepare(move |_, _, _| {
+        Some(gdk::ContentProvider::for_value(&event_id.to_value()))
+    });
+    button.add_controller(drag);
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {

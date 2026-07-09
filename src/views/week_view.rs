@@ -20,12 +20,14 @@ pub fn build(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
 ) -> gtk::Widget {
     build_days(
         week_dates(anchor).to_vec(),
         events,
         on_create,
         on_edit,
+        on_move,
         true,
     )
 }
@@ -35,8 +37,9 @@ pub fn build_day(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
 ) -> gtk::Widget {
-    build_days(vec![day], events, on_create, on_edit, true)
+    build_days(vec![day], events, on_create, on_edit, on_move, true)
 }
 
 fn build_days(
@@ -44,6 +47,7 @@ fn build_days(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
     scroll_to_today: bool,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -57,6 +61,7 @@ fn build_days(
         &days,
         events,
         on_edit.clone(),
+        on_move.clone(),
         &gutter_size_group,
     ));
 
@@ -71,7 +76,14 @@ fn build_days(
             .filter(|event| event_occurs_on_day(event, *day))
             .cloned()
             .collect();
-        let column = day_column(*day, today, &day_events, on_create.clone(), on_edit.clone());
+        let column = day_column(
+            *day,
+            today,
+            &day_events,
+            on_create.clone(),
+            on_edit.clone(),
+            on_move.clone(),
+        );
         day_area.attach(&column, day_column_index(&days, *day), 0, 1, 1);
     }
     hour_grid.append(&day_area);
@@ -142,6 +154,7 @@ fn all_day_row(
     days: &[NaiveDate],
     events: &[Event],
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
     let row = row_with_days(gutter_size_group, |day_area| {
@@ -169,6 +182,7 @@ fn all_day_row(
                 cell.append(&chip);
             }
 
+            add_drop_target(&cell, *day, on_move.clone());
             day_area.attach(&cell, i as i32, 0, 1, 1);
         }
     });
@@ -233,6 +247,7 @@ fn day_column(
     day_events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
 ) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
@@ -265,6 +280,7 @@ fn day_column(
     let overlay = gtk::Overlay::new();
     overlay.add_css_class("week-day-column");
     overlay.set_child(Some(&col));
+    add_drop_target(&overlay, day, on_move);
 
     for event in day_events {
         if event.all_day || event.start.date_naive() != day {
@@ -300,6 +316,25 @@ fn day_column(
     }
 
     overlay.upcast()
+}
+
+fn add_drop_target(
+    widget: &impl IsA<gtk::Widget>,
+    date: NaiveDate,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+) {
+    let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+    drop.connect_drop(move |_, value, _, _| {
+        let Ok(event_id) = value.get::<String>() else {
+            return false;
+        };
+        let Ok(event_id) = event_id.parse::<i64>() else {
+            return false;
+        };
+        on_move(event_id, date);
+        true
+    });
+    widget.add_controller(drop);
 }
 
 fn add_now_indicator(overlay: &gtk::Overlay) {
