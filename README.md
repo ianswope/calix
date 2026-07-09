@@ -1,8 +1,8 @@
 # Calix
 
-A calendar app for Linux, built because [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and (eventually) direct sync with Apple/iCloud and Google calendars.
+A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Existing synced events can be edited, deleted, and dragged to another day; creating brand-new events still uses the local calendar until a calendar picker exists.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Existing synced events can be edited or deleted; local events can also be dragged to another day. Creating brand-new events still uses the local calendar until a calendar picker exists.
 
 ## Building
 
@@ -13,6 +13,19 @@ cargo build
 cargo test
 cargo run
 ```
+
+## Homebrew
+
+Until the first tagged release is published, install the current development
+build from this repository's tap:
+
+```sh
+brew tap ianswope/calix https://github.com/ianswope/calix
+brew install --HEAD ianswope/calix/calix
+```
+
+This installs the `calix` binary and the desktop entry/icon. A tagged release
+will replace the `--HEAD` formula with a checksum-pinned stable package.
 
 ## Installing Locally
 

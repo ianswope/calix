@@ -1,5 +1,6 @@
 use crate::store::EventDraft;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
+use chrono_tz::Tz;
 use oauth2::reqwest;
 use std::collections::{HashMap, HashSet};
 
@@ -85,15 +86,54 @@ pub fn update_event(
     if event_href.contains('#') {
         return Err("Editing expanded recurring iCloud instances is not supported yet".to_string());
     }
-    let ics = event_ics(event_href, draft);
-    request(
-        credentials,
-        "PUT",
-        &absolute_url(event_href)?,
-        0,
-        "text/calendar; charset=utf-8",
-        ics,
-    )?;
+    let url = absolute_url(event_href)?;
+    let (existing_ics, etag) = fetch_event(credentials, &url)?;
+    let ics = replace_event_fields(&existing_ics, draft)?;
+    put_event(credentials, &url, &ics, etag.as_deref())?;
+    Ok(())
+}
+
+fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<String>), String> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get(url)
+        .basic_auth(&credentials.apple_id, Some(&credentials.app_password))
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+    }
+    Ok((body, etag))
+}
+
+fn put_event(
+    credentials: &Credentials,
+    url: &str,
+    ics: &str,
+    etag: Option<&str>,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .put(url)
+        .basic_auth(&credentials.apple_id, Some(&credentials.app_password))
+        .header("Content-Type", "text/calendar; charset=utf-8")
+        .body(ics.to_owned());
+    if let Some(etag) = etag {
+        request = request.header("If-Match", etag);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+    }
     Ok(())
 }
 
@@ -103,14 +143,21 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
             "Deleting expanded recurring iCloud instances is not supported yet".to_string(),
         );
     }
-    request(
-        credentials,
-        "DELETE",
-        &absolute_url(event_href)?,
-        0,
-        "text/plain",
-        String::new(),
-    )?;
+    let url = absolute_url(event_href)?;
+    let (_, etag) = fetch_event(credentials, &url)?;
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .delete(&url)
+        .basic_auth(&credentials.apple_id, Some(&credentials.app_password));
+    if let Some(etag) = etag.as_deref() {
+        request = request.header("If-Match", etag);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+    }
     Ok(())
 }
 
@@ -388,17 +435,17 @@ fn parse_events(href: &str, ics: &str) -> Vec<RemoteEvent> {
 
 fn parse_event(
     href: &str,
-    props: HashMap<String, String>,
+    props: HashMap<String, IcsProperty>,
     component_count: usize,
 ) -> Option<RemoteEvent> {
     let summary = props
         .get("SUMMARY")
-        .cloned()
+        .map(|property| property.value.clone())
         .unwrap_or_else(|| "(No title)".to_string());
     let (start, all_day) = parse_ics_datetime(props.get("DTSTART")?)?;
     let (end, _) = props
         .get("DTEND")
-        .and_then(|value| parse_ics_datetime(value))
+        .and_then(parse_ics_datetime)
         .unwrap_or_else(|| {
             if all_day {
                 (start + chrono::Duration::days(1), true)
@@ -412,7 +459,7 @@ fn parse_event(
         let instance_id = props
             .get("RECURRENCE-ID")
             .or_else(|| props.get("DTSTART"))
-            .cloned()
+            .map(|property| property.value.clone())
             .unwrap_or_else(|| start.to_rfc3339());
         format!("{href}#{instance_id}")
     };
@@ -424,28 +471,24 @@ fn parse_event(
             start,
             end,
             all_day,
-            location: props.get("LOCATION").cloned(),
-            notes: props.get("DESCRIPTION").cloned(),
+            location: props.get("LOCATION").map(|property| property.value.clone()),
+            notes: props
+                .get("DESCRIPTION")
+                .map(|property| property.value.clone()),
         },
     })
 }
 
-fn ics_event_properties(ics: &str) -> Vec<HashMap<String, String>> {
-    let mut unfolded: Vec<String> = Vec::new();
-    for line in ics.replace("\r\n", "\n").lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some(last) = unfolded.last_mut() {
-                last.push_str(line.trim_start());
-            }
-        } else {
-            unfolded.push(line.to_string());
-        }
-    }
+struct IcsProperty {
+    value: String,
+    tzid: Option<String>,
+}
 
+fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
     let mut events = Vec::new();
     let mut props = HashMap::new();
     let mut in_event = false;
-    for line in unfolded {
+    for line in unfold_ics(ics) {
         if line == "BEGIN:VEVENT" {
             in_event = true;
             props = HashMap::new();
@@ -464,13 +507,27 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, String>> {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let key = name.split(';').next().unwrap_or(name).to_string();
-        props.insert(key, unescape_ics_text(value));
+        let mut parts = name.split(';');
+        let key = parts.next().unwrap_or(name).to_string();
+        let tzid = parts.find_map(|parameter| {
+            parameter
+                .split_once('=')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("TZID"))
+                .map(|(_, value)| value.trim_matches('"').to_string())
+        });
+        props.insert(
+            key,
+            IcsProperty {
+                value: unescape_ics_text(value),
+                tzid,
+            },
+        );
     }
     events
 }
 
-fn parse_ics_datetime(value: &str) -> Option<(DateTime<Local>, bool)> {
+fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)> {
+    let value = property.value.as_str();
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
         let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
         return Some((
@@ -488,6 +545,12 @@ fn parse_ics_datetime(value: &str) -> Option<(DateTime<Local>, bool)> {
     }
 
     let naive = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
+    if let Some(tzid) = &property.tzid
+        && let Ok(timezone) = tzid.parse::<Tz>()
+    {
+        let datetime = timezone.from_local_datetime(&naive).earliest()?;
+        return Some((datetime.with_timezone(&Local), false));
+    }
     Some((Local.from_local_datetime(&naive).single()?, false))
 }
 
@@ -497,13 +560,15 @@ fn caldav_timestamp(dt: DateTime<Local>) -> String {
         .to_string()
 }
 
-fn event_ics(event_href: &str, draft: &EventDraft) -> String {
-    let uid = event_href
-        .trim_end_matches(".ics")
-        .rsplit('/')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("calix-event");
+fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String> {
+    let event_count = unfold_ics(ics)
+        .iter()
+        .filter(|line| line.as_str() == "BEGIN:VEVENT")
+        .count();
+    if event_count != 1 {
+        return Err("Editing recurring iCloud events is not supported yet".to_string());
+    }
+
     let (start_key, start_value, end_key, end_value) = if draft.all_day {
         (
             "DTSTART;VALUE=DATE",
@@ -519,26 +584,65 @@ fn event_ics(event_href: &str, draft: &EventDraft) -> String {
             caldav_timestamp(draft.end),
         )
     };
-    let mut lines = vec![
-        "BEGIN:VCALENDAR".to_string(),
-        "VERSION:2.0".to_string(),
-        "PRODID:-//Calix//Calix Calendar//EN".to_string(),
-        "BEGIN:VEVENT".to_string(),
-        format!("UID:{}", escape_ics_text(uid)),
+    let mut replacement = vec![
         format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
         format!("SUMMARY:{}", escape_ics_text(&draft.title)),
         format!("{start_key}:{start_value}"),
         format!("{end_key}:{end_value}"),
     ];
-    if let Some(location) = &draft.location {
-        lines.push(format!("LOCATION:{}", escape_ics_text(location)));
-    }
     if let Some(notes) = &draft.notes {
-        lines.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+        replacement.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
     }
-    lines.push("END:VEVENT".to_string());
-    lines.push("END:VCALENDAR".to_string());
-    lines.join("\r\n") + "\r\n"
+    if let Some(location) = &draft.location {
+        replacement.push(format!("LOCATION:{}", escape_ics_text(location)));
+    }
+
+    let mut result = Vec::new();
+    let mut in_event = false;
+    for line in unfold_ics(ics) {
+        if line == "BEGIN:VEVENT" {
+            in_event = true;
+            result.push(line);
+            result.append(&mut replacement);
+            continue;
+        }
+        if line == "END:VEVENT" {
+            in_event = false;
+            result.push(line);
+            continue;
+        }
+        if in_event
+            && property_name(&line).is_some_and(|name| {
+                matches!(
+                    name,
+                    "DTSTAMP" | "SUMMARY" | "DTSTART" | "DTEND" | "LOCATION" | "DESCRIPTION"
+                )
+            })
+        {
+            continue;
+        }
+        result.push(line);
+    }
+    Ok(result.join("\r\n") + "\r\n")
+}
+
+fn unfold_ics(ics: &str) -> Vec<String> {
+    let mut unfolded: Vec<String> = Vec::new();
+    for line in ics.replace("\r\n", "\n").lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = unfolded.last_mut() {
+                last.push_str(line.trim_start());
+            }
+        } else {
+            unfolded.push(line.to_string());
+        }
+    }
+    unfolded
+}
+
+fn property_name(line: &str) -> Option<&str> {
+    line.split_once(':')
+        .map(|(name, _)| name.split(';').next().unwrap_or(name))
 }
 
 fn escape_ics_text(value: &str) -> String {
@@ -693,5 +797,46 @@ END:VCALENDAR"#;
         assert_ne!(events[0].href, events[1].href);
         assert!(events[0].href.contains("20260709T183000Z"));
         assert!(events[1].href.contains("20260716T183000Z"));
+    }
+
+    #[test]
+    fn parse_ics_datetime_uses_tzid() {
+        let property = IcsProperty {
+            value: "20260709T090000".to_string(),
+            tzid: Some("America/New_York".to_string()),
+        };
+
+        let (datetime, all_day) = parse_ics_datetime(&property).unwrap();
+
+        assert!(!all_day);
+        assert_eq!(
+            datetime.with_timezone(&chrono::Utc),
+            chrono::Utc.with_ymd_and_hms(2026, 7, 9, 13, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn replacing_event_fields_preserves_unedited_ics_properties() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Old title\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T100000\r\nRRULE:FREQ=WEEKLY\r\nATTENDEE:mailto:friend@example.com\r\nBEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nLOCATION:Old location\r\nDESCRIPTION:Old notes\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Local::now();
+        let draft = EventDraft {
+            title: "New title".to_string(),
+            start,
+            end: start + chrono::Duration::hours(1),
+            all_day: false,
+            location: None,
+            notes: None,
+        };
+
+        let updated = replace_event_fields(ics, &draft).unwrap();
+
+        assert!(updated.contains("UID:abc"));
+        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert!(updated.contains("ATTENDEE:mailto:friend@example.com"));
+        assert!(updated.contains("BEGIN:VALARM"));
+        assert!(updated.contains("SUMMARY:New title"));
+        assert!(!updated.contains("Old title"));
+        assert!(!updated.contains("LOCATION:Old location"));
+        assert!(!updated.contains("DESCRIPTION:Old notes"));
     }
 }

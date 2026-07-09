@@ -185,7 +185,6 @@ impl Ui {
                     start,
                     move || ui_for_saved.reset(),
                     None,
-                    None,
                 );
             })
         };
@@ -195,8 +194,7 @@ impl Ui {
                 let calendar_id = event.calendar_id;
                 let start = event.start;
                 let ui_for_saved = ui.clone();
-                let remote_update = remote_update_handler(&ui, &event);
-                let remote_delete = remote_delete_handler(&ui, &event);
+                let remote_event = remote_event_handler(&ui, &event);
                 event_dialog::open(
                     &ui.carousel,
                     ui.store.clone(),
@@ -204,8 +202,7 @@ impl Ui {
                     Some(event),
                     start,
                     move || ui_for_saved.reset(),
-                    remote_update,
-                    remote_delete,
+                    remote_event,
                 );
             })
         };
@@ -325,7 +322,6 @@ pub fn build(app: &adw::Application) {
                 None,
                 start,
                 move || ui2.reset(),
-                None,
                 None,
             );
         }
@@ -609,7 +605,6 @@ fn connect_handlers(
         ui,
         move |btn| {
             if btn.is_active() {
-                ui.state.borrow_mut().current_date = Local::now().date_naive();
                 set_view_mode(&ui, ViewMode::Week);
                 ui.reset();
             }
@@ -621,7 +616,6 @@ fn connect_handlers(
         ui,
         move |btn| {
             if btn.is_active() {
-                ui.state.borrow_mut().current_date = Local::now().date_naive();
                 set_view_mode(&ui, ViewMode::Day);
                 ui.reset();
             }
@@ -636,70 +630,45 @@ fn set_view_mode(ui: &Rc<Ui>, view_mode: ViewMode) {
         .set_setting(ViewMode::SETTING_KEY, view_mode.as_setting());
 }
 
-fn remote_update_handler(
-    ui: &Rc<Ui>,
-    event: &Event,
-) -> Option<Rc<dyn Fn(&EventDraft) -> Result<(), String>>> {
+fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::RemoteEvent> {
     match event.account_provider.as_deref() {
         Some("google") => {
-            let config = ui.config.google.clone()?;
-            let token_key = event.account_token_key.clone()?;
-            let calendar_id = event.google_calendar_id.clone()?;
-            let event_id = event.google_event_id.clone()?;
-            Some(Rc::new(move |draft| {
-                let access_token = google::oauth::get_access_token(&config, &token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "Google account is not connected".to_string())?;
-                google::calendar_api::update_event(&access_token, &calendar_id, &event_id, draft)
-            }))
+            let Some(config) = ui.config.google.clone() else {
+                return Some(event_dialog::RemoteEvent::Unavailable(
+                    "Google is not configured on this machine".to_string(),
+                ));
+            };
+            let (Some(token_key), Some(calendar_id), Some(event_id)) = (
+                event.account_token_key.clone(),
+                event.google_calendar_id.clone(),
+                event.google_event_id.clone(),
+            ) else {
+                return Some(event_dialog::RemoteEvent::Unavailable(
+                    "This Google event is missing sync metadata".to_string(),
+                ));
+            };
+            Some(event_dialog::RemoteEvent::Google {
+                config,
+                token_key,
+                calendar_id,
+                event_id,
+            })
         }
         Some("icloud") => {
-            let apple_id = event.account_provider_id.clone()?;
-            let token_key = event.account_token_key.clone()?;
-            let event_href = event.icloud_event_id.clone()?;
-            Some(Rc::new(move |draft| {
-                let app_password = icloud::credentials::app_password(&token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
-                let credentials = icloud::caldav::Credentials {
-                    apple_id: apple_id.clone(),
-                    app_password,
-                };
-                icloud::caldav::update_event(&credentials, &event_href, draft)
-            }))
-        }
-        _ => None,
-    }
-}
-
-fn remote_delete_handler(ui: &Rc<Ui>, event: &Event) -> Option<Rc<dyn Fn() -> Result<(), String>>> {
-    match event.account_provider.as_deref() {
-        Some("google") => {
-            let config = ui.config.google.clone()?;
-            let token_key = event.account_token_key.clone()?;
-            let calendar_id = event.google_calendar_id.clone()?;
-            let event_id = event.google_event_id.clone()?;
-            Some(Rc::new(move || {
-                let access_token = google::oauth::get_access_token(&config, &token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "Google account is not connected".to_string())?;
-                google::calendar_api::delete_event(&access_token, &calendar_id, &event_id)
-            }))
-        }
-        Some("icloud") => {
-            let apple_id = event.account_provider_id.clone()?;
-            let token_key = event.account_token_key.clone()?;
-            let event_href = event.icloud_event_id.clone()?;
-            Some(Rc::new(move || {
-                let app_password = icloud::credentials::app_password(&token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
-                let credentials = icloud::caldav::Credentials {
-                    apple_id: apple_id.clone(),
-                    app_password,
-                };
-                icloud::caldav::delete_event(&credentials, &event_href)
-            }))
+            let (Some(apple_id), Some(token_key), Some(event_href)) = (
+                event.account_provider_id.clone(),
+                event.account_token_key.clone(),
+                event.icloud_event_id.clone(),
+            ) else {
+                return Some(event_dialog::RemoteEvent::Unavailable(
+                    "This iCloud event is missing sync metadata".to_string(),
+                ));
+            };
+            Some(event_dialog::RemoteEvent::Icloud {
+                apple_id,
+                token_key,
+                event_href,
+            })
         }
         _ => None,
     }
@@ -712,14 +681,6 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> Rc<dyn Fn(i64, NaiveDate)> {
             return;
         };
         let draft = moved_draft(&event, target_date);
-        if let Some(remote_update) = remote_update_handler(&ui, &event) {
-            if let Err(error) = remote_update(&draft) {
-                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                    "Couldn't move remote event: {error}"
-                )));
-                return;
-            }
-        }
         if let Err(error) = ui.store.update_event(event.id, &draft) {
             ui.toast_overlay
                 .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
@@ -1065,26 +1026,21 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
         let result = (|| -> Result<(usize, usize), String> {
             let store = Store::open().map_err(|e| e.to_string())?;
             let mut accounts = store.google_accounts().map_err(|e| e.to_string())?;
-            if accounts.is_empty() {
-                if let Some(token) = google::oauth::get_access_token(
+            if accounts.is_empty()
+                && let Some(token) = google::oauth::get_access_token(
                     &google_config,
                     google::oauth::legacy_token_key(),
                 )
                 .map_err(|e| e.to_string())?
-                {
-                    let (provider_account_id, display_name) =
-                        google::sync::account_identity(&token)?;
-                    let token_key = google::oauth::token_key(&provider_account_id);
-                    google::oauth::copy_refresh_token(
-                        google::oauth::legacy_token_key(),
-                        &token_key,
-                    )
+            {
+                let (provider_account_id, display_name) = google::sync::account_identity(&token)?;
+                let token_key = google::oauth::token_key(&provider_account_id);
+                google::oauth::copy_refresh_token(google::oauth::legacy_token_key(), &token_key)
                     .map_err(|e| e.to_string())?;
-                    store
-                        .upsert_google_account(&provider_account_id, &display_name, &token_key)
-                        .map_err(|e| e.to_string())?;
-                    accounts = store.google_accounts().map_err(|e| e.to_string())?;
-                }
+                store
+                    .upsert_google_account(&provider_account_id, &display_name, &token_key)
+                    .map_err(|e| e.to_string())?;
+                accounts = store.google_accounts().map_err(|e| e.to_string())?;
             }
             if accounts.is_empty() {
                 return Err("No Google accounts connected. Use Add Google first.".to_string());

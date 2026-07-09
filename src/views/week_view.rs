@@ -1,6 +1,6 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
-use crate::views::event_widget;
+use crate::views::{event_occurs_on_day, event_widget};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use gtk::glib;
 use gtk::prelude::*;
@@ -282,33 +282,27 @@ fn day_column(
     overlay.set_child(Some(&col));
     add_drop_target(&overlay, day, on_move);
 
-    for event in day_events {
-        if event.all_day || event.start.date_naive() != day {
-            continue;
-        }
-        let start_h = event.start.hour() as f64 + event.start.minute() as f64 / 60.0;
-        let end_h = if event.end.date_naive() == day {
-            (event.end.hour() as f64 + event.end.minute() as f64 / 60.0).max(start_h)
-        } else {
-            24.0
-        };
+    for layout in timed_event_layouts(day, day_events) {
+        let event = layout.event;
+        let start_h = layout.start_hour;
+        let end_h = layout.end_hour;
         let top = (start_h * HOUR_ROW_HEIGHT as f64).round() as i32;
         let height = (((end_h - start_h) * HOUR_ROW_HEIGHT as f64).round() as i32)
             .max(MIN_EVENT_BLOCK_HEIGHT);
 
         let block = event_widget::event_button(event, "event-block", MIN_EVENT_BLOCK_HEIGHT);
         block.set_valign(gtk::Align::Start);
-        block.set_halign(gtk::Align::Fill);
+        block.set_halign(gtk::Align::Start);
+        block.set_hexpand(false);
         block.set_margin_top(top);
         block.set_size_request(-1, height);
-        block.set_margin_start(2);
-        block.set_margin_end(2);
 
         let ev = event.clone();
         let on_edit = on_edit.clone();
         block.connect_clicked(move |_| on_edit(ev.clone()));
 
         overlay.add_overlay(&block);
+        position_event_block(&overlay, &block, layout.lane, layout.lane_count, height);
     }
 
     if day == today {
@@ -374,11 +368,146 @@ fn hour_label(hour: u32) -> String {
     }
 }
 
-fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
-    let start = event.start.date_naive();
-    let mut end = event.end.date_naive();
-    if event.all_day && event.end.time() == NaiveTime::MIN && event.end > event.start {
-        end -= chrono::Duration::days(1);
+struct TimedEventLayout<'a> {
+    event: &'a Event,
+    start_hour: f64,
+    end_hour: f64,
+    lane: usize,
+    lane_count: usize,
+}
+
+fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout<'_>> {
+    let mut layouts: Vec<TimedEventLayout<'_>> = events
+        .iter()
+        .filter(|event| !event.all_day)
+        .filter_map(|event| {
+            let start_hour = if event.start.date_naive() < day {
+                0.0
+            } else {
+                hour_fraction(event.start)
+            };
+            let end_hour = if event.end.date_naive() > day {
+                24.0
+            } else {
+                hour_fraction(event.end)
+            };
+            (end_hour > start_hour).then_some(TimedEventLayout {
+                event,
+                start_hour,
+                end_hour,
+                lane: 0,
+                lane_count: 1,
+            })
+        })
+        .collect();
+    layouts.sort_by(|left, right| {
+        left.start_hour
+            .total_cmp(&right.start_hour)
+            .then_with(|| left.end_hour.total_cmp(&right.end_hour))
+    });
+
+    let mut cluster_start = 0;
+    while cluster_start < layouts.len() {
+        let mut cluster_end = layouts[cluster_start].end_hour;
+        let mut cluster_end_index = cluster_start + 1;
+        while cluster_end_index < layouts.len()
+            && layouts[cluster_end_index].start_hour < cluster_end
+        {
+            cluster_end = cluster_end.max(layouts[cluster_end_index].end_hour);
+            cluster_end_index += 1;
+        }
+
+        let mut lane_ends = Vec::new();
+        for layout in &mut layouts[cluster_start..cluster_end_index] {
+            let lane = lane_ends
+                .iter()
+                .position(|end: &f64| *end <= layout.start_hour)
+                .unwrap_or_else(|| {
+                    lane_ends.push(0.0);
+                    lane_ends.len() - 1
+                });
+            lane_ends[lane] = layout.end_hour;
+            layout.lane = lane;
+        }
+        for layout in &mut layouts[cluster_start..cluster_end_index] {
+            layout.lane_count = lane_ends.len();
+        }
+        cluster_start = cluster_end_index;
     }
-    start <= day && end >= day
+    layouts
+}
+
+fn hour_fraction(datetime: DateTime<Local>) -> f64 {
+    datetime.hour() as f64 + datetime.minute() as f64 / 60.0
+}
+
+fn position_event_block(
+    overlay: &gtk::Overlay,
+    block: &gtk::Button,
+    lane: usize,
+    lane_count: usize,
+    height: i32,
+) {
+    let position = move |overlay: &gtk::Overlay, block: &gtk::Button| {
+        let available = (overlay.width() - 4).max(1);
+        let lane_width = (available / lane_count as i32).max(1);
+        block.set_margin_start(2 + lane as i32 * lane_width);
+        block.set_size_request((lane_width - 4).max(1), height);
+    };
+    position(overlay, block);
+
+    let weak_overlay = overlay.downgrade();
+    let weak_block = block.downgrade();
+    overlay.connect_notify_local(Some("width"), move |_, _| {
+        if let (Some(overlay), Some(block)) = (weak_overlay.upgrade(), weak_block.upgrade()) {
+            position(&overlay, &block);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn event(id: i64, start_hour: u32, end_hour: u32) -> Event {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, start_hour, 0, 0)
+            .single()
+            .unwrap();
+        let end = Local
+            .with_ymd_and_hms(2026, 7, 9, end_hour, 0, 0)
+            .single()
+            .unwrap();
+        Event {
+            id,
+            calendar_id: 1,
+            calendar_name: "Local".to_string(),
+            calendar_color: "#3584e4".to_string(),
+            account_provider: None,
+            account_provider_id: None,
+            account_token_key: None,
+            google_calendar_id: None,
+            title: format!("Event {id}"),
+            start,
+            end,
+            all_day: false,
+            location: None,
+            notes: None,
+            google_event_id: None,
+            icloud_event_id: None,
+        }
+    }
+
+    #[test]
+    fn overlapping_events_get_separate_lanes() {
+        let events = vec![event(1, 9, 11), event(2, 9, 10), event(3, 10, 12)];
+        let day = events[0].start.date_naive();
+
+        let layouts = timed_event_layouts(day, &events);
+
+        assert_eq!(layouts.len(), 3);
+        assert!(layouts.iter().all(|layout| layout.lane_count == 2));
+        assert_ne!(layouts[0].lane, layouts[1].lane);
+    }
 }

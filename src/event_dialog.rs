@@ -1,17 +1,102 @@
+use crate::config::GoogleConfig;
+use crate::google;
+use crate::icloud;
 use crate::store::{Event, EventDraft, Store};
 use adw::prelude::*;
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use gtk::glib;
 use gtk::glib::clone;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 const DATE_FORMAT: &str = "%Y-%m-%d";
 
-/// Opens a create/edit dialog for an event. Pass `editing: Some(event)` to
-/// edit (adds a Delete button); `None` to create a new one starting at
-/// `initial_start`. `on_saved` is called after any successful save or
-/// delete so the caller can refresh whatever's showing the event list.
+/// The network details needed to change an existing remote event. This is
+/// owned and `Send`, so event dialogs can do remote work off the GTK thread.
+#[derive(Clone)]
+pub enum RemoteEvent {
+    Unavailable(String),
+    Google {
+        config: GoogleConfig,
+        token_key: String,
+        calendar_id: String,
+        event_id: String,
+    },
+    Icloud {
+        apple_id: String,
+        token_key: String,
+        event_href: String,
+    },
+}
+
+impl RemoteEvent {
+    fn update(&self, draft: &EventDraft) -> Result<(), String> {
+        match self {
+            Self::Unavailable(error) => Err(error.clone()),
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                event_id,
+            } => {
+                let access_token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                google::calendar_api::update_event(&access_token, calendar_id, event_id, draft)
+            }
+            Self::Icloud {
+                apple_id,
+                token_key,
+                event_href,
+            } => {
+                let app_password = icloud::credentials::app_password(token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
+                let credentials = icloud::caldav::Credentials {
+                    apple_id: apple_id.clone(),
+                    app_password,
+                };
+                icloud::caldav::update_event(&credentials, event_href, draft)
+            }
+        }
+    }
+
+    fn delete(&self) -> Result<(), String> {
+        match self {
+            Self::Unavailable(error) => Err(error.clone()),
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                event_id,
+            } => {
+                let access_token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                google::calendar_api::delete_event(&access_token, calendar_id, event_id)
+            }
+            Self::Icloud {
+                apple_id,
+                token_key,
+                event_href,
+            } => {
+                let app_password = icloud::credentials::app_password(token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
+                let credentials = icloud::caldav::Credentials {
+                    apple_id: apple_id.clone(),
+                    app_password,
+                };
+                icloud::caldav::delete_event(&credentials, event_href)
+            }
+        }
+    }
+}
+
+/// Opens a create/edit dialog for an event. Remote changes are completed in a
+/// worker thread before the local cache is updated.
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     store: Rc<Store>,
@@ -19,8 +104,7 @@ pub fn open(
     editing: Option<Event>,
     initial_start: DateTime<Local>,
     on_saved: impl Fn() + 'static,
-    remote_update: Option<Rc<dyn Fn(&EventDraft) -> Result<(), String>>>,
-    remote_delete: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    remote_event: Option<RemoteEvent>,
 ) {
     let on_saved = Rc::new(on_saved);
 
@@ -45,12 +129,8 @@ pub fn open(
 
     let title_row = adw::EntryRow::builder().title("Title").build();
     let all_day_row = adw::SwitchRow::builder().title("All day").build();
-    let start_row = adw::EntryRow::builder()
-        .title("Start (YYYY-MM-DD HH:MM)")
-        .build();
-    let end_row = adw::EntryRow::builder()
-        .title("End (YYYY-MM-DD HH:MM)")
-        .build();
+    let start_row = adw::EntryRow::new();
+    let end_row = adw::EntryRow::new();
     let location_row = adw::EntryRow::builder().title("Location").build();
     let notes_row = adw::EntryRow::builder().title("Notes").build();
     let error_label = gtk::Label::new(None);
@@ -63,20 +143,31 @@ pub fn open(
         .unwrap_or_else(|| "Local".to_string());
 
     match &editing {
-        Some(ev) => {
-            title_row.set_text(&ev.title);
-            all_day_row.set_active(ev.all_day);
-            start_row.set_text(&ev.start.format(DATETIME_FORMAT).to_string());
-            end_row.set_text(&ev.end.format(DATETIME_FORMAT).to_string());
-            location_row.set_text(ev.location.as_deref().unwrap_or(""));
-            notes_row.set_text(ev.notes.as_deref().unwrap_or(""));
+        Some(event) => {
+            title_row.set_text(&event.title);
+            all_day_row.set_active(event.all_day);
+            set_time_rows(&start_row, &end_row, event.start, event.end, event.all_day);
+            location_row.set_text(event.location.as_deref().unwrap_or(""));
+            notes_row.set_text(event.notes.as_deref().unwrap_or(""));
         }
         None => {
-            let end = initial_start + chrono::Duration::hours(1);
-            start_row.set_text(&initial_start.format(DATETIME_FORMAT).to_string());
-            end_row.set_text(&end.format(DATETIME_FORMAT).to_string());
+            set_time_rows(
+                &start_row,
+                &end_row,
+                initial_start,
+                initial_start + chrono::Duration::hours(1),
+                false,
+            );
         }
     }
+
+    all_day_row.connect_active_notify(clone!(
+        #[weak]
+        start_row,
+        #[weak]
+        end_row,
+        move |row| switch_time_format(&start_row, &end_row, row.is_active())
+    ));
 
     let group = adw::PreferencesGroup::new();
     let calendar_row = adw::ActionRow::builder()
@@ -100,33 +191,85 @@ pub fn open(
     content.append(&group);
     content.append(&error_label);
 
-    if let Some(ev) = &editing {
-        let event_id = ev.id;
+    if let Some(event) = &editing {
+        let event_id = event.id;
         let delete_button = gtk::Button::builder()
             .label("Delete Event")
             .css_classes(["destructive-action"])
             .build();
         delete_button.connect_clicked(clone!(
-            #[weak]
+            #[strong]
             dialog,
             #[strong]
             store,
             #[strong]
             on_saved,
             #[strong]
-            remote_delete,
+            remote_event,
+            #[strong]
+            delete_button,
             #[weak]
             error_label,
             move |_| {
-                if let Some(remote_delete) = &remote_delete {
-                    if let Err(error) = remote_delete() {
-                        error_label.set_label(&error);
-                        return;
+                if let Some(remote_event) = remote_event.clone() {
+                    delete_button.set_sensitive(false);
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(remote_event.delete());
+                    });
+                    glib::timeout_add_local(
+                        Duration::from_millis(100),
+                        clone!(
+                            #[strong]
+                            dialog,
+                            #[strong]
+                            store,
+                            #[strong]
+                            on_saved,
+                            #[strong]
+                            delete_button,
+                            #[strong]
+                            error_label,
+                            move || match rx.try_recv() {
+                                Ok(Ok(())) => match store.delete_event(event_id) {
+                                    Ok(()) => {
+                                        on_saved();
+                                        dialog.close();
+                                        glib::ControlFlow::Break
+                                    }
+                                    Err(error) => {
+                                        error_label.set_label(&format!(
+                                            "Remote event deleted, but the local cache could not be updated: {error}"
+                                        ));
+                                        delete_button.set_sensitive(true);
+                                        glib::ControlFlow::Break
+                                    }
+                                },
+                                Ok(Err(error)) => {
+                                    error_label.set_label(&error);
+                                    delete_button.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    error_label.set_label("Remote delete stopped unexpectedly");
+                                    delete_button.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                            }
+                        ),
+                    );
+                } else {
+                    match store.delete_event(event_id) {
+                        Ok(()) => {
+                            on_saved();
+                            dialog.close();
+                        }
+                        Err(error) => {
+                            error_label.set_label(&format!("Couldn't delete event: {error}"))
+                        }
                     }
                 }
-                let _ = store.delete_event(event_id);
-                on_saved();
-                dialog.close();
             }
         ));
         content.append(&delete_button);
@@ -146,7 +289,7 @@ pub fn open(
     ));
 
     save_button.connect_clicked(clone!(
-        #[weak]
+        #[strong]
         dialog,
         #[strong]
         store,
@@ -155,19 +298,32 @@ pub fn open(
         #[strong]
         editing,
         #[strong]
-        remote_update,
+        remote_event,
+        #[strong]
+        save_button,
         #[weak]
         error_label,
         move |_| {
             let all_day = all_day_row.is_active();
             let Some(start) = parse_datetime(&start_row.text(), all_day) else {
+                error_label.set_label(&invalid_date_message(all_day));
                 return;
             };
             let Some(end) = parse_datetime(&end_row.text(), all_day) else {
+                error_label.set_label(&invalid_date_message(all_day));
                 return;
             };
             let title = title_row.text().trim().to_string();
             if title.is_empty() {
+                error_label.set_label("A title is required");
+                return;
+            }
+            if end <= start {
+                error_label.set_label(if all_day {
+                    "The end date must be after the start date"
+                } else {
+                    "The end time must be after the start time"
+                });
                 return;
             }
 
@@ -180,22 +336,75 @@ pub fn open(
                 notes: non_empty(notes_row.text().to_string()),
             };
 
-            let result = match &editing {
-                Some(ev) => {
-                    if let Some(remote_update) = &remote_update {
-                        if let Err(error) = remote_update(&draft) {
-                            error_label.set_label(&error);
-                            return;
-                        }
+            let Some(event) = editing.as_ref() else {
+                match store.create_event(calendar_id, &draft) {
+                    Ok(_) => {
+                        on_saved();
+                        dialog.close();
                     }
-                    store.update_event(ev.id, &draft)
+                    Err(error) => error_label.set_label(&format!("Couldn't save event: {error}")),
                 }
-                None => store.create_event(calendar_id, &draft).map(|_| ()),
+                return;
             };
 
-            if result.is_ok() {
-                on_saved();
-                dialog.close();
+            if let Some(remote_event) = remote_event.clone() {
+                save_button.set_sensitive(false);
+                let event_id = event.id;
+                let (tx, rx) = mpsc::channel();
+                let remote_draft = draft.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(remote_event.update(&remote_draft));
+                });
+                glib::timeout_add_local(
+                    Duration::from_millis(100),
+                    clone!(
+                        #[strong]
+                        dialog,
+                        #[strong]
+                        store,
+                        #[strong]
+                        on_saved,
+                        #[strong]
+                        save_button,
+                        #[strong]
+                        error_label,
+                        move || match rx.try_recv() {
+                            Ok(Ok(())) => match store.update_event(event_id, &draft) {
+                                Ok(()) => {
+                                    on_saved();
+                                    dialog.close();
+                                    glib::ControlFlow::Break
+                                }
+                                Err(error) => {
+                                    error_label.set_label(&format!(
+                                        "Remote event saved, but the local cache could not be updated: {error}"
+                                    ));
+                                    save_button.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                            },
+                            Ok(Err(error)) => {
+                                error_label.set_label(&error);
+                                save_button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                error_label.set_label("Remote save stopped unexpectedly");
+                                save_button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    ),
+                );
+            } else {
+                match store.update_event(event.id, &draft) {
+                    Ok(()) => {
+                        on_saved();
+                        dialog.close();
+                    }
+                    Err(error) => error_label.set_label(&format!("Couldn't save event: {error}")),
+                }
             }
         }
     ));
@@ -203,23 +412,113 @@ pub fn open(
     dialog.present(Some(parent));
 }
 
+fn set_time_rows(
+    start_row: &adw::EntryRow,
+    end_row: &adw::EntryRow,
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+    all_day: bool,
+) {
+    let format = if all_day {
+        DATE_FORMAT
+    } else {
+        DATETIME_FORMAT
+    };
+    start_row.set_title(if all_day {
+        "Start (YYYY-MM-DD)"
+    } else {
+        "Start (YYYY-MM-DD HH:MM)"
+    });
+    end_row.set_title(if all_day {
+        "End (YYYY-MM-DD)"
+    } else {
+        "End (YYYY-MM-DD HH:MM)"
+    });
+    start_row.set_text(&start.format(format).to_string());
+    end_row.set_text(&end.format(format).to_string());
+}
+
+fn switch_time_format(start_row: &adw::EntryRow, end_row: &adw::EntryRow, all_day: bool) {
+    if all_day {
+        let Some(start) = parse_datetime(&start_row.text(), false) else {
+            return;
+        };
+        let Some(end) = parse_datetime(&end_row.text(), false) else {
+            return;
+        };
+        let mut end_date = end.date_naive();
+        if end.time() != NaiveTime::MIN || end_date <= start.date_naive() {
+            end_date = end_date.succ_opt().unwrap_or(end_date);
+        }
+        set_time_rows(
+            start_row,
+            end_row,
+            start,
+            Local
+                .from_local_datetime(&end_date.and_time(NaiveTime::MIN))
+                .single()
+                .unwrap_or(end),
+            true,
+        );
+    } else {
+        let Some(start_date) = NaiveDate::parse_from_str(start_row.text().trim(), DATE_FORMAT).ok()
+        else {
+            return;
+        };
+        let Some(end_date) = NaiveDate::parse_from_str(end_row.text().trim(), DATE_FORMAT).ok()
+        else {
+            return;
+        };
+        let timed_end_date = end_date.pred_opt().unwrap_or(end_date).max(start_date);
+        let Some(start) = Local
+            .from_local_datetime(&start_date.and_hms_opt(9, 0, 0).expect("valid time"))
+            .single()
+        else {
+            return;
+        };
+        let Some(end) = Local
+            .from_local_datetime(&timed_end_date.and_hms_opt(10, 0, 0).expect("valid time"))
+            .single()
+        else {
+            return;
+        };
+        set_time_rows(start_row, end_row, start, end, false);
+    }
+}
+
+fn invalid_date_message(all_day: bool) -> String {
+    if all_day {
+        "Enter dates as YYYY-MM-DD".to_string()
+    } else {
+        "Enter dates and times as YYYY-MM-DD HH:MM".to_string()
+    }
+}
+
 fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {
     let text = text.trim();
     let naive = if all_day {
         NaiveDate::parse_from_str(text, DATE_FORMAT)
             .ok()
-            .map(|d| NaiveDateTime::new(d, NaiveTime::MIN))
+            .map(|date| NaiveDateTime::new(date, NaiveTime::MIN))
     } else {
         NaiveDateTime::parse_from_str(text, DATETIME_FORMAT).ok()
     }?;
     naive.and_local_timezone(Local).single()
 }
 
-fn non_empty(s: String) -> Option<String> {
-    let s = s.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s.to_string())
+fn non_empty(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_day_values_use_date_only_input() {
+        assert!(parse_datetime("2026-07-09", true).is_some());
+        assert!(parse_datetime("2026-07-09 00:00", true).is_none());
+        assert!(parse_datetime("2026-07-09 09:00", false).is_some());
     }
 }
