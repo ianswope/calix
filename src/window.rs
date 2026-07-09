@@ -129,6 +129,14 @@ impl Ui {
         let on_edit: Rc<dyn Fn(Event)> = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
+                if event.google_event_id.is_some() {
+                    // Editing would just get silently overwritten by the
+                    // next sync, so don't pretend it's supported.
+                    ui.toast_overlay.add_toast(adw::Toast::new(
+                        "Editing synced Google events isn't supported yet",
+                    ));
+                    return;
+                }
                 let calendar_id = event.calendar_id;
                 let start = event.start;
                 let ui_for_saved = ui.clone();
@@ -233,7 +241,7 @@ pub fn build(app: &adw::Application) {
         ui,
         #[weak]
         google_button,
-        move |_| connect_or_disconnect_google(&ui, &google_button)
+        move |_| connect_or_sync_google(&ui, &google_button)
     ));
 
     let header = adw::HeaderBar::new();
@@ -393,20 +401,27 @@ fn next_half_hour() -> DateTime<Local> {
 
 fn set_google_button_label(button: &gtk::Button) {
     if google::oauth::has_saved_account() {
-        button.set_label("Google Connected");
+        button.set_label("Sync Google");
+        button.set_tooltip_text(Some("Click to fetch the latest events from your Google calendars"));
     } else {
         button.set_label("Connect Google");
+        button.set_tooltip_text(None);
     }
 }
 
 /// If no Google account is connected yet, runs the full OAuth sign-in flow
-/// (opens the browser, waits for the redirect, stores the refresh token)
-/// and verifies it by fetching the account's calendar list. If one is
-/// already connected, disconnects it instead. The network/browser-waiting
-/// part runs on a background thread — GTK widgets aren't `Send`, so the
-/// result comes back over a channel polled from a main-thread timeout
-/// rather than being touched directly from that thread.
-fn connect_or_disconnect_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
+/// (opens the browser, waits for the redirect, stores the refresh token).
+/// Either way, then syncs: fetches every visible Google calendar and its
+/// events and upserts them into the local store, so this doubles as
+/// "connect" and "sync now" depending on prior state.
+///
+/// The network/browser-waiting part runs on a background thread — GTK
+/// widgets aren't `Send`, so the result comes back over a channel polled
+/// from a main-thread timeout rather than being touched directly from
+/// that thread. That thread opens its own `Store` (a fresh connection to
+/// the same database file) rather than sharing `ui.store`, since
+/// `rusqlite::Connection` isn't `Send` either.
+fn connect_or_sync_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
     let Some(google_config) = ui.config.google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
@@ -414,25 +429,21 @@ fn connect_or_disconnect_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
         return;
     };
 
-    if google::oauth::has_saved_account() {
-        google::oauth::sign_out();
-        set_google_button_label(google_button);
-        ui.toast_overlay.add_toast(adw::Toast::new("Disconnected Google account"));
-        return;
-    }
-
+    let already_connected = google::oauth::has_saved_account();
     google_button.set_sensitive(false);
-    google_button.set_label("Connecting…");
+    google_button.set_label(if already_connected { "Syncing…" } else { "Connecting…" });
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| -> Result<usize, String> {
-            google::oauth::sign_in(&google_config).map_err(|e| e.to_string())?;
+            if !already_connected {
+                google::oauth::sign_in(&google_config).map_err(|e| e.to_string())?;
+            }
             let token = google::oauth::get_access_token(&google_config)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "no access token after sign-in".to_string())?;
-            let calendars = google::calendar_api::list_calendars(&token).map_err(|e| e.to_string())?;
-            Ok(calendars.len())
+            let store = Store::open().map_err(|e| e.to_string())?;
+            google::sync::sync(&token, &store)
         })();
         let _ = tx.send(result);
     });
@@ -447,14 +458,15 @@ fn connect_or_disconnect_google(ui: &Rc<Ui>, google_button: &gtk::Button) {
             move || match rx.try_recv() {
                 Ok(Ok(count)) => {
                     ui.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Connected — found {count} calendar(s)")));
+                        .add_toast(adw::Toast::new(&format!("Synced {count} calendar(s)")));
                     set_google_button_label(&google_button);
                     google_button.set_sensitive(true);
+                    ui.reset();
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
                     ui.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Google sign-in failed: {error}")));
+                        .add_toast(adw::Toast::new(&format!("Google sync failed: {error}")));
                     set_google_button_label(&google_button);
                     google_button.set_sensitive(true);
                     glib::ControlFlow::Break
