@@ -93,6 +93,22 @@ pub fn update_event(
     Ok(())
 }
 
+pub fn create_event(
+    credentials: &Credentials,
+    calendar_href: &str,
+    draft: &EventDraft,
+) -> Result<String, String> {
+    let uid = format!(
+        "calix-{}-{}",
+        chrono::Utc::now().timestamp_micros(),
+        std::process::id()
+    );
+    let event_href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), uid);
+    let ics = new_event_ics(&uid, draft);
+    put_event(credentials, &absolute_url(&event_href)?, &ics, None)?;
+    Ok(event_href)
+}
+
 fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<String>), String> {
     let client = reqwest::blocking::Client::new();
     let response = client
@@ -624,6 +640,44 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
         result.push(line);
     }
     Ok(result.join("\r\n") + "\r\n")
+}
+
+fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
+    let (start_key, start_value, end_key, end_value) = if draft.all_day {
+        (
+            "DTSTART;VALUE=DATE",
+            draft.start.format("%Y%m%d").to_string(),
+            "DTEND;VALUE=DATE",
+            draft.end.format("%Y%m%d").to_string(),
+        )
+    } else {
+        (
+            "DTSTART",
+            caldav_timestamp(draft.start),
+            "DTEND",
+            caldav_timestamp(draft.end),
+        )
+    };
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".to_string(),
+        "PRODID:-//Calix//Calix Calendar//EN".to_string(),
+        "BEGIN:VEVENT".to_string(),
+        format!("UID:{}", escape_ics_text(uid)),
+        format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
+        format!("SUMMARY:{}", escape_ics_text(&draft.title)),
+        format!("{start_key}:{start_value}"),
+        format!("{end_key}:{end_value}"),
+    ];
+    if let Some(location) = &draft.location {
+        lines.push(format!("LOCATION:{}", escape_ics_text(location)));
+    }
+    if let Some(notes) = &draft.notes {
+        lines.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+    }
+    lines.push("END:VEVENT".to_string());
+    lines.push("END:VCALENDAR".to_string());
+    lines.join("\r\n") + "\r\n"
 }
 
 fn unfold_ics(ics: &str) -> Vec<String> {

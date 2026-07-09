@@ -292,17 +292,18 @@ fn day_column(
 
         let block = event_widget::event_button(event, "event-block", MIN_EVENT_BLOCK_HEIGHT);
         block.set_valign(gtk::Align::Start);
-        block.set_halign(gtk::Align::Start);
-        block.set_hexpand(false);
+        block.set_halign(gtk::Align::Fill);
+        block.set_hexpand(true);
         block.set_margin_top(top);
         block.set_size_request(-1, height);
+        block.set_margin_start(2);
+        block.set_margin_end(2);
 
         let ev = event.clone();
         let on_edit = on_edit.clone();
         block.connect_clicked(move |_| on_edit(ev.clone()));
 
         overlay.add_overlay(&block);
-        position_event_block(&overlay, &block, layout.lane, layout.lane_count, height);
     }
 
     if day == today {
@@ -372,8 +373,6 @@ struct TimedEventLayout<'a> {
     event: &'a Event,
     start_hour: f64,
     end_hour: f64,
-    lane: usize,
-    lane_count: usize,
 }
 
 fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout<'_>> {
@@ -395,8 +394,6 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
                 event,
                 start_hour,
                 end_hour,
-                lane: 0,
-                lane_count: 1,
             })
         })
         .collect();
@@ -406,63 +403,11 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
             .then_with(|| left.end_hour.total_cmp(&right.end_hour))
     });
 
-    let mut cluster_start = 0;
-    while cluster_start < layouts.len() {
-        let mut cluster_end = layouts[cluster_start].end_hour;
-        let mut cluster_end_index = cluster_start + 1;
-        while cluster_end_index < layouts.len()
-            && layouts[cluster_end_index].start_hour < cluster_end
-        {
-            cluster_end = cluster_end.max(layouts[cluster_end_index].end_hour);
-            cluster_end_index += 1;
-        }
-
-        let mut lane_ends = Vec::new();
-        for layout in &mut layouts[cluster_start..cluster_end_index] {
-            let lane = lane_ends
-                .iter()
-                .position(|end: &f64| *end <= layout.start_hour)
-                .unwrap_or_else(|| {
-                    lane_ends.push(0.0);
-                    lane_ends.len() - 1
-                });
-            lane_ends[lane] = layout.end_hour;
-            layout.lane = lane;
-        }
-        for layout in &mut layouts[cluster_start..cluster_end_index] {
-            layout.lane_count = lane_ends.len();
-        }
-        cluster_start = cluster_end_index;
-    }
     layouts
 }
 
 fn hour_fraction(datetime: DateTime<Local>) -> f64 {
     datetime.hour() as f64 + datetime.minute() as f64 / 60.0
-}
-
-fn position_event_block(
-    overlay: &gtk::Overlay,
-    block: &gtk::Button,
-    lane: usize,
-    lane_count: usize,
-    height: i32,
-) {
-    let position = move |overlay: &gtk::Overlay, block: &gtk::Button| {
-        let available = (overlay.width() - 4).max(1);
-        let lane_width = (available / lane_count as i32).max(1);
-        block.set_margin_start(2 + lane as i32 * lane_width);
-        block.set_size_request((lane_width - 4).max(1), height);
-    };
-    position(overlay, block);
-
-    let weak_overlay = overlay.downgrade();
-    let weak_block = block.downgrade();
-    overlay.connect_notify_local(Some("width"), move |_, _| {
-        if let (Some(overlay), Some(block)) = (weak_overlay.upgrade(), weak_block.upgrade()) {
-            position(&overlay, &block);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -500,14 +445,15 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_events_get_separate_lanes() {
+    fn overlapping_events_are_retained_in_time_order() {
         let events = vec![event(1, 9, 11), event(2, 9, 10), event(3, 10, 12)];
         let day = events[0].start.date_naive();
 
         let layouts = timed_event_layouts(day, &events);
 
         assert_eq!(layouts.len(), 3);
-        assert!(layouts.iter().all(|layout| layout.lane_count == 2));
-        assert_ne!(layouts[0].lane, layouts[1].lane);
+        assert_eq!(layouts[0].event.id, 2);
+        assert_eq!(layouts[1].event.id, 1);
+        assert_eq!(layouts[2].event.id, 3);
     }
 }

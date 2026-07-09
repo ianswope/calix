@@ -82,7 +82,7 @@ pub fn sync_account(access_token: &str, store: &Store, account_id: i64) -> Resul
                 end,
                 all_day,
                 location: event.location.clone(),
-                notes: event.description.clone(),
+                notes: notes_with_conference_links(event),
             };
             store
                 .upsert_google_event(local_calendar_id, &event.id, &draft)
@@ -95,4 +95,18 @@ pub fn sync_account(access_token: &str, store: &Store, account_id: i64) -> Resul
     }
 
     Ok(calendars.len())
+}
+
+fn notes_with_conference_links(event: &calendar_api::EventItem) -> Option<String> {
+    let mut lines = event
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+        .map(str::to_owned)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(conference_data) = &event.conference_data {
+        lines.extend(conference_data.join_links().map(str::to_owned));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }

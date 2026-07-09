@@ -1,0 +1,28 @@
+{
+  "app-id": "com.ianswope.Calix",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "48",
+  "sdk": "org.gnome.Sdk",
+  "command": "calix",
+  "finish-args": [
+    "--share=network",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--talk-name=org.freedesktop.secrets"
+  ],
+  "modules": [
+    {
+      "name": "calix",
+      "buildsystem": "simple",
+      "build-commands": [
+        "cargo --offline install --path . --root /app",
+        "install -Dm644 dist/com.ianswope.Calix.desktop /app/share/applications/com.ianswope.Calix.desktop",
+        "install -Dm644 dist/com.ianswope.Calix.svg /app/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg"
+      ],
+      "sources": [
+        { "type": "dir", "path": ".." },
+        { "type": "file", "path": "cargo-sources.json" }
+      ]
+    }
+  ]
+}

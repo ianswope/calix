@@ -2,7 +2,7 @@
 
 A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Existing synced events can be edited or deleted; local events can also be dragged to another day. Creating brand-new events still uses the local calendar until a calendar picker exists.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. The event dialog can create events on local, Google, or iCloud calendars; existing synced events can also be edited or deleted. Local events can be dragged to another day.
 
 ## Building
 
@@ -26,6 +26,20 @@ brew install --HEAD ianswope/calix/calix
 
 This installs the `calix` binary and the desktop entry/icon. A tagged release
 will replace the `--HEAD` formula with a checksum-pinned stable package.
+
+## Flatpak and AUR
+
+The Flatpak manifest is in `flatpak/com.ianswope.Calix.json`. Before building,
+generate its dependency manifest with:
+
+```sh
+scripts/generate-flatpak-sources.sh
+flatpak-builder --user --install --force-clean build-dir flatpak/com.ianswope.Calix.json
+```
+
+`packaging/aur/PKGBUILD` is the release package definition for Arch users. It
+is pinned to the current release version when publishing to the AUR; replace
+its temporary `SKIP` checksum with the SHA-256 for the tagged source archive.
 
 ## Installing Locally
 
@@ -120,7 +134,7 @@ This file lives outside the repo and is never read by anything that gets committ
 - [x] Pull iCloud events via CalDAV (one-way sync)
 - [x] Basic two-way Google sync / editing synced Google events
 - [x] Basic two-way iCloud CalDAV sync / editing simple synced iCloud events
-- [ ] Calendar picker for creating new events directly on Google/iCloud calendars
+- [x] Calendar picker for creating new events directly on Google/iCloud calendars
 - [ ] Recurrence exception editing for expanded iCloud recurring events
 - [ ] Packaging (AUR, Flatpak)
 

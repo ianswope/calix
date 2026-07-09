@@ -9,6 +9,7 @@ use gtk::glib::clone;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
+use url::Url;
 
 const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 const DATE_FORMAT: &str = "%Y-%m-%d";
@@ -29,6 +30,92 @@ pub enum RemoteEvent {
         token_key: String,
         event_href: String,
     },
+}
+
+#[derive(Clone)]
+pub enum CreateTarget {
+    Local {
+        calendar_id: i64,
+        name: String,
+    },
+    Google {
+        calendar_id: i64,
+        name: String,
+        config: GoogleConfig,
+        token_key: String,
+        google_calendar_id: String,
+    },
+    Icloud {
+        calendar_id: i64,
+        name: String,
+        apple_id: String,
+        token_key: String,
+        calendar_href: String,
+    },
+    Unavailable {
+        calendar_id: i64,
+        name: String,
+        error: String,
+    },
+}
+
+impl CreateTarget {
+    pub fn calendar_id(&self) -> i64 {
+        match self {
+            Self::Local { calendar_id, .. }
+            | Self::Google { calendar_id, .. }
+            | Self::Icloud { calendar_id, .. }
+            | Self::Unavailable { calendar_id, .. } => *calendar_id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Local { name, .. }
+            | Self::Google { name, .. }
+            | Self::Icloud { name, .. }
+            | Self::Unavailable { name, .. } => name,
+        }
+    }
+
+    fn create(&self, draft: &EventDraft) -> Result<Option<(bool, String)>, String> {
+        match self {
+            Self::Local { .. } => Ok(None),
+            Self::Google {
+                config,
+                token_key,
+                google_calendar_id,
+                ..
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                let event_id =
+                    google::calendar_api::create_event(&token, google_calendar_id, draft)?;
+                Ok(Some((true, event_id)))
+            }
+            Self::Icloud {
+                apple_id,
+                token_key,
+                calendar_href,
+                ..
+            } => {
+                let password = icloud::credentials::app_password(token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
+                let event_id = icloud::caldav::create_event(
+                    &icloud::caldav::Credentials {
+                        apple_id: apple_id.clone(),
+                        app_password: password,
+                    },
+                    calendar_href,
+                    draft,
+                )?;
+                Ok(Some((false, event_id)))
+            }
+            Self::Unavailable { error, .. } => Err(error.clone()),
+        }
+    }
 }
 
 impl RemoteEvent {
@@ -100,7 +187,7 @@ impl RemoteEvent {
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     store: Rc<Store>,
-    calendar_id: i64,
+    create_targets: Vec<CreateTarget>,
     editing: Option<Event>,
     initial_start: DateTime<Local>,
     on_saved: impl Fn() + 'static,
@@ -141,6 +228,18 @@ pub fn open(
         .as_ref()
         .map(|event| event.calendar_name.clone())
         .unwrap_or_else(|| "Local".to_string());
+    let target_names = create_targets
+        .iter()
+        .map(|target| target.name())
+        .collect::<Vec<_>>();
+    let calendar_selector = gtk::DropDown::from_strings(&target_names);
+    let selected_target = create_targets
+        .iter()
+        .position(|target| {
+            target.calendar_id() == editing.as_ref().map_or(1, |event| event.calendar_id)
+        })
+        .unwrap_or(0);
+    calendar_selector.set_selected(selected_target as u32);
 
     match &editing {
         Some(event) => {
@@ -175,6 +274,10 @@ pub fn open(
         .subtitle(gtk::glib::markup_escape_text(&calendar_name))
         .build();
     calendar_row.set_subtitle_lines(1);
+    if editing.is_none() {
+        calendar_row.add_suffix(&calendar_selector);
+        calendar_row.set_activatable_widget(Some(&calendar_selector));
+    }
     group.add(&calendar_row);
     group.add(&title_row);
     group.add(&all_day_row);
@@ -189,6 +292,22 @@ pub fn open(
     content.set_margin_start(18);
     content.set_margin_end(18);
     content.append(&group);
+    if let Some(event) = &editing {
+        let links = event_links(event);
+        if !links.is_empty() {
+            let links_group = adw::PreferencesGroup::builder()
+                .title("Meeting links")
+                .build();
+            for link in links {
+                let label = meeting_link_label(&link);
+                let button = gtk::LinkButton::with_label(&link, &label);
+                button.set_halign(gtk::Align::Start);
+                button.set_tooltip_text(Some(&link));
+                links_group.add(&button);
+            }
+            content.append(&links_group);
+        }
+    }
     content.append(&error_label);
 
     if let Some(event) = &editing {
@@ -300,6 +419,10 @@ pub fn open(
         #[strong]
         remote_event,
         #[strong]
+        create_targets,
+        #[strong]
+        calendar_selector,
+        #[strong]
         save_button,
         #[weak]
         error_label,
@@ -337,13 +460,76 @@ pub fn open(
             };
 
             let Some(event) = editing.as_ref() else {
-                match store.create_event(calendar_id, &draft) {
-                    Ok(_) => {
-                        on_saved();
-                        dialog.close();
-                    }
-                    Err(error) => error_label.set_label(&format!("Couldn't save event: {error}")),
-                }
+                let Some(target) = create_targets.get(calendar_selector.selected() as usize).cloned() else {
+                    error_label.set_label("Choose a calendar");
+                    return;
+                };
+                save_button.set_sensitive(false);
+                let remote_draft = draft.clone();
+                let (tx, rx) = mpsc::channel();
+                let remote_target = target.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(remote_target.create(&remote_draft));
+                });
+                glib::timeout_add_local(
+                    Duration::from_millis(100),
+                    clone!(
+                        #[strong]
+                        dialog,
+                        #[strong]
+                        store,
+                        #[strong]
+                        on_saved,
+                        #[strong]
+                        save_button,
+                        #[strong]
+                        error_label,
+                        move || match rx.try_recv() {
+                            Ok(Ok(None)) => match store.create_event(target.calendar_id(), &draft) {
+                                Ok(_) => {
+                                    on_saved();
+                                    dialog.close();
+                                    glib::ControlFlow::Break
+                                }
+                                Err(error) => {
+                                    error_label.set_label(&format!("Couldn't save event: {error}"));
+                                    save_button.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                            },
+                            Ok(Ok(Some((is_google, remote_id)))) => {
+                                let result = if is_google {
+                                    store.upsert_google_event(target.calendar_id(), &remote_id, &draft)
+                                } else {
+                                    store.upsert_icloud_event(target.calendar_id(), &remote_id, &draft)
+                                };
+                                match result {
+                                    Ok(()) => {
+                                        on_saved();
+                                        dialog.close();
+                                        glib::ControlFlow::Break
+                                    }
+                                    Err(error) => {
+                                        error_label.set_label(&format!("Remote event created, but the local cache could not be updated: {error}"));
+                                        save_button.set_sensitive(true);
+                                        glib::ControlFlow::Break
+                                    }
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                error_label.set_label(&error);
+                                save_button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                error_label.set_label("Event creation stopped unexpectedly");
+                                save_button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    ),
+                );
                 return;
             };
 
@@ -511,6 +697,39 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+fn event_links(event: &Event) -> Vec<String> {
+    [event.location.as_deref(), event.notes.as_deref()]
+        .into_iter()
+        .flatten()
+        .flat_map(urls_in_text)
+        .fold(Vec::new(), |mut links, link| {
+            if !links.contains(&link) {
+                links.push(link);
+            }
+            links
+        })
+}
+
+fn urls_in_text(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_whitespace().filter_map(|word| {
+        let candidate = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.' | ';' | ':'
+            )
+        });
+        let url = Url::parse(candidate).ok()?;
+        matches!(url.scheme(), "http" | "https").then(|| candidate.to_string())
+    })
+}
+
+fn meeting_link_label(link: &str) -> String {
+    Url::parse(link)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| format!("Join via {host}")))
+        .unwrap_or_else(|| "Open meeting link".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +739,20 @@ mod tests {
         assert!(parse_datetime("2026-07-09", true).is_some());
         assert!(parse_datetime("2026-07-09 00:00", true).is_none());
         assert!(parse_datetime("2026-07-09 09:00", false).is_some());
+    }
+
+    #[test]
+    fn url_detection_keeps_meeting_links_and_drops_surrounding_punctuation() {
+        let links =
+            urls_in_text("Join https://meet.google.com/abc-defg-hij, or https://zoom.us/j/123.")
+                .collect::<Vec<_>>();
+
+        assert_eq!(
+            links,
+            vec![
+                "https://meet.google.com/abc-defg-hij",
+                "https://zoom.us/j/123"
+            ]
+        );
     }
 }

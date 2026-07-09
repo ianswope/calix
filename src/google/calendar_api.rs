@@ -69,8 +69,37 @@ pub struct EventItem {
     pub status: String,
     #[serde(default, rename = "eventType")]
     pub event_type: String,
+    #[serde(rename = "conferenceData")]
+    pub conference_data: Option<ConferenceData>,
     pub start: EventDateTime,
     pub end: EventDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConferenceData {
+    #[serde(default, rename = "entryPoints")]
+    entry_points: Vec<ConferenceEntryPoint>,
+}
+
+impl ConferenceData {
+    pub fn join_links(&self) -> impl Iterator<Item = &str> {
+        self.entry_points
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.entry_point_type.as_deref(),
+                    Some("video") | Some("more")
+                )
+            })
+            .map(|entry| entry.uri.as_str())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConferenceEntryPoint {
+    pub uri: String,
+    #[serde(rename = "entryPointType")]
+    entry_point_type: Option<String>,
 }
 
 impl EventItem {
@@ -143,7 +172,8 @@ pub fn list_events(
         .append_pair("timeMin", &time_min.to_rfc3339())
         .append_pair("timeMax", &time_max.to_rfc3339())
         .append_pair("singleEvents", "true")
-        .append_pair("orderBy", "startTime");
+        .append_pair("orderBy", "startTime")
+        .append_pair("conferenceDataVersion", "1");
 
     let mut events = Vec::new();
     let mut page_token: Option<String> = None;
@@ -201,6 +231,40 @@ pub fn update_event(
         url.as_str(),
         Some(&body),
     )
+}
+
+pub fn create_event(
+    access_token: &str,
+    calendar_id: &str,
+    draft: &crate::store::EventDraft,
+) -> Result<String, String> {
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars")
+        .map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid calendar API base URL".to_string())?
+        .push(calendar_id)
+        .push("events");
+    let client = reqwest::blocking::Client::new();
+    let body =
+        serde_json::to_string(&GoogleEventPatch::from_draft(draft)).map_err(|e| e.to_string())?;
+    let response = client
+        .post(url)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Google API error ({status}): {body}"));
+    }
+    serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| e.to_string())?
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "Google created an event without an ID".to_string())
 }
 
 pub fn delete_event(access_token: &str, calendar_id: &str, event_id: &str) -> Result<(), String> {
@@ -322,6 +386,7 @@ mod tests {
                 date_time: None,
                 time_zone: None,
             },
+            conference_data: None,
             end: EventDateTime {
                 date: Some("2026-07-10".to_string()),
                 date_time: None,
@@ -351,6 +416,7 @@ mod tests {
                 date_time: Some("2026-07-09T11:00:00-05:00".to_string()),
                 time_zone: None,
             },
+            conference_data: None,
         };
 
         assert!(event.is_displayable_calendar_event());
