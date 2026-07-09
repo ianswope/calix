@@ -18,6 +18,7 @@ pub fn build(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -61,6 +62,7 @@ pub fn build(
             day_events,
             on_create.clone(),
             on_edit.clone(),
+            on_move.clone(),
         );
         grid.attach(&cell, col, row, 1, 1);
     }
@@ -76,6 +78,7 @@ fn day_cell(
     day_events: Vec<Event>,
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
 ) -> gtk::Widget {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
     cell.add_css_class("month-cell");
@@ -131,6 +134,26 @@ fn day_cell(
         }
     });
     cell.add_controller(click);
+    add_drop_target(&cell, date, on_move);
 
     cell.upcast()
+}
+
+fn add_drop_target(
+    widget: &impl IsA<gtk::Widget>,
+    date: NaiveDate,
+    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+) {
+    let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+    drop.connect_drop(move |_, value, _, _| {
+        let Ok(event_id) = value.get::<String>() else {
+            return false;
+        };
+        let Ok(event_id) = event_id.parse::<i64>() else {
+            return false;
+        };
+        on_move(event_id, date);
+        true
+    });
+    widget.add_controller(drop);
 }

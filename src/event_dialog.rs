@@ -19,16 +19,25 @@ pub fn open(
     editing: Option<Event>,
     initial_start: DateTime<Local>,
     on_saved: impl Fn() + 'static,
+    remote_update: Option<Rc<dyn Fn(&EventDraft) -> Result<(), String>>>,
+    remote_delete: Option<Rc<dyn Fn() -> Result<(), String>>>,
 ) {
     let on_saved = Rc::new(on_saved);
 
     let dialog = adw::Dialog::builder()
-        .title(if editing.is_some() { "Edit Event" } else { "New Event" })
+        .title(if editing.is_some() {
+            "Edit Event"
+        } else {
+            "New Event"
+        })
         .content_width(420)
         .build();
 
     let cancel_button = gtk::Button::with_label("Cancel");
-    let save_button = gtk::Button::builder().label("Save").css_classes(["suggested-action"]).build();
+    let save_button = gtk::Button::builder()
+        .label("Save")
+        .css_classes(["suggested-action"])
+        .build();
 
     let header = adw::HeaderBar::new();
     header.pack_start(&cancel_button);
@@ -36,10 +45,18 @@ pub fn open(
 
     let title_row = adw::EntryRow::builder().title("Title").build();
     let all_day_row = adw::SwitchRow::builder().title("All day").build();
-    let start_row = adw::EntryRow::builder().title("Start (YYYY-MM-DD HH:MM)").build();
-    let end_row = adw::EntryRow::builder().title("End (YYYY-MM-DD HH:MM)").build();
+    let start_row = adw::EntryRow::builder()
+        .title("Start (YYYY-MM-DD HH:MM)")
+        .build();
+    let end_row = adw::EntryRow::builder()
+        .title("End (YYYY-MM-DD HH:MM)")
+        .build();
     let location_row = adw::EntryRow::builder().title("Location").build();
     let notes_row = adw::EntryRow::builder().title("Notes").build();
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("error");
+    error_label.set_xalign(0.0);
+    error_label.set_wrap(true);
 
     match &editing {
         Some(ev) => {
@@ -71,6 +88,7 @@ pub fn open(
     content.set_margin_start(18);
     content.set_margin_end(18);
     content.append(&group);
+    content.append(&error_label);
 
     if let Some(ev) = &editing {
         let event_id = ev.id;
@@ -85,7 +103,17 @@ pub fn open(
             store,
             #[strong]
             on_saved,
+            #[strong]
+            remote_delete,
+            #[weak]
+            error_label,
             move |_| {
+                if let Some(remote_delete) = &remote_delete {
+                    if let Err(error) = remote_delete() {
+                        error_label.set_label(&error);
+                        return;
+                    }
+                }
                 let _ = store.delete_event(event_id);
                 on_saved();
                 dialog.close();
@@ -116,6 +144,10 @@ pub fn open(
         on_saved,
         #[strong]
         editing,
+        #[strong]
+        remote_update,
+        #[weak]
+        error_label,
         move |_| {
             let all_day = all_day_row.is_active();
             let Some(start) = parse_datetime(&start_row.text(), all_day) else {
@@ -139,7 +171,15 @@ pub fn open(
             };
 
             let result = match &editing {
-                Some(ev) => store.update_event(ev.id, &draft),
+                Some(ev) => {
+                    if let Some(remote_update) = &remote_update {
+                        if let Err(error) = remote_update(&draft) {
+                            error_label.set_label(&error);
+                            return;
+                        }
+                    }
+                    store.update_event(ev.id, &draft)
+                }
                 None => store.create_event(calendar_id, &draft).map(|_| ()),
             };
 
@@ -151,104 +191,6 @@ pub fn open(
     ));
 
     dialog.present(Some(parent));
-}
-
-pub fn open_read_only(parent: &impl IsA<gtk::Widget>, event: Event) {
-    let dialog = adw::Dialog::builder()
-        .title("Event Details")
-        .content_width(440)
-        .build();
-
-    let close_button = gtk::Button::with_label("Close");
-    let header = adw::HeaderBar::new();
-    header.pack_end(&close_button);
-
-    let title = gtk::Label::new(Some(&event.title));
-    title.add_css_class("title-2");
-    title.set_xalign(0.0);
-    title.set_wrap(true);
-
-    let group = adw::PreferencesGroup::new();
-    group.add(&detail_row("Calendar", &event.calendar_name));
-    group.add(&detail_row("Source", event_source(&event)));
-    group.add(&detail_row("When", &event_time_range(&event)));
-    if let Some(location) = event.location.as_deref().filter(|value| !value.trim().is_empty()) {
-        group.add(&detail_row("Location", location));
-    }
-    if let Some(notes) = event.notes.as_deref().filter(|value| !value.trim().is_empty()) {
-        let notes_row = adw::ActionRow::builder()
-            .title("Notes")
-            .subtitle(gtk::glib::markup_escape_text(notes))
-            .build();
-        notes_row.set_subtitle_lines(8);
-        group.add(&notes_row);
-    }
-
-    let read_only = gtk::Label::new(Some("Synced events are read-only in Calix for now."));
-    read_only.add_css_class("dim-label");
-    read_only.set_xalign(0.0);
-    read_only.set_wrap(true);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(18);
-    content.set_margin_bottom(18);
-    content.set_margin_start(18);
-    content.set_margin_end(18);
-    content.append(&title);
-    content.append(&group);
-    content.append(&read_only);
-
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
-    dialog.set_child(Some(&toolbar_view));
-
-    close_button.connect_clicked(clone!(
-        #[weak]
-        dialog,
-        move |_| {
-            dialog.close();
-        }
-    ));
-
-    dialog.present(Some(parent));
-}
-
-fn detail_row(label: &str, value: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(label)
-        .subtitle(gtk::glib::markup_escape_text(value))
-        .build();
-    row.set_subtitle_lines(3);
-    row
-}
-
-fn event_source(event: &Event) -> &'static str {
-    match event.account_provider.as_deref() {
-        Some("google") => "Google Calendar",
-        Some("icloud") => "iCloud Calendar",
-        _ if event.google_event_id.is_some() => "Google Calendar",
-        _ if event.icloud_event_id.is_some() => "iCloud Calendar",
-        _ => "Local",
-    }
-}
-
-fn event_time_range(event: &Event) -> String {
-    if event.all_day {
-        let start = event.start.format(DATE_FORMAT).to_string();
-        let end = event.end.format(DATE_FORMAT).to_string();
-        if start == end {
-            format!("{start}, all day")
-        } else {
-            format!("{start} to {end}, all day")
-        }
-    } else {
-        format!(
-            "{} to {}",
-            event.start.format("%a, %b %-d, %Y %-I:%M %p"),
-            event.end.format("%a, %b %-d, %Y %-I:%M %p")
-        )
-    }
 }
 
 fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {

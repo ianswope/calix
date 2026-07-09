@@ -77,6 +77,43 @@ pub fn calendar_events(
         .collect())
 }
 
+pub fn update_event(
+    credentials: &Credentials,
+    event_href: &str,
+    draft: &EventDraft,
+) -> Result<(), String> {
+    if event_href.contains('#') {
+        return Err("Editing expanded recurring iCloud instances is not supported yet".to_string());
+    }
+    let ics = event_ics(event_href, draft);
+    request(
+        credentials,
+        "PUT",
+        &absolute_url(event_href)?,
+        0,
+        "text/calendar; charset=utf-8",
+        ics,
+    )?;
+    Ok(())
+}
+
+pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), String> {
+    if event_href.contains('#') {
+        return Err(
+            "Deleting expanded recurring iCloud instances is not supported yet".to_string(),
+        );
+    }
+    request(
+        credentials,
+        "DELETE",
+        &absolute_url(event_href)?,
+        0,
+        "text/plain",
+        String::new(),
+    )?;
+    Ok(())
+}
+
 fn current_user_principal(credentials: &Credentials) -> Result<String, String> {
     let body = r#"<?xml version="1.0" encoding="utf-8" ?>
 <D:propfind xmlns:D="DAV:">
@@ -458,6 +495,58 @@ fn caldav_timestamp(dt: DateTime<Local>) -> String {
     dt.with_timezone(&chrono::Utc)
         .format("%Y%m%dT%H%M%SZ")
         .to_string()
+}
+
+fn event_ics(event_href: &str, draft: &EventDraft) -> String {
+    let uid = event_href
+        .trim_end_matches(".ics")
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("calix-event");
+    let (start_key, start_value, end_key, end_value) = if draft.all_day {
+        (
+            "DTSTART;VALUE=DATE",
+            draft.start.format("%Y%m%d").to_string(),
+            "DTEND;VALUE=DATE",
+            draft.end.format("%Y%m%d").to_string(),
+        )
+    } else {
+        (
+            "DTSTART",
+            caldav_timestamp(draft.start),
+            "DTEND",
+            caldav_timestamp(draft.end),
+        )
+    };
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_string(),
+        "VERSION:2.0".to_string(),
+        "PRODID:-//Calix//Calix Calendar//EN".to_string(),
+        "BEGIN:VEVENT".to_string(),
+        format!("UID:{}", escape_ics_text(uid)),
+        format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
+        format!("SUMMARY:{}", escape_ics_text(&draft.title)),
+        format!("{start_key}:{start_value}"),
+        format!("{end_key}:{end_value}"),
+    ];
+    if let Some(location) = &draft.location {
+        lines.push(format!("LOCATION:{}", escape_ics_text(location)));
+    }
+    if let Some(notes) = &draft.notes {
+        lines.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+    }
+    lines.push("END:VEVENT".to_string());
+    lines.push("END:VCALENDAR".to_string());
+    lines.join("\r\n") + "\r\n"
+}
+
+fn escape_ics_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
 }
 
 fn unescape_ics_text(value: &str) -> String {

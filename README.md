@@ -2,7 +2,7 @@
 
 A calendar app for Linux, built because [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and (eventually) direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and one-way Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Synced remote events are currently read-only locally.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Existing synced events can be edited, deleted, and dragged to another day; creating brand-new events still uses the local calendar until a calendar picker exists.
 
 ## Building
 
@@ -72,11 +72,11 @@ iCloud uses CalDAV with an Apple app-specific password:
 4. Enter your Apple Account email and the app-specific password. The password is saved to your system keyring, not to a file.
 5. Use **Sync iCloud** to refresh connected iCloud accounts.
 
-Synced iCloud events are currently read-only in Calix, like synced Google events.
+Synced iCloud events can be edited or deleted when they are simple `.ics` resources. Expanded recurring iCloud instances are still read-only until recurrence exceptions are implemented.
 
 ## Using Calendars
 
-The left sidebar lists local calendars and synced Google/iCloud calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendars are currently read-only in Calix, but their visibility choice is local and is preserved across later syncs.
+The left sidebar lists local calendars and synced Google/iCloud calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
 
 The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add Google**, **Sync Google**, **Add iCloud**, and **Sync iCloud**.
 
@@ -109,8 +109,10 @@ Page navigation deliberately avoids `AdwCarousel::scroll_to()`. In the libadwait
 - [x] Pull Google events from multiple Google accounts into the month/week grid (one-way sync)
 - [x] Show/hide connected calendars from a native sidebar
 - [x] Pull iCloud events via CalDAV (one-way sync)
-- [ ] Two-way Google sync / editing synced Google events
-- [ ] Two-way iCloud CalDAV sync / editing synced iCloud events
+- [x] Basic two-way Google sync / editing synced Google events
+- [x] Basic two-way iCloud CalDAV sync / editing simple synced iCloud events
+- [ ] Calendar picker for creating new events directly on Google/iCloud calendars
+- [ ] Recurrence exception editing for expanded iCloud recurring events
 - [ ] Packaging (AUR, Flatpak)
 
 ## License

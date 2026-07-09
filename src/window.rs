@@ -7,7 +7,7 @@ use crate::date_util::{
 use crate::event_dialog;
 use crate::google;
 use crate::icloud;
-use crate::store::{self, Event, Store};
+use crate::store::{self, Event, EventDraft, Store};
 use crate::views::{month_view, week_view};
 use adw::prelude::*;
 use chrono::{DateTime, Local, NaiveDate};
@@ -184,19 +184,19 @@ impl Ui {
                     None,
                     start,
                     move || ui_for_saved.reset(),
+                    None,
+                    None,
                 );
             })
         };
         let on_edit: Rc<dyn Fn(Event)> = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
-                if event.google_event_id.is_some() || event.icloud_event_id.is_some() {
-                    event_dialog::open_read_only(&ui.carousel, event);
-                    return;
-                }
                 let calendar_id = event.calendar_id;
                 let start = event.start;
                 let ui_for_saved = ui.clone();
+                let remote_update = remote_update_handler(&ui, &event);
+                let remote_delete = remote_delete_handler(&ui, &event);
                 event_dialog::open(
                     &ui.carousel,
                     ui.store.clone(),
@@ -204,6 +204,8 @@ impl Ui {
                     Some(event),
                     start,
                     move || ui_for_saved.reset(),
+                    remote_update,
+                    remote_delete,
                 );
             })
         };
@@ -215,7 +217,8 @@ impl Ui {
                     .store
                     .events_between(store::day_start(range_start), store::day_start(range_end))
                     .unwrap_or_default();
-                month_view::build(date, &events, on_create, on_edit)
+                let on_move = move_handler(self, events.clone());
+                month_view::build(date, &events, on_create, on_edit, on_move)
             }
             ViewMode::Week => {
                 let (range_start, range_end) = week_bounds(date);
@@ -223,7 +226,8 @@ impl Ui {
                     .store
                     .events_between(store::day_start(range_start), store::day_start(range_end))
                     .unwrap_or_default();
-                week_view::build(date, &events, on_create, on_edit)
+                let on_move = move_handler(self, events.clone());
+                week_view::build(date, &events, on_create, on_edit, on_move)
             }
             ViewMode::Day => {
                 let (range_start, range_end) = day_bounds(date);
@@ -231,7 +235,8 @@ impl Ui {
                     .store
                     .events_between(store::day_start(range_start), store::day_start(range_end))
                     .unwrap_or_default();
-                week_view::build_day(date, &events, on_create, on_edit)
+                let on_move = move_handler(self, events.clone());
+                week_view::build_day(date, &events, on_create, on_edit, on_move)
             }
         }
     }
@@ -320,6 +325,8 @@ pub fn build(app: &adw::Application) {
                 None,
                 start,
                 move || ui2.reset(),
+                None,
+                None,
             );
         }
     ));
@@ -627,6 +634,116 @@ fn set_view_mode(ui: &Rc<Ui>, view_mode: ViewMode) {
     let _ = ui
         .store
         .set_setting(ViewMode::SETTING_KEY, view_mode.as_setting());
+}
+
+fn remote_update_handler(
+    ui: &Rc<Ui>,
+    event: &Event,
+) -> Option<Rc<dyn Fn(&EventDraft) -> Result<(), String>>> {
+    match event.account_provider.as_deref() {
+        Some("google") => {
+            let config = ui.config.google.clone()?;
+            let token_key = event.account_token_key.clone()?;
+            let calendar_id = event.google_calendar_id.clone()?;
+            let event_id = event.google_event_id.clone()?;
+            Some(Rc::new(move |draft| {
+                let access_token = google::oauth::get_access_token(&config, &token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                google::calendar_api::update_event(&access_token, &calendar_id, &event_id, draft)
+            }))
+        }
+        Some("icloud") => {
+            let apple_id = event.account_provider_id.clone()?;
+            let token_key = event.account_token_key.clone()?;
+            let event_href = event.icloud_event_id.clone()?;
+            Some(Rc::new(move |draft| {
+                let app_password = icloud::credentials::app_password(&token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
+                let credentials = icloud::caldav::Credentials {
+                    apple_id: apple_id.clone(),
+                    app_password,
+                };
+                icloud::caldav::update_event(&credentials, &event_href, draft)
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn remote_delete_handler(ui: &Rc<Ui>, event: &Event) -> Option<Rc<dyn Fn() -> Result<(), String>>> {
+    match event.account_provider.as_deref() {
+        Some("google") => {
+            let config = ui.config.google.clone()?;
+            let token_key = event.account_token_key.clone()?;
+            let calendar_id = event.google_calendar_id.clone()?;
+            let event_id = event.google_event_id.clone()?;
+            Some(Rc::new(move || {
+                let access_token = google::oauth::get_access_token(&config, &token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                google::calendar_api::delete_event(&access_token, &calendar_id, &event_id)
+            }))
+        }
+        Some("icloud") => {
+            let apple_id = event.account_provider_id.clone()?;
+            let token_key = event.account_token_key.clone()?;
+            let event_href = event.icloud_event_id.clone()?;
+            Some(Rc::new(move || {
+                let app_password = icloud::credentials::app_password(&token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
+                let credentials = icloud::caldav::Credentials {
+                    apple_id: apple_id.clone(),
+                    app_password,
+                };
+                icloud::caldav::delete_event(&credentials, &event_href)
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> Rc<dyn Fn(i64, NaiveDate)> {
+    let ui = ui.clone();
+    Rc::new(move |event_id, target_date| {
+        let Some(event) = events.iter().find(|event| event.id == event_id).cloned() else {
+            return;
+        };
+        let draft = moved_draft(&event, target_date);
+        if let Some(remote_update) = remote_update_handler(&ui, &event) {
+            if let Err(error) = remote_update(&draft) {
+                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Couldn't move remote event: {error}"
+                )));
+                return;
+            }
+        }
+        if let Err(error) = ui.store.update_event(event.id, &draft) {
+            ui.toast_overlay
+                .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+            return;
+        }
+        ui.reset();
+    })
+}
+
+fn moved_draft(event: &Event, target_date: NaiveDate) -> EventDraft {
+    let duration = event.end - event.start;
+    let start = target_date
+        .and_time(event.start.time())
+        .and_local_timezone(Local)
+        .single()
+        .unwrap_or(event.start);
+    EventDraft {
+        title: event.title.clone(),
+        start,
+        end: start + duration,
+        all_day: event.all_day,
+        location: event.location.clone(),
+        notes: event.notes.clone(),
+    }
 }
 
 /// Now, rounded up to the next :00 or :30 — a sensible default start time
