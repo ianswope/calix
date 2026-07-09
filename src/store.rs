@@ -35,6 +35,7 @@ pub struct Event {
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
 /// separately since callers building this don't yet know or can't change
 /// them.
+#[derive(Clone)]
 pub struct EventDraft {
     pub title: String,
     pub start: DateTime<Local>,
@@ -58,7 +59,6 @@ pub struct Calendar {
     pub name: String,
     pub color: String,
     pub visible: bool,
-    pub read_only: bool,
     pub google_calendar_id: Option<String>,
     pub icloud_calendar_id: Option<String>,
 }
@@ -124,12 +124,6 @@ impl Store {
         )?;
         ensure_column(&conn, "calendars", "google_calendar_id", "TEXT")?;
         ensure_column(&conn, "calendars", "visible", "INTEGER NOT NULL DEFAULT 1")?;
-        ensure_column(
-            &conn,
-            "calendars",
-            "read_only",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
         ensure_column(&conn, "events", "google_event_id", "TEXT")?;
         ensure_column(&conn, "calendars", "icloud_calendar_id", "TEXT")?;
         ensure_column(&conn, "events", "icloud_event_id", "TEXT")?;
@@ -200,7 +194,7 @@ impl Store {
 
     pub fn local_calendars(&self) -> rusqlite::Result<Vec<Calendar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, color, visible, read_only, google_calendar_id, icloud_calendar_id
+            "SELECT id, name, color, visible, google_calendar_id, icloud_calendar_id
              FROM calendars
              WHERE account_id IS NULL
              ORDER BY name",
@@ -211,7 +205,7 @@ impl Store {
 
     pub fn calendars_for_account(&self, account_id: i64) -> rusqlite::Result<Vec<Calendar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, color, visible, read_only, google_calendar_id, icloud_calendar_id
+            "SELECT id, name, color, visible, google_calendar_id, icloud_calendar_id
              FROM calendars
              WHERE account_id = ?1
              ORDER BY name",
@@ -304,17 +298,17 @@ impl Store {
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
             "UPDATE calendars
-             SET account_id = ?1, name = ?3, color = ?4, read_only = 1
+             SET account_id = ?1, name = ?3, color = ?4
              WHERE account_id IS NULL AND google_calendar_id = ?2",
             params![account_id, google_calendar_id, name, color],
         )?;
 
         self.conn.query_row(
-            "INSERT INTO calendars (account_id, name, color, google_calendar_id, visible, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+            "INSERT INTO calendars (account_id, name, color, google_calendar_id, visible)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(account_id, google_calendar_id)
              WHERE account_id IS NOT NULL AND google_calendar_id IS NOT NULL
-             DO UPDATE SET name = ?2, color = ?3, read_only = 1
+             DO UPDATE SET name = ?2, color = ?3
              RETURNING id",
             params![account_id, name, color, google_calendar_id, visible as i64],
             |row| row.get(0),
@@ -330,11 +324,11 @@ impl Store {
         visible: bool,
     ) -> rusqlite::Result<i64> {
         self.conn.query_row(
-            "INSERT INTO calendars (account_id, name, color, icloud_calendar_id, visible, read_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+            "INSERT INTO calendars (account_id, name, color, icloud_calendar_id, visible)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(account_id, icloud_calendar_id)
              WHERE account_id IS NOT NULL AND icloud_calendar_id IS NOT NULL
-             DO UPDATE SET name = ?2, color = ?3, read_only = 1
+             DO UPDATE SET name = ?2, color = ?3
              RETURNING id",
             params![account_id, name, color, icloud_calendar_id, visible as i64],
             |row| row.get(0),
@@ -466,11 +460,19 @@ impl Store {
         &self,
         calendar_id: i64,
         keep_google_ids: &[String],
+        range_start: DateTime<Local>,
+        range_end: DateTime<Local>,
     ) -> rusqlite::Result<()> {
         if keep_google_ids.is_empty() {
             self.conn.execute(
-                "DELETE FROM events WHERE calendar_id = ?1 AND google_event_id IS NOT NULL",
-                params![calendar_id],
+                "DELETE FROM events
+                 WHERE calendar_id = ?1 AND google_event_id IS NOT NULL
+                   AND start_at < ?2 AND end_at > ?3",
+                params![
+                    calendar_id,
+                    range_end.to_rfc3339(),
+                    range_start.to_rfc3339()
+                ],
             )?;
             return Ok(());
         }
@@ -481,10 +483,14 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "DELETE FROM events WHERE calendar_id = ? AND google_event_id IS NOT NULL
-             AND google_event_id NOT IN ({placeholders})"
+            "DELETE FROM events
+             WHERE calendar_id = ? AND google_event_id IS NOT NULL
+               AND start_at < ? AND end_at > ?
+               AND google_event_id NOT IN ({placeholders})"
         );
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
+        let range_end = range_end.to_rfc3339();
+        let range_start = range_start.to_rfc3339();
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id, &range_end, &range_start];
         params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
@@ -494,11 +500,19 @@ impl Store {
         &self,
         calendar_id: i64,
         keep_icloud_ids: &[String],
+        range_start: DateTime<Local>,
+        range_end: DateTime<Local>,
     ) -> rusqlite::Result<()> {
         if keep_icloud_ids.is_empty() {
             self.conn.execute(
-                "DELETE FROM events WHERE calendar_id = ?1 AND icloud_event_id IS NOT NULL",
-                params![calendar_id],
+                "DELETE FROM events
+                 WHERE calendar_id = ?1 AND icloud_event_id IS NOT NULL
+                   AND start_at < ?2 AND end_at > ?3",
+                params![
+                    calendar_id,
+                    range_end.to_rfc3339(),
+                    range_start.to_rfc3339()
+                ],
             )?;
             return Ok(());
         }
@@ -509,10 +523,14 @@ impl Store {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "DELETE FROM events WHERE calendar_id = ? AND icloud_event_id IS NOT NULL
-             AND icloud_event_id NOT IN ({placeholders})"
+            "DELETE FROM events
+             WHERE calendar_id = ? AND icloud_event_id IS NOT NULL
+               AND start_at < ? AND end_at > ?
+               AND icloud_event_id NOT IN ({placeholders})"
         );
-        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
+        let range_end = range_end.to_rfc3339();
+        let range_start = range_start.to_rfc3339();
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id, &range_end, &range_start];
         params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
@@ -564,6 +582,57 @@ impl Store {
         );
         let mut calendar_params: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
         calendar_params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn
+            .execute(&calendar_sql, calendar_params.as_slice())?;
+        Ok(())
+    }
+
+    pub fn prune_google_calendars(
+        &self,
+        account_id: i64,
+        keep_google_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        if keep_google_ids.is_empty() {
+            self.conn.execute(
+                "DELETE FROM events
+                 WHERE calendar_id IN (
+                     SELECT id FROM calendars
+                     WHERE account_id = ?1 AND google_calendar_id IS NOT NULL
+                 )",
+                params![account_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM calendars
+                 WHERE account_id = ?1 AND google_calendar_id IS NOT NULL",
+                params![account_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders = keep_google_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let event_sql = format!(
+            "DELETE FROM events
+             WHERE calendar_id IN (
+                 SELECT id FROM calendars
+                 WHERE account_id = ? AND google_calendar_id IS NOT NULL
+                   AND google_calendar_id NOT IN ({placeholders})
+             )"
+        );
+        let mut event_params: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+        event_params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn.execute(&event_sql, event_params.as_slice())?;
+
+        let calendar_sql = format!(
+            "DELETE FROM calendars
+             WHERE account_id = ? AND google_calendar_id IS NOT NULL
+               AND google_calendar_id NOT IN ({placeholders})"
+        );
+        let mut calendar_params: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+        calendar_params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn
             .execute(&calendar_sql, calendar_params.as_slice())?;
         Ok(())
@@ -628,9 +697,8 @@ fn row_to_calendar(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
         name: row.get(1)?,
         color: row.get(2)?,
         visible: row.get::<_, i64>(3)? != 0,
-        read_only: row.get::<_, i64>(4)? != 0,
-        google_calendar_id: row.get(5)?,
-        icloud_calendar_id: row.get(6)?,
+        google_calendar_id: row.get(4)?,
+        icloud_calendar_id: row.get(5)?,
     })
 }
 
@@ -757,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn list_calendars_returns_visibility_and_read_only_state() {
+    fn list_calendars_returns_visibility_and_source_ids() {
         let store = Store::open_in_memory().unwrap();
         let account_id = store
             .upsert_google_account(
@@ -778,10 +846,8 @@ mod tests {
 
         assert_eq!(local.len(), 1);
         assert!(local[0].visible);
-        assert!(!local[0].read_only);
         assert_eq!(remote.len(), 1);
         assert!(!remote[0].visible);
-        assert!(remote[0].read_only);
         assert_eq!(remote[0].google_calendar_id.as_deref(), Some("cal-abc"));
     }
 
@@ -1053,7 +1119,12 @@ mod tests {
             .unwrap();
 
         store
-            .prune_google_events(calendar_id, &["keep".to_string()])
+            .prune_google_events(
+                calendar_id,
+                &["keep".to_string()],
+                start - Duration::minutes(1),
+                end + Duration::minutes(1),
+            )
             .unwrap();
 
         let events = store
@@ -1091,7 +1162,14 @@ mod tests {
             .create_event(calendar_id, &draft("Local one", start, end))
             .unwrap();
 
-        store.prune_google_events(calendar_id, &[]).unwrap();
+        store
+            .prune_google_events(
+                calendar_id,
+                &[],
+                start - Duration::minutes(1),
+                end + Duration::minutes(1),
+            )
+            .unwrap();
 
         let events = store
             .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
@@ -1099,5 +1177,76 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "Local one");
         assert!(events[0].google_event_id.is_none());
+    }
+
+    #[test]
+    fn pruning_a_sync_window_preserves_cached_events_outside_it() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account("person@example.com", "Person", "token")
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let now = Local::now();
+        let old_start = now - Duration::days(365);
+
+        store
+            .upsert_google_event(
+                calendar_id,
+                "old-event",
+                &draft("Old", old_start, old_start + Duration::hours(1)),
+            )
+            .unwrap();
+        store
+            .upsert_google_event(
+                calendar_id,
+                "stale-current-event",
+                &draft("Stale", now, now + Duration::hours(1)),
+            )
+            .unwrap();
+
+        store
+            .prune_google_events(
+                calendar_id,
+                &[],
+                now - Duration::days(1),
+                now + Duration::days(1),
+            )
+            .unwrap();
+
+        let old_events = store
+            .events_between(
+                old_start - Duration::minutes(1),
+                old_start + Duration::hours(2),
+            )
+            .unwrap();
+        assert_eq!(old_events.len(), 1);
+        let current_events = store
+            .events_between(now - Duration::minutes(1), now + Duration::hours(2))
+            .unwrap();
+        assert!(current_events.is_empty());
+    }
+
+    #[test]
+    fn pruning_google_calendars_removes_unsubscribed_calendars() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account("person@example.com", "Person", "token")
+            .unwrap();
+        store
+            .upsert_google_calendar(account_id, "keep", "Keep", "#ff0000", true)
+            .unwrap();
+        store
+            .upsert_google_calendar(account_id, "remove", "Remove", "#00ff00", true)
+            .unwrap();
+
+        store
+            .prune_google_calendars(account_id, &["keep".to_string()])
+            .unwrap();
+
+        let calendars = store.calendars_for_account(account_id).unwrap();
+        assert_eq!(calendars.len(), 1);
+        assert_eq!(calendars[0].google_calendar_id.as_deref(), Some("keep"));
     }
 }

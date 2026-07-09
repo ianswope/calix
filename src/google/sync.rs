@@ -31,6 +31,13 @@ pub fn sync_account(access_token: &str, store: &Store, account_id: i64) -> Resul
 
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
     let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
+    let calendar_ids = calendars
+        .iter()
+        .map(|calendar| calendar.id.clone())
+        .collect::<Vec<_>>();
+    store
+        .prune_google_calendars(account_id, &calendar_ids)
+        .map_err(|e| e.to_string())?;
 
     for calendar in &calendars {
         let color = calendar
@@ -83,7 +90,7 @@ pub fn sync_account(access_token: &str, store: &Store, account_id: i64) -> Resul
             synced_ids.push(event.id.clone());
         }
         store
-            .prune_google_events(local_calendar_id, &synced_ids)
+            .prune_google_events(local_calendar_id, &synced_ids, time_min, time_max)
             .map_err(|e| e.to_string())?;
     }
 

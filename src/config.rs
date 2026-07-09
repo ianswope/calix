@@ -17,7 +17,9 @@ impl Config {
     /// configured" — not an error, since that's the normal state until a
     /// user follows the README's OAuth client setup steps.
     pub fn load() -> Config {
-        let path = gtk::glib::user_config_dir().join("calix").join("config.toml");
+        let path = gtk::glib::user_config_dir()
+            .join("calix")
+            .join("config.toml");
         let Ok(contents) = std::fs::read_to_string(&path) else {
             return Config::default();
         };

@@ -1,5 +1,5 @@
 use chrono::Datelike;
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use oauth2::reqwest;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -28,14 +28,35 @@ impl CalendarListEntry {
 struct CalendarListResponse {
     #[serde(default)]
     items: Vec<CalendarListEntry>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 /// Lists the calendars on the signed-in Google account.
 pub fn list_calendars(access_token: &str) -> Result<Vec<CalendarListEntry>, String> {
-    let url = "https://www.googleapis.com/calendar/v3/users/me/calendarList";
-    let body = get(access_token, url)?;
-    let parsed: CalendarListResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(parsed.items)
+    let url = Url::parse("https://www.googleapis.com/calendar/v3/users/me/calendarList")
+        .map_err(|e| e.to_string())?;
+    let mut calendars = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut page_url = url.clone();
+        if let Some(page_token) = &page_token {
+            page_url
+                .query_pairs_mut()
+                .append_pair("pageToken", page_token);
+        }
+        let body = get(access_token, page_url.as_str())?;
+        let parsed: CalendarListResponse =
+            serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        calendars.extend(parsed.items);
+        page_token = parsed.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+
+    Ok(calendars)
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +85,8 @@ pub struct EventDateTime {
     pub date: Option<String>,
     #[serde(rename = "dateTime")]
     pub date_time: Option<String>,
+    #[serde(rename = "timeZone")]
+    pub time_zone: Option<String>,
 }
 
 impl EventDateTime {
@@ -72,7 +95,12 @@ impl EventDateTime {
     /// which shouldn't happen for a well-formed event.
     pub fn to_local(&self) -> Option<(DateTime<Local>, bool)> {
         if let Some(date_time) = &self.date_time {
-            let parsed = DateTime::parse_from_rfc3339(date_time).ok()?;
+            if let Ok(parsed) = DateTime::parse_from_rfc3339(date_time) {
+                return Some((parsed.with_timezone(&Local), false));
+            }
+            let timezone = self.time_zone.as_deref()?.parse::<chrono_tz::Tz>().ok()?;
+            let naive = NaiveDateTime::parse_from_str(date_time, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
+            let parsed = timezone.from_local_datetime(&naive).earliest()?;
             return Some((parsed.with_timezone(&Local), false));
         }
         let date = NaiveDate::parse_from_str(self.date.as_deref()?, "%Y-%m-%d").ok()?;
@@ -87,6 +115,8 @@ impl EventDateTime {
 struct EventListResponse {
     #[serde(default)]
     items: Vec<EventItem>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 /// Lists events on `calendar_id` overlapping [`time_min`, `time_max`),
@@ -115,14 +145,30 @@ pub fn list_events(
         .append_pair("singleEvents", "true")
         .append_pair("orderBy", "startTime");
 
-    let body = get(access_token, url.as_str())?;
-    let parsed: EventListResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-    Ok(parsed
-        .items
-        .into_iter()
-        .filter(|e| e.status != "cancelled")
-        .filter(|e| e.is_displayable_calendar_event())
-        .collect())
+    let mut events = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut page_url = url.clone();
+        if let Some(page_token) = &page_token {
+            page_url
+                .query_pairs_mut()
+                .append_pair("pageToken", page_token);
+        }
+        let body = get(access_token, page_url.as_str())?;
+        let parsed: EventListResponse = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        events.extend(
+            parsed
+                .items
+                .into_iter()
+                .filter(|event| event.status != "cancelled")
+                .filter(EventItem::is_displayable_calendar_event),
+        );
+        page_token = parsed.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+    Ok(events)
 }
 
 fn get(access_token: &str, url: &str) -> Result<String, String> {
@@ -198,9 +244,7 @@ fn request_json<T: Serialize>(
 #[derive(Serialize)]
 struct GoogleEventPatch {
     summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     location: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
     start: GoogleEventDateTime,
     end: GoogleEventDateTime,
@@ -276,10 +320,12 @@ mod tests {
             start: EventDateTime {
                 date: Some("2026-07-09".to_string()),
                 date_time: None,
+                time_zone: None,
             },
             end: EventDateTime {
                 date: Some("2026-07-10".to_string()),
                 date_time: None,
+                time_zone: None,
             },
         };
 
@@ -298,13 +344,50 @@ mod tests {
             start: EventDateTime {
                 date: None,
                 date_time: Some("2026-07-09T10:00:00-05:00".to_string()),
+                time_zone: None,
             },
             end: EventDateTime {
                 date: None,
                 date_time: Some("2026-07-09T11:00:00-05:00".to_string()),
+                time_zone: None,
             },
         };
 
         assert!(event.is_displayable_calendar_event());
+    }
+
+    #[test]
+    fn google_patch_clears_absent_optional_fields() {
+        let now = Local::now();
+        let draft = crate::store::EventDraft {
+            title: "Planning".to_string(),
+            start: now,
+            end: now + chrono::Duration::hours(1),
+            all_day: false,
+            location: None,
+            notes: None,
+        };
+
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+
+        assert!(json["location"].is_null());
+        assert!(json["description"].is_null());
+    }
+
+    #[test]
+    fn google_event_datetime_uses_its_declared_timezone_without_an_offset() {
+        let datetime = EventDateTime {
+            date: None,
+            date_time: Some("2026-07-09T09:00:00".to_string()),
+            time_zone: Some("America/New_York".to_string()),
+        };
+
+        let (local, all_day) = datetime.to_local().unwrap();
+
+        assert!(!all_day);
+        assert_eq!(
+            local.with_timezone(&chrono::Utc),
+            chrono::Utc.with_ymd_and_hms(2026, 7, 9, 13, 0, 0).unwrap()
+        );
     }
 }

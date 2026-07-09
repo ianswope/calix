@@ -29,16 +29,16 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
         "google",
     );
 
-    if let Ok(local_calendars) = store.local_calendars() {
-        if !local_calendars.is_empty() {
-            content.append(&calendar_group(
-                "On My Computer",
-                None,
-                local_calendars,
-                store.clone(),
-                on_changed.clone(),
-            ));
-        }
+    if let Ok(local_calendars) = store.local_calendars()
+        && !local_calendars.is_empty()
+    {
+        content.append(&calendar_group(
+            "On My Computer",
+            None,
+            local_calendars,
+            store.clone(),
+            on_changed.clone(),
+        ));
     }
 
     gtk::ScrolledWindow::builder()
@@ -158,14 +158,12 @@ fn calendar_group(
 
 fn calendar_row(calendar: Calendar, store: Rc<Store>, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
     let subtitle = match (
-        calendar.read_only,
         calendar.google_calendar_id.as_deref(),
         calendar.icloud_calendar_id.as_deref(),
     ) {
-        (true, Some(_), _) => "Read-only Google calendar",
-        (true, _, Some(_)) => "Read-only iCloud calendar",
-        (true, _, _) => "Read-only calendar",
-        (false, _, _) => "Local calendar",
+        (Some(_), _) => "Google calendar",
+        (_, Some(_)) => "iCloud calendar",
+        _ => "Local calendar",
     };
 
     let row = adw::ActionRow::builder()

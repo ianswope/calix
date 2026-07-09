@@ -1,6 +1,6 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
-use crate::views::event_widget;
+use crate::views::{event_occurs_on_day, event_widget};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
 use std::rc::Rc;
@@ -52,7 +52,7 @@ pub fn build(
         let col = (i % 7) as i32;
         let day_events: Vec<Event> = events
             .iter()
-            .filter(|e| e.start.date_naive() <= *date && e.end.date_naive() >= *date)
+            .filter(|event| event_occurs_on_day(event, *date))
             .cloned()
             .collect();
         let cell = day_cell(

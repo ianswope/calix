@@ -7,6 +7,7 @@ use oauth2::{
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::time::{Duration, Instant};
 use url::Url;
 
 const KEYRING_SERVICE: &str = "com.ianswope.Calix";
@@ -18,6 +19,7 @@ const SCOPES: [&str; 2] = [
 ];
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
+const REDIRECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 pub struct SignInTokens {
     pub access_token: String,
@@ -31,6 +33,7 @@ pub enum AuthError {
     MissingRedirectCode,
     StateMismatch,
     NoRefreshToken,
+    RedirectTimedOut,
     Keyring(keyring::Error),
 }
 
@@ -48,6 +51,9 @@ impl std::fmt::Display for AuthError {
                     f,
                     "Google didn't return a refresh token — try disconnecting and reconnecting"
                 )
+            }
+            AuthError::RedirectTimedOut => {
+                write!(f, "Google sign-in timed out; try Add Google again")
             }
             AuthError::Keyring(e) => write!(f, "couldn't access the system keyring: {e}"),
         }
@@ -77,16 +83,6 @@ pub fn copy_refresh_token(from_token_key: &str, to_token_key: &str) -> Result<bo
     Ok(true)
 }
 
-// Not wired into any UI yet — there's no "disconnect" action in the
-// header, just connect/sync. Kept ready for whenever a settings view
-// exists to put it in.
-#[allow(dead_code)]
-pub fn sign_out(token_key: &str) {
-    if let Ok(entry) = keyring_entry(token_key) {
-        let _ = entry.delete_credential();
-    }
-}
-
 /// Runs the full interactive OAuth flow: opens the user's browser, waits for
 /// the redirect on a one-shot local loopback listener, exchanges the code
 /// for tokens, and saves the refresh token to the system keyring.
@@ -96,6 +92,7 @@ pub fn sign_out(token_key: &str) {
 /// main thread.
 pub fn sign_in(config: &GoogleConfig) -> Result<SignInTokens, AuthError> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(AuthError::Io)?;
+    listener.set_nonblocking(true).map_err(AuthError::Io)?;
     let port = listener.local_addr().map_err(AuthError::Io)?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
@@ -121,7 +118,7 @@ pub fn sign_in(config: &GoogleConfig) -> Result<SignInTokens, AuthError> {
         .add_extra_param("prompt", "select_account consent")
         .url();
 
-    open_in_browser(auth_url.as_str());
+    open_in_browser(auth_url.as_str())?;
 
     let (code, state) = receive_redirect(&listener)?;
     if state.secret() != csrf_token.secret() {
@@ -186,7 +183,19 @@ fn http_client() -> Result<reqwest::blocking::Client, AuthError> {
 }
 
 fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfToken), AuthError> {
-    let (mut stream, _) = listener.accept().map_err(AuthError::Io)?;
+    let deadline = Instant::now() + REDIRECT_TIMEOUT;
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(AuthError::RedirectTimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(AuthError::Io(error)),
+        }
+    };
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).map_err(AuthError::Io)?;
@@ -220,6 +229,10 @@ fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfTo
     Ok((code, state))
 }
 
-fn open_in_browser(url: &str) {
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+fn open_in_browser(url: &str) -> Result<(), AuthError> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(AuthError::Io)
 }

@@ -51,7 +51,7 @@ pub fn sync_account(
             synced_ids.push(event.href);
         }
         store
-            .prune_icloud_events(local_calendar_id, &synced_ids)
+            .prune_icloud_events(local_calendar_id, &synced_ids, time_min, time_max)
             .map_err(|e| e.to_string())?;
     }
 
