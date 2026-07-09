@@ -175,12 +175,11 @@ impl Ui {
         let on_create: Rc<dyn Fn(DateTime<Local>)> = {
             let ui = self.clone();
             Rc::new(move |start: DateTime<Local>| {
-                let calendar_id = ui.store.default_calendar_id();
                 let ui_for_saved = ui.clone();
                 event_dialog::open(
                     &ui.carousel,
                     ui.store.clone(),
-                    calendar_id,
+                    create_targets(&ui),
                     None,
                     start,
                     move || ui_for_saved.reset(),
@@ -191,14 +190,13 @@ impl Ui {
         let on_edit: Rc<dyn Fn(Event)> = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
-                let calendar_id = event.calendar_id;
                 let start = event.start;
                 let ui_for_saved = ui.clone();
                 let remote_event = remote_event_handler(&ui, &event);
                 event_dialog::open(
                     &ui.carousel,
                     ui.store.clone(),
-                    calendar_id,
+                    Vec::new(),
                     Some(event),
                     start,
                     move || ui_for_saved.reset(),
@@ -312,13 +310,12 @@ pub fn build(app: &adw::Application) {
         #[strong]
         ui,
         move |_| {
-            let calendar_id = ui.store.default_calendar_id();
             let start = next_half_hour();
             let ui2 = ui.clone();
             event_dialog::open(
                 &ui.carousel,
                 ui.store.clone(),
-                calendar_id,
+                create_targets(&ui),
                 None,
                 start,
                 move || ui2.reset(),
@@ -672,6 +669,60 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
         }
         _ => None,
     }
+}
+
+fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::CreateTarget> {
+    ui.store
+        .calendar_connections()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|calendar| match calendar.provider.as_deref() {
+            Some("google") => match (
+                ui.config.google.clone(),
+                calendar.token_key,
+                calendar.google_calendar_id,
+            ) {
+                (Some(config), Some(token_key), Some(google_calendar_id)) => {
+                    event_dialog::CreateTarget::Google {
+                        calendar_id: calendar.id,
+                        name: calendar.name,
+                        config,
+                        token_key,
+                        google_calendar_id,
+                    }
+                }
+                _ => event_dialog::CreateTarget::Unavailable {
+                    calendar_id: calendar.id,
+                    name: calendar.name,
+                    error: "Google calendar is not configured on this machine".to_string(),
+                },
+            },
+            Some("icloud") => match (
+                calendar.provider_account_id,
+                calendar.token_key,
+                calendar.icloud_calendar_id,
+            ) {
+                (Some(apple_id), Some(token_key), Some(calendar_href)) => {
+                    event_dialog::CreateTarget::Icloud {
+                        calendar_id: calendar.id,
+                        name: calendar.name,
+                        apple_id,
+                        token_key,
+                        calendar_href,
+                    }
+                }
+                _ => event_dialog::CreateTarget::Unavailable {
+                    calendar_id: calendar.id,
+                    name: calendar.name,
+                    error: "iCloud calendar is missing sync metadata".to_string(),
+                },
+            },
+            _ => event_dialog::CreateTarget::Local {
+                calendar_id: calendar.id,
+                name: calendar.name,
+            },
+        })
+        .collect()
 }
 
 fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> Rc<dyn Fn(i64, NaiveDate)> {

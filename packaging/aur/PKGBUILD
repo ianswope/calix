@@ -1,0 +1,27 @@
+pkgname=calix
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native GTK4 calendar for Linux with Google and iCloud sync"
+arch=('x86_64')
+url='https://github.com/ianswope/calix'
+license=('MIT')
+depends=('gtk4' 'libadwaita')
+makedepends=('cargo' 'pkgconf')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${pkgname}-${pkgver}"
+  cargo build --release --locked
+}
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  install -Dm755 target/release/calix "${pkgdir}/usr/bin/calix"
+  install -Dm644 dist/com.ianswope.Calix.desktop \
+    "${pkgdir}/usr/share/applications/com.ianswope.Calix.desktop"
+  install -Dm644 dist/com.ianswope.Calix.svg \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

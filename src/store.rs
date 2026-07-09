@@ -63,6 +63,17 @@ pub struct Calendar {
     pub icloud_calendar_id: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct CalendarConnection {
+    pub id: i64,
+    pub name: String,
+    pub provider: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub token_key: Option<String>,
+    pub google_calendar_id: Option<String>,
+    pub icloud_calendar_id: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -167,6 +178,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn default_calendar_id(&self) -> i64 {
         1
     }
@@ -211,6 +223,29 @@ impl Store {
              ORDER BY name",
         )?;
         let rows = stmt.query_map(params![account_id], row_to_calendar)?;
+        rows.collect()
+    }
+
+    pub fn calendar_connections(&self) -> rusqlite::Result<Vec<CalendarConnection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT calendars.id, calendars.name, accounts.provider,
+                    accounts.provider_account_id, accounts.token_key,
+                    calendars.google_calendar_id, calendars.icloud_calendar_id
+             FROM calendars
+             LEFT JOIN accounts ON accounts.id = calendars.account_id
+             ORDER BY accounts.provider IS NOT NULL, accounts.display_name, calendars.name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(CalendarConnection {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                provider: row.get(2)?,
+                provider_account_id: row.get(3)?,
+                token_key: row.get(4)?,
+                google_calendar_id: row.get(5)?,
+                icloud_calendar_id: row.get(6)?,
+            })
+        })?;
         rows.collect()
     }
 
