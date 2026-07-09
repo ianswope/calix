@@ -45,8 +45,16 @@ pub struct EventItem {
     pub description: Option<String>,
     #[serde(default)]
     pub status: String,
+    #[serde(default, rename = "eventType")]
+    pub event_type: String,
     pub start: EventDateTime,
     pub end: EventDateTime,
+}
+
+impl EventItem {
+    pub fn is_displayable_calendar_event(&self) -> bool {
+        self.event_type.is_empty() || self.event_type == "default"
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +120,7 @@ pub fn list_events(
         .items
         .into_iter()
         .filter(|e| e.status != "cancelled")
+        .filter(|e| e.is_displayable_calendar_event())
         .collect())
 }
 
@@ -129,4 +138,53 @@ fn get(access_token: &str, url: &str) -> Result<String, String> {
         return Err(format!("Google API error ({status}): {body}"));
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn google_event_type_filter_skips_working_location_events() {
+        let event = EventItem {
+            id: "evt-1".to_string(),
+            summary: Some("Office".to_string()),
+            location: None,
+            description: None,
+            status: "confirmed".to_string(),
+            event_type: "workingLocation".to_string(),
+            start: EventDateTime {
+                date: Some("2026-07-09".to_string()),
+                date_time: None,
+            },
+            end: EventDateTime {
+                date: Some("2026-07-10".to_string()),
+                date_time: None,
+            },
+        };
+
+        assert!(!event.is_displayable_calendar_event());
+    }
+
+    #[test]
+    fn google_event_type_filter_keeps_default_events() {
+        let event = EventItem {
+            id: "evt-1".to_string(),
+            summary: Some("Meeting".to_string()),
+            location: None,
+            description: None,
+            status: "confirmed".to_string(),
+            event_type: "default".to_string(),
+            start: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-09T10:00:00-05:00".to_string()),
+            },
+            end: EventDateTime {
+                date: None,
+                date_time: Some("2026-07-09T11:00:00-05:00".to_string()),
+            },
+        };
+
+        assert!(event.is_displayable_calendar_event());
+    }
 }

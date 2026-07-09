@@ -2,7 +2,7 @@
 
 A calendar app for Linux, built because [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and (eventually) direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week grid works, events are stored locally (SQLite) with create/edit/delete, and one-way Google sync can pull calendars from multiple Google accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Synced Google events are currently read-only locally, and CalDAV/iCloud sync isn't built yet.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and one-way Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Synced remote events are currently read-only locally.
 
 ## Building
 
@@ -28,15 +28,27 @@ Google requires every app to bring its own OAuth client — there's no shared on
    client_id = "your-client-id.apps.googleusercontent.com"
    client_secret = "your-client-secret"
    ```
-6. Run Calix and click **Add Google** in the header. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
+6. Run Calix, open the calendar sidebar, and click **Add Google** in the Accounts section. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
 
 If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
 
+## Connecting iCloud Calendar
+
+iCloud uses CalDAV with an Apple app-specific password:
+
+1. Sign in at [account.apple.com](https://account.apple.com).
+2. Under **Sign-In and Security → App-Specific Passwords**, generate a password for Calix.
+3. In Calix, open the calendar sidebar and click **Add iCloud** in the Accounts section.
+4. Enter your Apple Account email and the app-specific password. The password is saved to your system keyring, not to a file.
+5. Use **Sync iCloud** to refresh connected iCloud accounts.
+
+Synced iCloud events are currently read-only in Calix, like synced Google events.
+
 ## Using Calendars
 
-The left sidebar lists local calendars and synced Google calendars. Use the switch next to each calendar to show or hide it in the month/week grid. Google calendars are currently read-only in Calix, but their visibility choice is local and is preserved across later syncs.
+The left sidebar lists local calendars and synced Google/iCloud calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendars are currently read-only in Calix, but their visibility choice is local and is preserved across later syncs.
 
-The calendar button in the header toggles the sidebar. **Sync Google** refreshes calendars and events for all connected Google accounts.
+The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add Google**, **Sync Google**, **Add iCloud**, and **Sync iCloud**.
 
 This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
 
@@ -44,7 +56,7 @@ This file lives outside the repo and is never read by anything that gets committ
 
 - `src/date_util.rs` — pure date-math helpers (month grids, week ranges, month/week shifting), unit tested independent of any GTK state.
 - `src/views/month_view.rs`, `src/views/week_view.rs` — build a single month-grid or week-grid page for a given anchor date.
-- `src/window.rs` — owns the `AdwCarousel` paging between prev/current/next pages, the header bar (Today / prev / next / Month-Week toggle / New Event / Calendars / Add Google / Sync Google), and the current view-mode + date state.
+- `src/window.rs` — owns the `AdwCarousel` paging between prev/current/next pages, the header bar (Today / prev / next / Month-Week-Day toggle / New Event / Calendars), sidebar account actions, and the current view-mode + date state.
 - `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line).
 - `src/store.rs` — SQLite-backed account/calendar/event storage (create/list/update/delete), with in-memory-DB unit tests independent of the GUI.
 - `src/calendar_dialog.rs` — reusable account/calendar list for the sidebar, including per-calendar visibility toggles.
@@ -53,6 +65,7 @@ This file lives outside the repo and is never read by anything that gets committ
 - `src/google/oauth.rs` — the OAuth2 + PKCE sign-in flow (loopback redirect, no embedded browser) and per-account refresh-token storage via the system keyring.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
+- `src/icloud/` — CalDAV discovery/sync for iCloud calendars using an Apple app-specific password stored in the system keyring.
 
 ### A carousel gotcha worth knowing
 
@@ -65,8 +78,9 @@ Page navigation deliberately avoids `AdwCarousel::scroll_to()`. In the libadwait
 - [x] Google sign-in (OAuth + PKCE, verified by fetching the calendar list)
 - [x] Pull Google events from multiple Google accounts into the month/week grid (one-way sync)
 - [x] Show/hide connected calendars from a native sidebar
+- [x] Pull iCloud events via CalDAV (one-way sync)
 - [ ] Two-way Google sync / editing synced Google events
-- [ ] Apple/iCloud calendars via CalDAV (app-specific password)
+- [ ] Two-way iCloud CalDAV sync / editing synced iCloud events
 - [ ] Packaging (AUR, Flatpak)
 
 ## License

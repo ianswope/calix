@@ -16,16 +16,20 @@ pub fn day_start(date: NaiveDate) -> DateTime<Local> {
 pub struct Event {
     pub id: i64,
     pub calendar_id: i64,
+    pub calendar_name: String,
+    pub calendar_color: String,
+    pub account_provider: Option<String>,
     pub title: String,
     pub start: DateTime<Local>,
     pub end: DateTime<Local>,
     pub all_day: bool,
     pub location: Option<String>,
     pub notes: Option<String>,
-    /// `Some` for events synced from Google — editing these locally isn't
-    /// supported yet (a sync would just overwrite the edit), so the UI
-    /// uses this to show them read-only.
+    /// `Some` for events synced from a remote provider — editing these
+    /// locally isn't supported yet (a sync would just overwrite the edit),
+    /// so the UI uses this to show them read-only.
     pub google_event_id: Option<String>,
+    pub icloud_event_id: Option<String>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -56,6 +60,7 @@ pub struct Calendar {
     pub visible: bool,
     pub read_only: bool,
     pub google_calendar_id: Option<String>,
+    pub icloud_calendar_id: Option<String>,
 }
 
 pub struct Store {
@@ -100,6 +105,10 @@ impl Store {
                 location TEXT,
                 notes TEXT
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS events_start_at ON events(start_at);
             ",
         )?;
@@ -122,6 +131,8 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "events", "google_event_id", "TEXT")?;
+        ensure_column(&conn, "calendars", "icloud_calendar_id", "TEXT")?;
+        ensure_column(&conn, "events", "icloud_event_id", "TEXT")?;
 
         conn.execute_batch(
             "
@@ -136,6 +147,11 @@ impl Store {
             DROP INDEX IF EXISTS events_google_id;
             CREATE UNIQUE INDEX IF NOT EXISTS events_google_calendar_id
                 ON events(calendar_id, google_event_id) WHERE google_event_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS calendars_icloud_account_id
+                ON calendars(account_id, icloud_calendar_id)
+                WHERE account_id IS NOT NULL AND icloud_calendar_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS events_icloud_calendar_id
+                ON events(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL;
             ",
         )?;
 
@@ -161,9 +177,30 @@ impl Store {
         1
     }
 
+    pub fn setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO app_settings (key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn local_calendars(&self) -> rusqlite::Result<Vec<Calendar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, color, visible, read_only, google_calendar_id
+            "SELECT id, name, color, visible, read_only, google_calendar_id, icloud_calendar_id
              FROM calendars
              WHERE account_id IS NULL
              ORDER BY name",
@@ -174,7 +211,7 @@ impl Store {
 
     pub fn calendars_for_account(&self, account_id: i64) -> rusqlite::Result<Vec<Calendar>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, color, visible, read_only, google_calendar_id
+            "SELECT id, name, color, visible, read_only, google_calendar_id, icloud_calendar_id
              FROM calendars
              WHERE account_id = ?1
              ORDER BY name",
@@ -192,13 +229,21 @@ impl Store {
     }
 
     pub fn google_accounts(&self) -> rusqlite::Result<Vec<Account>> {
+        self.accounts_for_provider("google")
+    }
+
+    pub fn icloud_accounts(&self) -> rusqlite::Result<Vec<Account>> {
+        self.accounts_for_provider("icloud")
+    }
+
+    fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, provider_account_id, display_name, token_key
              FROM accounts
-             WHERE provider = 'google'
+             WHERE provider = ?1
              ORDER BY display_name",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![provider], |row| {
             Ok(Account {
                 id: row.get(0)?,
                 provider_account_id: row.get(1)?,
@@ -225,6 +270,23 @@ impl Store {
              DO UPDATE SET display_name = ?2, token_key = ?3
              RETURNING id",
             params![provider_account_id, display_name, token_key],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn upsert_icloud_account(
+        &self,
+        apple_id: &str,
+        display_name: &str,
+        token_key: &str,
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "INSERT INTO accounts (provider, provider_account_id, display_name, token_key)
+             VALUES ('icloud', ?1, ?2, ?3)
+             ON CONFLICT(provider, provider_account_id)
+             DO UPDATE SET display_name = ?2, token_key = ?3
+             RETURNING id",
+            params![apple_id, display_name, token_key],
             |row| row.get(0),
         )
     }
@@ -259,6 +321,26 @@ impl Store {
         )
     }
 
+    pub fn upsert_icloud_calendar(
+        &self,
+        account_id: i64,
+        icloud_calendar_id: &str,
+        name: &str,
+        color: &str,
+        visible: bool,
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "INSERT INTO calendars (account_id, name, color, icloud_calendar_id, visible, read_only)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT(account_id, icloud_calendar_id)
+             WHERE account_id IS NOT NULL AND icloud_calendar_id IS NOT NULL
+             DO UPDATE SET name = ?2, color = ?3, read_only = 1
+             RETURNING id",
+            params![account_id, name, color, icloud_calendar_id, visible as i64],
+            |row| row.get(0),
+        )
+    }
+
     /// Events whose [start, end) span overlaps the given half-open range.
     pub fn events_between(
         &self,
@@ -266,11 +348,16 @@ impl Store {
         range_end: DateTime<Local>,
     ) -> rusqlite::Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id
+            "SELECT events.id, events.calendar_id, calendars.name, calendars.color,
+                    accounts.provider, events.title, events.start_at,
+                    events.end_at, events.all_day, events.location, events.notes,
+                    events.google_event_id, events.icloud_event_id
              FROM events
-             WHERE start_at < ?1 AND end_at > ?2
-             AND calendar_id IN (SELECT id FROM calendars WHERE visible != 0)
-             ORDER BY start_at",
+             JOIN calendars ON calendars.id = events.calendar_id
+             LEFT JOIN accounts ON accounts.id = calendars.account_id
+             WHERE events.start_at < ?1 AND events.end_at > ?2
+             AND calendars.visible != 0
+             ORDER BY events.start_at",
         )?;
         let rows = stmt.query_map(
             params![range_end.to_rfc3339(), range_start.to_rfc3339()],
@@ -345,6 +432,31 @@ impl Store {
         Ok(())
     }
 
+    pub fn upsert_icloud_event(
+        &self,
+        calendar_id: i64,
+        icloud_event_id: &str,
+        draft: &EventDraft,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7",
+            params![
+                calendar_id,
+                draft.title,
+                draft.start.to_rfc3339(),
+                draft.end.to_rfc3339(),
+                draft.all_day as i64,
+                draft.location,
+                draft.notes,
+                icloud_event_id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Removes previously-synced events for `calendar_id` that are no
     /// longer in `keep_google_ids` — i.e. deleted on Google's side since
     /// the last sync.
@@ -373,6 +485,85 @@ impl Store {
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
         params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    pub fn prune_icloud_events(
+        &self,
+        calendar_id: i64,
+        keep_icloud_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        if keep_icloud_ids.is_empty() {
+            self.conn.execute(
+                "DELETE FROM events WHERE calendar_id = ?1 AND icloud_event_id IS NOT NULL",
+                params![calendar_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders = keep_icloud_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM events WHERE calendar_id = ? AND icloud_event_id IS NOT NULL
+             AND icloud_event_id NOT IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
+        params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    pub fn prune_icloud_calendars(
+        &self,
+        account_id: i64,
+        keep_icloud_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        if keep_icloud_ids.is_empty() {
+            self.conn.execute(
+                "DELETE FROM events
+                 WHERE calendar_id IN (
+                     SELECT id FROM calendars
+                     WHERE account_id = ?1 AND icloud_calendar_id IS NOT NULL
+                 )",
+                params![account_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM calendars
+                 WHERE account_id = ?1 AND icloud_calendar_id IS NOT NULL",
+                params![account_id],
+            )?;
+            return Ok(());
+        }
+
+        let placeholders = keep_icloud_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let event_sql = format!(
+            "DELETE FROM events
+             WHERE calendar_id IN (
+                 SELECT id FROM calendars
+                 WHERE account_id = ? AND icloud_calendar_id IS NOT NULL
+                   AND icloud_calendar_id NOT IN ({placeholders})
+             )"
+        );
+        let mut event_params: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+        event_params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn.execute(&event_sql, event_params.as_slice())?;
+
+        let calendar_sql = format!(
+            "DELETE FROM calendars
+             WHERE account_id = ? AND icloud_calendar_id IS NOT NULL
+               AND icloud_calendar_id NOT IN ({placeholders})"
+        );
+        let mut calendar_params: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+        calendar_params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn
+            .execute(&calendar_sql, calendar_params.as_slice())?;
         Ok(())
     }
 
@@ -407,18 +598,22 @@ fn ensure_column(
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
-    let start_at: String = row.get(3)?;
-    let end_at: String = row.get(4)?;
+    let start_at: String = row.get(6)?;
+    let end_at: String = row.get(7)?;
     Ok(Event {
         id: row.get(0)?,
         calendar_id: row.get(1)?,
-        title: row.get(2)?,
+        calendar_name: row.get(2)?,
+        calendar_color: row.get(3)?,
+        account_provider: row.get(4)?,
+        title: row.get(5)?,
         start: parse_rfc3339(&start_at),
         end: parse_rfc3339(&end_at),
-        all_day: row.get::<_, i64>(5)? != 0,
-        location: row.get(6)?,
-        notes: row.get(7)?,
-        google_event_id: row.get(8)?,
+        all_day: row.get::<_, i64>(8)? != 0,
+        location: row.get(9)?,
+        notes: row.get(10)?,
+        google_event_id: row.get(11)?,
+        icloud_event_id: row.get(12)?,
     })
 }
 
@@ -430,6 +625,7 @@ fn row_to_calendar(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
         visible: row.get::<_, i64>(3)? != 0,
         read_only: row.get::<_, i64>(4)? != 0,
         google_calendar_id: row.get(5)?,
+        icloud_calendar_id: row.get(6)?,
     })
 }
 
@@ -477,6 +673,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, id);
         assert_eq!(events[0].title, "Test");
+        assert_eq!(events[0].calendar_name, "Local");
+        assert_eq!(events[0].calendar_color, "#3584e4");
+        assert_eq!(events[0].account_provider, None);
 
         let mut updated = draft("Updated", start, end);
         updated.location = Some("Home".to_string());
@@ -492,6 +691,17 @@ mod tests {
             .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
             .unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn app_settings_roundtrip() {
+        let store = Store::open_in_memory().unwrap();
+
+        assert_eq!(store.setting("view_mode").unwrap(), None);
+        store.set_setting("view_mode", "week").unwrap();
+        assert_eq!(store.setting("view_mode").unwrap().as_deref(), Some("week"));
+        store.set_setting("view_mode", "day").unwrap();
+        assert_eq!(store.setting("view_mode").unwrap().as_deref(), Some("day"));
     }
 
     #[test]
@@ -721,7 +931,51 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "Standup (moved)");
+        assert_eq!(events[0].calendar_name, "Work");
+        assert_eq!(events[0].account_provider.as_deref(), Some("google"));
         assert_eq!(events[0].google_event_id.as_deref(), Some("evt-1"));
+    }
+
+    #[test]
+    fn upsert_icloud_event_updates_in_place_and_marks_icloud_source() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account(
+                "person@example.com",
+                "person@example.com",
+                "icloud-app-password:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_icloud_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+
+        store
+            .upsert_icloud_event(
+                calendar_id,
+                "/calendars/work/evt-1.ics",
+                &draft("Lunch", start, end),
+            )
+            .unwrap();
+        store
+            .upsert_icloud_event(
+                calendar_id,
+                "/calendars/work/evt-1.ics",
+                &draft("Lunch (moved)", start, end),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Lunch (moved)");
+        assert_eq!(
+            events[0].icloud_event_id.as_deref(),
+            Some("/calendars/work/evt-1.ics")
+        );
     }
 
     #[test]
