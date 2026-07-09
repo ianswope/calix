@@ -50,6 +50,10 @@ pub fn has_saved_account() -> bool {
     keyring_entry().and_then(|e| e.get_password().map_err(AuthError::Keyring)).is_ok()
 }
 
+// Not wired into any UI yet — there's no "disconnect" action in the
+// header, just connect/sync. Kept ready for whenever a settings view
+// exists to put it in.
+#[allow(dead_code)]
 pub fn sign_out() {
     if let Ok(entry) = keyring_entry() {
         let _ = entry.delete_credential();

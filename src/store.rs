@@ -22,6 +22,10 @@ pub struct Event {
     pub all_day: bool,
     pub location: Option<String>,
     pub notes: Option<String>,
+    /// `Some` for events synced from Google — editing these locally isn't
+    /// supported yet (a sync would just overwrite the edit), so the UI
+    /// uses this to show them read-only.
+    pub google_event_id: Option<String>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -75,6 +79,21 @@ impl Store {
             ",
         )?;
 
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` — these two columns were
+        // added after the tables above shipped, so existing databases need
+        // an explicit existence check before altering.
+        ensure_column(&conn, "calendars", "google_calendar_id", "TEXT")?;
+        ensure_column(&conn, "events", "google_event_id", "TEXT")?;
+
+        conn.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS calendars_google_id
+                ON calendars(google_calendar_id) WHERE google_calendar_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS events_google_id
+                ON events(google_event_id) WHERE google_event_id IS NOT NULL;
+            ",
+        )?;
+
         let store = Store { conn };
         store.ensure_default_calendar()?;
         Ok(store)
@@ -97,6 +116,25 @@ impl Store {
         1
     }
 
+    /// Creates a Google-sourced calendar if `google_calendar_id` hasn't
+    /// been seen before, or updates its name/color if it has. Returns the
+    /// local calendar id either way.
+    pub fn upsert_google_calendar(
+        &self,
+        google_calendar_id: &str,
+        name: &str,
+        color: &str,
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "INSERT INTO calendars (name, color, google_calendar_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT(google_calendar_id) WHERE google_calendar_id IS NOT NULL
+             DO UPDATE SET name = ?1, color = ?2
+             RETURNING id",
+            params![name, color, google_calendar_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Events whose [start, end) span overlaps the given half-open range.
     pub fn events_between(
         &self,
@@ -104,7 +142,7 @@ impl Store {
         range_end: DateTime<Local>,
     ) -> rusqlite::Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, calendar_id, title, start_at, end_at, all_day, location, notes
+            "SELECT id, calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id
              FROM events
              WHERE start_at < ?1 AND end_at > ?2
              ORDER BY start_at",
@@ -154,6 +192,67 @@ impl Store {
         self.conn.execute("DELETE FROM events WHERE id = ?1", params![id])?;
         Ok(())
     }
+
+    /// Creates or updates a Google-sourced event by its Google event id.
+    pub fn upsert_google_event(
+        &self,
+        calendar_id: i64,
+        google_event_id: &str,
+        draft: &EventDraft,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(google_event_id) WHERE google_event_id IS NOT NULL
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7",
+            params![
+                calendar_id,
+                draft.title,
+                draft.start.to_rfc3339(),
+                draft.end.to_rfc3339(),
+                draft.all_day as i64,
+                draft.location,
+                draft.notes,
+                google_event_id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes previously-synced events for `calendar_id` that are no
+    /// longer in `keep_google_ids` — i.e. deleted on Google's side since
+    /// the last sync.
+    pub fn prune_google_events(&self, calendar_id: i64, keep_google_ids: &[String]) -> rusqlite::Result<()> {
+        let placeholders = keep_google_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "DELETE FROM events WHERE calendar_id = ? AND google_event_id IS NOT NULL
+             AND google_event_id NOT IN ({placeholders})"
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
+        params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn calendar_row(&self, id: i64) -> rusqlite::Result<(String, String)> {
+        self.conn
+            .query_row("SELECT name, color FROM calendars WHERE id = ?1", params![id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+    }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl_type: &str) -> rusqlite::Result<()> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if exists == 0 {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"), [])?;
+    }
+    Ok(())
 }
 
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
@@ -168,6 +267,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         all_day: row.get::<_, i64>(5)? != 0,
         location: row.get(6)?,
         notes: row.get(7)?,
+        google_event_id: row.get(8)?,
     })
 }
 
@@ -239,4 +339,55 @@ mod tests {
         let events = store.events_between(start, end).unwrap();
         assert!(events.is_empty());
     }
+
+    #[test]
+    fn upsert_google_calendar_is_idempotent_by_google_id() {
+        let store = Store::open_in_memory().unwrap();
+        let id1 = store.upsert_google_calendar("cal-abc", "Work", "#ff0000").unwrap();
+        let id2 = store.upsert_google_calendar("cal-abc", "Work Renamed", "#00ff00").unwrap();
+        assert_eq!(id1, id2);
+
+        let (name, color) = store.calendar_row(id1).unwrap();
+        assert_eq!(name, "Work Renamed");
+        assert_eq!(color, "#00ff00");
+    }
+
+    #[test]
+    fn upsert_google_event_updates_in_place_and_marks_google_source() {
+        let store = Store::open_in_memory().unwrap();
+        let calendar_id = store.upsert_google_calendar("cal-abc", "Work", "#ff0000").unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+
+        store.upsert_google_event(calendar_id, "evt-1", &draft("Standup", start, end)).unwrap();
+        store
+            .upsert_google_event(calendar_id, "evt-1", &draft("Standup (moved)", start, end))
+            .unwrap();
+
+        let events = store.events_between(start - Duration::minutes(1), end + Duration::minutes(1)).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Standup (moved)");
+        assert_eq!(events[0].google_event_id.as_deref(), Some("evt-1"));
+    }
+
+    #[test]
+    fn prune_google_events_removes_only_stale_synced_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let calendar_id = store.upsert_google_calendar("cal-abc", "Work", "#ff0000").unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+
+        store.upsert_google_event(calendar_id, "keep", &draft("Keep", start, end)).unwrap();
+        store.upsert_google_event(calendar_id, "gone", &draft("Gone", start, end)).unwrap();
+        store.create_event(calendar_id, &draft("Local one", start, end)).unwrap();
+
+        store.prune_google_events(calendar_id, &["keep".to_string()]).unwrap();
+
+        let events = store.events_between(start - Duration::minutes(1), end + Duration::minutes(1)).unwrap();
+        let titles: Vec<&str> = events.iter().map(|e| e.title.as_str()).collect();
+        assert!(titles.contains(&"Keep"));
+        assert!(titles.contains(&"Local one"));
+        assert!(!titles.contains(&"Gone"));
+    }
+
 }
