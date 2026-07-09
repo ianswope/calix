@@ -51,6 +51,11 @@ const CSS: &str = "
 .event-block label {
     color: @accent_fg_color;
 }
+
+.calendar-sidebar {
+    background-color: @sidebar_bg_color;
+    border-right: 1px solid @borders;
+}
 ";
 
 pub fn load() {

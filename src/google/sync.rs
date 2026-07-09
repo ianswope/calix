@@ -5,7 +5,19 @@ use chrono::{Duration, Local};
 const SYNC_PAST_DAYS: i64 = 90;
 const SYNC_FUTURE_DAYS: i64 = 180;
 
-/// Fetches every visible Google calendar and its events in a fixed window
+/// Returns a stable Google account identity from the signed-in account's
+/// primary calendar. This avoids needing extra OAuth profile scopes.
+pub fn account_identity(access_token: &str) -> Result<(String, String), String> {
+    let calendars = calendar_api::list_calendars(access_token)?;
+    let calendar = calendars
+        .iter()
+        .find(|calendar| calendar.primary == Some(true))
+        .or_else(|| calendars.first())
+        .ok_or_else(|| "Google account has no calendars".to_string())?;
+    Ok((calendar.id.clone(), calendar.summary.clone()))
+}
+
+/// Fetches every Google calendar and its events in a fixed window
 /// around now, and upserts them into the local store (removing previously
 /// synced events that are gone on Google's side). Returns the number of
 /// calendars synced, for user-facing feedback.
@@ -14,28 +26,51 @@ const SYNC_FUTURE_DAYS: i64 = 180;
 /// be a fresh `Store::open()` for that thread, not one shared with the
 /// GTK main thread: `Store` wraps a `rusqlite::Connection`, which isn't
 /// `Send`.
-pub fn sync(access_token: &str, store: &Store) -> Result<usize, String> {
-    let calendars: Vec<_> = calendar_api::list_calendars(access_token)?
-        .into_iter()
-        .filter(|c| c.is_visible())
-        .collect();
+pub fn sync_account(access_token: &str, store: &Store, account_id: i64) -> Result<usize, String> {
+    let calendars = calendar_api::list_calendars(access_token)?;
 
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
     let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
 
     for calendar in &calendars {
-        let color = calendar.background_color.clone().unwrap_or_else(|| "#3584e4".to_string());
+        let color = calendar
+            .background_color
+            .clone()
+            .unwrap_or_else(|| "#3584e4".to_string());
         let local_calendar_id = store
-            .upsert_google_calendar(&calendar.id, &calendar.summary, &color)
+            .upsert_google_calendar(
+                account_id,
+                &calendar.id,
+                &calendar.summary,
+                &color,
+                calendar.is_visible(),
+            )
             .map_err(|e| e.to_string())?;
 
-        let events = calendar_api::list_events(access_token, &calendar.id, time_min, time_max)?;
+        let events = match calendar_api::list_events(access_token, &calendar.id, time_min, time_max)
+        {
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!(
+                    "calix: failed to sync Google calendar {} ({}): {}",
+                    calendar.summary, calendar.id, error
+                );
+                continue;
+            }
+        };
         let mut synced_ids = Vec::with_capacity(events.len());
         for event in &events {
-            let Some((start, all_day)) = event.start.to_local() else { continue };
-            let Some((end, _)) = event.end.to_local() else { continue };
+            let Some((start, all_day)) = event.start.to_local() else {
+                continue;
+            };
+            let Some((end, _)) = event.end.to_local() else {
+                continue;
+            };
             let draft = EventDraft {
-                title: event.summary.clone().unwrap_or_else(|| "(No title)".to_string()),
+                title: event
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "(No title)".to_string()),
                 start,
                 end,
                 all_day,
