@@ -30,6 +30,9 @@ pub struct Event {
     pub notes: Option<String>,
     pub google_event_id: Option<String>,
     pub icloud_event_id: Option<String>,
+    /// CalDAV server base URL for a generic `caldav` event's account; `None`
+    /// for google, icloud, and local events.
+    pub account_server_url: Option<String>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -51,6 +54,9 @@ pub struct Account {
     pub provider_account_id: String,
     pub display_name: String,
     pub token_key: String,
+    /// CalDAV server base URL for generic `caldav` accounts; `None` for
+    /// google and icloud.
+    pub server_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -73,6 +79,8 @@ pub struct CalendarConnection {
     pub google_calendar_id: Option<String>,
     pub icloud_calendar_id: Option<String>,
     pub visible: bool,
+    /// CalDAV server base URL for generic `caldav` calendars; `None` otherwise.
+    pub server_url: Option<String>,
 }
 
 pub struct Store {
@@ -137,8 +145,15 @@ impl Store {
         ensure_column(&conn, "calendars", "google_calendar_id", "TEXT")?;
         ensure_column(&conn, "calendars", "visible", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "events", "google_event_id", "TEXT")?;
+        // The `icloud_*` columns hold CalDAV hrefs. iCloud was the first
+        // CalDAV provider, so they kept its name; generic CalDAV accounts
+        // (provider = 'caldav') store their calendar/event hrefs in the same
+        // columns and are told apart by `accounts.provider`.
         ensure_column(&conn, "calendars", "icloud_calendar_id", "TEXT")?;
         ensure_column(&conn, "events", "icloud_event_id", "TEXT")?;
+        // Base URL for a generic CalDAV account's server; NULL for google and
+        // icloud (iCloud uses a fixed well-known root).
+        ensure_column(&conn, "accounts", "server_url", "TEXT")?;
 
         conn.execute_batch(
             "
@@ -232,7 +247,7 @@ impl Store {
             "SELECT calendars.id, calendars.name, accounts.provider,
                     accounts.provider_account_id, accounts.token_key,
                     calendars.google_calendar_id, calendars.icloud_calendar_id,
-                    calendars.visible
+                    calendars.visible, accounts.server_url
              FROM calendars
              LEFT JOIN accounts ON accounts.id = calendars.account_id
              ORDER BY accounts.provider IS NOT NULL, accounts.display_name, calendars.name",
@@ -247,6 +262,7 @@ impl Store {
                 google_calendar_id: row.get(5)?,
                 icloud_calendar_id: row.get(6)?,
                 visible: row.get::<_, i64>(7)? != 0,
+                server_url: row.get(8)?,
             })
         })?;
         rows.collect()
@@ -268,9 +284,13 @@ impl Store {
         self.accounts_for_provider("icloud")
     }
 
+    pub fn caldav_accounts(&self) -> rusqlite::Result<Vec<Account>> {
+        self.accounts_for_provider("caldav")
+    }
+
     fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider_account_id, display_name, token_key
+            "SELECT id, provider_account_id, display_name, token_key, server_url
              FROM accounts
              WHERE provider = ?1
              ORDER BY display_name",
@@ -281,6 +301,7 @@ impl Store {
                 provider_account_id: row.get(1)?,
                 display_name: row.get(2)?,
                 token_key: row.get(3)?,
+                server_url: row.get(4)?,
             })
         })?;
         rows.collect()
@@ -323,6 +344,28 @@ impl Store {
         )
     }
 
+    /// Creates or updates a generic CalDAV account. `username` is the login
+    /// sent to the server and doubles as the provider-scoped id, so
+    /// reconnecting the same login updates the existing row (including its
+    /// `server_url` if the address changed).
+    pub fn upsert_caldav_account(
+        &self,
+        username: &str,
+        server_url: &str,
+        display_name: &str,
+        token_key: &str,
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "INSERT INTO accounts (provider, provider_account_id, display_name, token_key, server_url)
+             VALUES ('caldav', ?1, ?2, ?3, ?4)
+             ON CONFLICT(provider, provider_account_id)
+             DO UPDATE SET display_name = ?2, token_key = ?3, server_url = ?4
+             RETURNING id",
+            params![username, display_name, token_key, server_url],
+            |row| row.get(0),
+        )
+    }
+
     /// Creates a Google-sourced calendar if `google_calendar_id` hasn't
     /// been seen before for `account_id`, or updates its name/color if it
     /// has. Returns the local calendar id either way.
@@ -353,7 +396,10 @@ impl Store {
         )
     }
 
-    pub fn upsert_icloud_calendar(
+    /// Upserts a CalDAV-sourced calendar (iCloud or generic `caldav`). The
+    /// href is stored in the `icloud_calendar_id` column (see the schema
+    /// note); the account's provider distinguishes the source.
+    pub fn upsert_caldav_calendar(
         &self,
         account_id: i64,
         icloud_calendar_id: &str,
@@ -385,7 +431,8 @@ impl Store {
                     calendars.google_calendar_id,
                     events.title, events.start_at,
                     events.end_at, events.all_day, events.location, events.notes,
-                    events.google_event_id, events.icloud_event_id
+                    events.google_event_id, events.icloud_event_id,
+                    accounts.server_url
              FROM events
              JOIN calendars ON calendars.id = events.calendar_id
              LEFT JOIN accounts ON accounts.id = calendars.account_id
@@ -466,7 +513,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_icloud_event(
+    pub fn upsert_caldav_event(
         &self,
         calendar_id: i64,
         icloud_event_id: &str,
@@ -534,7 +581,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn prune_icloud_events(
+    pub fn prune_caldav_events(
         &self,
         calendar_id: i64,
         keep_icloud_ids: &[String],
@@ -574,7 +621,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn prune_icloud_calendars(
+    pub fn prune_caldav_calendars(
         &self,
         account_id: i64,
         keep_icloud_ids: &[String],
@@ -726,6 +773,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         notes: row.get(13)?,
         google_event_id: row.get(14)?,
         icloud_event_id: row.get(15)?,
+        account_server_url: row.get(16)?,
     })
 }
 
@@ -1046,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_icloud_event_updates_in_place_and_marks_icloud_source() {
+    fn upsert_caldav_event_updates_in_place_and_marks_caldav_source() {
         let store = Store::open_in_memory().unwrap();
         let account_id = store
             .upsert_icloud_account(
@@ -1056,20 +1104,20 @@ mod tests {
             )
             .unwrap();
         let calendar_id = store
-            .upsert_icloud_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
             .unwrap();
         let start = Local::now();
         let end = start + Duration::hours(1);
 
         store
-            .upsert_icloud_event(
+            .upsert_caldav_event(
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch", start, end),
             )
             .unwrap();
         store
-            .upsert_icloud_event(
+            .upsert_caldav_event(
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch (moved)", start, end),
@@ -1084,6 +1132,55 @@ mod tests {
         assert_eq!(
             events[0].icloud_event_id.as_deref(),
             Some("/calendars/work/evt-1.ics")
+        );
+    }
+
+    #[test]
+    fn caldav_account_stores_server_url_and_surfaces_it_on_events() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_caldav_account(
+                "me",
+                "https://caldav.fastmail.com/",
+                "me (caldav.fastmail.com)",
+                "caldav-password:https://caldav.fastmail.com|me",
+            )
+            .unwrap();
+
+        let accounts = store.caldav_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(
+            accounts[0].server_url.as_deref(),
+            Some("https://caldav.fastmail.com/")
+        );
+        // A CalDAV account must not leak into the iCloud provider list.
+        assert!(store.icloud_accounts().unwrap().is_empty());
+
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/dav/calendars/me/work/", "Work", "#123456", true)
+            .unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/dav/calendars/me/work/evt.ics",
+                &draft("Standup", start, end),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].account_provider.as_deref(), Some("caldav"));
+        assert_eq!(
+            events[0].account_server_url.as_deref(),
+            Some("https://caldav.fastmail.com/")
+        );
+        assert_eq!(
+            events[0].icloud_event_id.as_deref(),
+            Some("/dav/calendars/me/work/evt.ics")
         );
     }
 

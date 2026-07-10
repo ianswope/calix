@@ -28,6 +28,13 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
         "Google",
         "google",
     );
+    add_account_sections(
+        &content,
+        store.clone(),
+        on_changed.clone(),
+        "CalDAV",
+        "caldav",
+    );
 
     if let Ok(local_calendars) = store.local_calendars()
         && !local_calendars.is_empty()
@@ -60,17 +67,14 @@ fn add_account_sections(
     let accounts = match provider {
         "google" => store.google_accounts(),
         "icloud" => store.icloud_accounts(),
+        "caldav" => store.caldav_accounts(),
         _ => return,
     };
 
     match accounts {
         Ok(accounts) if accounts.is_empty() => {
             let empty_group = adw::PreferencesGroup::builder().title(title).build();
-            let account_name = if provider == "icloud" {
-                "iCloud"
-            } else {
-                "Google"
-            };
+            let account_name = title;
             let row = adw::ActionRow::builder()
                 .title(format!("No {account_name} accounts connected"))
                 .subtitle(format!("Use Add {account_name} to connect an account"))
@@ -85,11 +89,7 @@ fn add_account_sections(
                 .filter_map(|account| store.calendars_for_account(account.id).ok())
                 .map(|calendars| calendars.len())
                 .sum::<usize>();
-            let account_name = if provider == "icloud" {
-                "iCloud"
-            } else {
-                "Google"
-            };
+            let account_name = title;
             let summary_group = adw::PreferencesGroup::builder().title(title).build();
             summary_group.add(
                 &adw::ActionRow::builder()

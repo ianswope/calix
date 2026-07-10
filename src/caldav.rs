@@ -1,14 +1,22 @@
-use crate::store::EventDraft;
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
+use crate::store::{EventDraft, Store};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
 use oauth2::reqwest;
 use std::collections::{HashMap, HashSet};
 
-const ICLOUD_CALDAV_ROOT: &str = "https://caldav.icloud.com/";
+/// How far back and forward each sync fetches events, in days.
+const SYNC_PAST_DAYS: i64 = 90;
+const SYNC_FUTURE_DAYS: i64 = 180;
 
+/// Connection details for a CalDAV server. `base_url` is where discovery
+/// starts (a server root, a `.well-known/caldav` URL, or a principal URL);
+/// `username`/`password` are sent as HTTP Basic auth. iCloud is served by
+/// pointing `base_url` at [`crate::icloud::ICLOUD_CALDAV_ROOT`] with an Apple
+/// ID and app-specific password.
 pub struct Credentials {
-    pub apple_id: String,
-    pub app_password: String,
+    pub base_url: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Clone)]
@@ -25,9 +33,73 @@ pub struct RemoteEvent {
 
 pub fn discover_calendars(credentials: &Credentials) -> Result<Vec<RemoteCalendar>, String> {
     let principal = current_user_principal(credentials)?;
-    let home = calendar_home_set(credentials, &absolute_url(&principal)?)?;
+    let home = calendar_home_set(
+        credentials,
+        &absolute_url(&credentials.base_url, &principal)?,
+    )?;
     let mut visited = HashSet::new();
-    calendar_list(credentials, &absolute_url(&home)?, 0, &mut visited)
+    calendar_list(
+        credentials,
+        &absolute_url(&credentials.base_url, &home)?,
+        0,
+        &mut visited,
+    )
+}
+
+/// Discovers a CalDAV account's calendars, syncs each one's events into the
+/// store's CalDAV columns, and prunes rows that no longer exist server-side.
+/// Used for both iCloud and generic `caldav` accounts — only the credentials
+/// differ. Returns the number of calendars synced.
+pub fn sync_account(
+    credentials: &Credentials,
+    store: &Store,
+    account_id: i64,
+) -> Result<usize, String> {
+    let calendars = discover_calendars(credentials)?;
+    let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
+    let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
+    let calendar_ids = calendars
+        .iter()
+        .map(|calendar| calendar.href.clone())
+        .collect::<Vec<_>>();
+    store
+        .prune_caldav_calendars(account_id, &calendar_ids)
+        .map_err(|e| e.to_string())?;
+
+    for calendar in &calendars {
+        let local_calendar_id = store
+            .upsert_caldav_calendar(
+                account_id,
+                &calendar.href,
+                &calendar.name,
+                &calendar.color,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
+
+        let events = match calendar_events(credentials, &calendar.href, time_min, time_max) {
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!(
+                    "calix: failed to sync CalDAV calendar {} ({}): {}",
+                    calendar.name, calendar.href, error
+                );
+                continue;
+            }
+        };
+        let mut synced_ids = Vec::with_capacity(events.len());
+        for event in events {
+            store
+                .upsert_caldav_event(local_calendar_id, &event.href, &event.draft)
+                .map_err(|e| e.to_string())?;
+            synced_ids.push(event.href);
+        }
+        store
+            .prune_caldav_events(local_calendar_id, &synced_ids, time_min, time_max)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(calendars.len())
 }
 
 pub fn calendar_events(
@@ -61,7 +133,7 @@ pub fn calendar_events(
     let response = request(
         credentials,
         "REPORT",
-        &absolute_url(calendar_href)?,
+        &absolute_url(&credentials.base_url, calendar_href)?,
         1,
         "application/xml; charset=utf-8",
         body,
@@ -88,7 +160,7 @@ pub fn update_event(
         .map_or((event_href, None), |(href, recurrence_id)| {
             (href, Some(recurrence_id))
         });
-    let url = absolute_url(resource_href)?;
+    let url = absolute_url(&credentials.base_url, resource_href)?;
     let (existing_ics, etag) = fetch_event(credentials, &url)?;
     let ics = match recurrence_id {
         Some(recurrence_id) => replace_recurrence_instance(&existing_ics, recurrence_id, draft)?,
@@ -110,7 +182,12 @@ pub fn create_event(
     );
     let event_href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), uid);
     let ics = new_event_ics(&uid, draft);
-    put_event(credentials, &absolute_url(&event_href)?, &ics, None)?;
+    put_event(
+        credentials,
+        &absolute_url(&credentials.base_url, &event_href)?,
+        &ics,
+        None,
+    )?;
     Ok(event_href)
 }
 
@@ -118,7 +195,7 @@ fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<S
     let client = reqwest::blocking::Client::new();
     let response = client
         .get(url)
-        .basic_auth(&credentials.apple_id, Some(&credentials.app_password))
+        .basic_auth(&credentials.username, Some(&credentials.password))
         .send()
         .map_err(|e| e.to_string())?;
     let status = response.status();
@@ -129,7 +206,7 @@ fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<S
         .map(str::to_owned);
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+        return Err(format!("CalDAV error ({status}): {body}"));
     }
     Ok((body, etag))
 }
@@ -143,7 +220,7 @@ fn put_event(
     let client = reqwest::blocking::Client::new();
     let mut request = client
         .put(url)
-        .basic_auth(&credentials.apple_id, Some(&credentials.app_password))
+        .basic_auth(&credentials.username, Some(&credentials.password))
         .header("Content-Type", "text/calendar; charset=utf-8")
         .body(ics.to_owned());
     if let Some(etag) = etag {
@@ -153,23 +230,21 @@ fn put_event(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+        return Err(format!("CalDAV error ({status}): {body}"));
     }
     Ok(())
 }
 
 pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), String> {
     if event_href.contains('#') {
-        return Err(
-            "Deleting expanded recurring iCloud instances is not supported yet".to_string(),
-        );
+        return Err("Deleting expanded recurring instances is not supported yet".to_string());
     }
-    let url = absolute_url(event_href)?;
+    let url = absolute_url(&credentials.base_url, event_href)?;
     let (_, etag) = fetch_event(credentials, &url)?;
     let client = reqwest::blocking::Client::new();
     let mut request = client
         .delete(&url)
-        .basic_auth(&credentials.apple_id, Some(&credentials.app_password));
+        .basic_auth(&credentials.username, Some(&credentials.password));
     if let Some(etag) = etag.as_deref() {
         request = request.header("If-Match", etag);
     }
@@ -177,12 +252,28 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+        return Err(format!("CalDAV error ({status}): {body}"));
     }
     Ok(())
 }
 
 fn current_user_principal(credentials: &Credentials) -> Result<String, String> {
+    // Try the URL the user gave first; if the server doesn't answer
+    // current-user-principal there (common when they paste a bare origin
+    // like https://caldav.fastmail.com), fall back to the RFC 6764
+    // /.well-known/caldav bootstrap. iCloud answers directly at its root, so
+    // the fallback never fires for it.
+    if let Some(principal) = principal_at(credentials, &credentials.base_url)? {
+        return Ok(principal);
+    }
+    let well_known = absolute_url(&credentials.base_url, "/.well-known/caldav")?;
+    if let Some(principal) = principal_at(credentials, &well_known)? {
+        return Ok(principal);
+    }
+    Err("The server did not return a CalDAV principal URL. Check the server address.".to_string())
+}
+
+fn principal_at(credentials: &Credentials, url: &str) -> Result<Option<String>, String> {
     let body = r#"<?xml version="1.0" encoding="utf-8" ?>
 <D:propfind xmlns:D="DAV:">
   <D:prop>
@@ -192,15 +283,14 @@ fn current_user_principal(credentials: &Credentials) -> Result<String, String> {
     let response = request(
         credentials,
         "PROPFIND",
-        ICLOUD_CALDAV_ROOT,
+        url,
         0,
         "application/xml; charset=utf-8",
         body.to_string(),
     )
-    .map_err(|error| format!("iCloud principal discovery failed: {error}"))?;
-    child_xml(&response, "current-user-principal")
-        .and_then(|principal| child_text(&principal, "href"))
-        .ok_or_else(|| "iCloud did not return a principal URL".to_string())
+    .map_err(|error| format!("CalDAV principal discovery failed: {error}"))?;
+    Ok(child_xml(&response, "current-user-principal")
+        .and_then(|principal| child_text(&principal, "href")))
 }
 
 fn calendar_home_set(credentials: &Credentials, principal_url: &str) -> Result<String, String> {
@@ -218,10 +308,10 @@ fn calendar_home_set(credentials: &Credentials, principal_url: &str) -> Result<S
         "application/xml; charset=utf-8",
         body.to_string(),
     )
-    .map_err(|error| format!("iCloud calendar home discovery failed: {error}"))?;
+    .map_err(|error| format!("CalDAV calendar home discovery failed: {error}"))?;
     child_xml(&response, "calendar-home-set")
         .and_then(|home| child_text(&home, "href"))
-        .ok_or_else(|| "iCloud did not return a calendar home URL".to_string())
+        .ok_or_else(|| "The server did not return a calendar home URL".to_string())
 }
 
 fn calendar_list(
@@ -251,7 +341,7 @@ fn calendar_list(
         "application/xml; charset=utf-8",
         body.to_string(),
     )
-    .map_err(|error| format!("iCloud calendar list failed: {error}"))?;
+    .map_err(|error| format!("CalDAV calendar list failed: {error}"))?;
 
     let mut calendars = Vec::new();
     let mut child_collections = Vec::new();
@@ -264,7 +354,8 @@ fn calendar_list(
         }
 
         if is_calendar_response(&response) {
-            let name = child_text(&response, "displayname").unwrap_or_else(|| "iCloud".to_string());
+            let name =
+                child_text(&response, "displayname").unwrap_or_else(|| "Calendar".to_string());
             let color = child_text(&response, "calendar-color")
                 .map(|color| color.chars().take(7).collect::<String>())
                 .filter(|color| color.starts_with('#') && color.len() == 7)
@@ -276,7 +367,7 @@ fn calendar_list(
     }
 
     for href in child_collections {
-        let child_url = absolute_url(&href)?;
+        let child_url = absolute_url(&credentials.base_url, &href)?;
         calendars.extend(calendar_list(credentials, &child_url, depth + 1, visited)?);
     }
 
@@ -326,7 +417,7 @@ fn request(
     let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let response = client
         .request(method, url)
-        .basic_auth(&credentials.apple_id, Some(&credentials.app_password))
+        .basic_auth(&credentials.username, Some(&credentials.password))
         .header("Depth", depth.to_string())
         .header("Content-Type", content_type)
         .body(body)
@@ -336,16 +427,19 @@ fn request(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() && status.as_u16() != 207 {
-        return Err(format!("iCloud CalDAV error ({status}): {body}"));
+        return Err(format!("CalDAV error ({status}): {body}"));
     }
     Ok(body)
 }
 
-fn absolute_url(href: &str) -> Result<String, String> {
+/// Resolves a possibly-relative href (as CalDAV servers return in multistatus
+/// responses) against the server's base URL. Absolute hrefs — iCloud routes
+/// principals to partition hosts like `p42-caldav.icloud.com` — pass through.
+fn absolute_url(base_url: &str, href: &str) -> Result<String, String> {
     if href.starts_with("http://") || href.starts_with("https://") {
         Ok(href.to_string())
     } else {
-        let root = url::Url::parse(ICLOUD_CALDAV_ROOT).map_err(|e| e.to_string())?;
+        let root = url::Url::parse(base_url).map_err(|e| e.to_string())?;
         root.join(href)
             .map(|url| url.to_string())
             .map_err(|e| e.to_string())
@@ -587,7 +681,7 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
         .filter(|line| line.as_str() == "BEGIN:VEVENT")
         .count();
     if event_count != 1 {
-        return Err("Editing recurring iCloud events is not supported yet".to_string());
+        return Err("Editing recurring events is not supported yet".to_string());
     }
 
     let (start_key, start_value, end_key, end_value) = if draft.all_day {
@@ -660,7 +754,7 @@ fn replace_recurrence_instance(
                 .then(|| line.split_once(':').map(|(_, value)| value.to_string()))
                 .flatten()
         })
-        .ok_or_else(|| "iCloud event is missing its UID".to_string())?;
+        .ok_or_else(|| "Event is missing its UID".to_string())?;
 
     let mut result = Vec::new();
     let mut component = Vec::new();
@@ -692,7 +786,7 @@ fn replace_recurrence_instance(
     let insert_at = result
         .iter()
         .position(|line| line == "END:VCALENDAR")
-        .ok_or_else(|| "iCloud event is missing VCALENDAR closing data".to_string())?;
+        .ok_or_else(|| "Event is missing VCALENDAR closing data".to_string())?;
     result.splice(
         insert_at..insert_at,
         recurrence_exception_lines(&uid, recurrence_id, draft),

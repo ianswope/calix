@@ -1,5 +1,5 @@
 class Calix < Formula
-  desc "Native GTK4 calendar for Linux with Google and iCloud sync"
+  desc "Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
   homepage "https://github.com/ianswope/calix"
   head "https://github.com/ianswope/calix.git", branch: "main"
 

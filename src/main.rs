@@ -1,6 +1,7 @@
 use adw::prelude::*;
 use gtk::glib;
 
+mod caldav;
 mod calendar_dialog;
 mod config;
 mod date_util;

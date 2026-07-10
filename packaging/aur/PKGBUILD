@@ -1,7 +1,7 @@
 pkgname=calix
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
-pkgdesc="Native GTK4 calendar for Linux with Google and iCloud sync"
+pkgdesc="Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
 arch=('x86_64')
 url='https://github.com/ianswope/calix'
 license=('MIT')

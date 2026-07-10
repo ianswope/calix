@@ -1,3 +1,4 @@
+use crate::caldav;
 use crate::config::GoogleConfig;
 use crate::google;
 use crate::icloud;
@@ -26,8 +27,9 @@ pub enum RemoteEvent {
         calendar_id: String,
         event_id: String,
     },
-    Icloud {
-        apple_id: String,
+    Caldav {
+        base_url: String,
+        username: String,
         token_key: String,
         event_href: String,
     },
@@ -55,10 +57,11 @@ pub enum CreateTarget {
         token_key: String,
         google_calendar_id: String,
     },
-    Icloud {
+    Caldav {
         calendar_id: i64,
         name: String,
-        apple_id: String,
+        base_url: String,
+        username: String,
         token_key: String,
         calendar_href: String,
     },
@@ -74,7 +77,7 @@ impl CreateTarget {
         match self {
             Self::Local { calendar_id, .. }
             | Self::Google { calendar_id, .. }
-            | Self::Icloud { calendar_id, .. }
+            | Self::Caldav { calendar_id, .. }
             | Self::Unavailable { calendar_id, .. } => *calendar_id,
         }
     }
@@ -83,7 +86,7 @@ impl CreateTarget {
         match self {
             Self::Local { name, .. }
             | Self::Google { name, .. }
-            | Self::Icloud { name, .. }
+            | Self::Caldav { name, .. }
             | Self::Unavailable { name, .. } => name,
         }
     }
@@ -104,28 +107,37 @@ impl CreateTarget {
                     google::calendar_api::create_event(&token, google_calendar_id, draft)?;
                 Ok(Some((true, event_id)))
             }
-            Self::Icloud {
-                apple_id,
+            Self::Caldav {
+                base_url,
+                username,
                 token_key,
                 calendar_href,
                 ..
             } => {
-                let password = icloud::credentials::app_password(token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
-                let event_id = icloud::caldav::create_event(
-                    &icloud::caldav::Credentials {
-                        apple_id: apple_id.clone(),
-                        app_password: password,
-                    },
-                    calendar_href,
-                    draft,
-                )?;
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                let event_id = caldav::create_event(&credentials, calendar_href, draft)?;
                 Ok(Some((false, event_id)))
             }
             Self::Unavailable { error, .. } => Err(error.clone()),
         }
     }
+}
+
+/// Rebuilds CalDAV connection details from a stored account, reading the
+/// password from the keyring. Shared by create/update/delete.
+fn caldav_credentials(
+    base_url: &str,
+    username: &str,
+    token_key: &str,
+) -> Result<caldav::Credentials, String> {
+    let password = icloud::credentials::app_password(token_key)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "CalDAV account is not connected".to_string())?;
+    Ok(caldav::Credentials {
+        base_url: base_url.to_string(),
+        username: username.to_string(),
+        password,
+    })
 }
 
 impl RemoteEvent {
@@ -143,19 +155,14 @@ impl RemoteEvent {
                     .ok_or_else(|| "Google account is not connected".to_string())?;
                 google::calendar_api::update_event(&access_token, calendar_id, event_id, draft)
             }
-            Self::Icloud {
-                apple_id,
+            Self::Caldav {
+                base_url,
+                username,
                 token_key,
                 event_href,
             } => {
-                let app_password = icloud::credentials::app_password(token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
-                let credentials = icloud::caldav::Credentials {
-                    apple_id: apple_id.clone(),
-                    app_password,
-                };
-                icloud::caldav::update_event(&credentials, event_href, draft)
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                caldav::update_event(&credentials, event_href, draft)
             }
         }
     }
@@ -174,19 +181,14 @@ impl RemoteEvent {
                     .ok_or_else(|| "Google account is not connected".to_string())?;
                 google::calendar_api::delete_event(&access_token, calendar_id, event_id)
             }
-            Self::Icloud {
-                apple_id,
+            Self::Caldav {
+                base_url,
+                username,
                 token_key,
                 event_href,
             } => {
-                let app_password = icloud::credentials::app_password(token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "iCloud account is not connected".to_string())?;
-                let credentials = icloud::caldav::Credentials {
-                    apple_id: apple_id.clone(),
-                    app_password,
-                };
-                icloud::caldav::delete_event(&credentials, event_href)
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                caldav::delete_event(&credentials, event_href)
             }
         }
     }
@@ -570,7 +572,7 @@ pub fn open(
                                 let result = if is_google {
                                     store.upsert_google_event(target.calendar_id(), &remote_id, &draft)
                                 } else {
-                                    store.upsert_icloud_event(target.calendar_id(), &remote_id, &draft)
+                                    store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft)
                                 };
                                 match result {
                                     Ok(()) => {
