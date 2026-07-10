@@ -1,6 +1,7 @@
 use crate::store::Event;
 use chrono::{NaiveDate, NaiveTime};
 
+pub(crate) mod drag;
 mod event_widget;
 pub mod month_view;
 pub mod week_view;

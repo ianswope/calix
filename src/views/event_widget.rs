@@ -1,7 +1,9 @@
 use crate::store::Event;
+use crate::views::drag::{DragKind, drag_payload};
 use gtk::gdk;
 use gtk::prelude::*;
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 pub fn event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
     event_button_with_padding(event, css_class, min_height, 2)
@@ -9,6 +11,22 @@ pub fn event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::But
 
 pub fn compact_event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
     event_button_with_padding(event, css_class, min_height, 0)
+}
+
+pub fn timed_event_widget(
+    event: &Event,
+    css_class: &str,
+    min_height: i32,
+    on_click: Rc<dyn Fn(Event)>,
+) -> gtk::Widget {
+    let overlay = gtk::Overlay::new();
+    let button = event_button_with_padding(event, css_class, min_height, 0);
+    let ev = event.clone();
+    button.connect_clicked(move |_| on_click(ev.clone()));
+    overlay.set_child(Some(&button));
+    overlay.add_overlay(&resize_handle(event.id, DragKind::ResizeStart));
+    overlay.add_overlay(&resize_handle(event.id, DragKind::ResizeEnd));
+    overlay.upcast()
 }
 
 fn event_button_with_padding(
@@ -78,23 +96,37 @@ fn event_button_with_padding(
         .build();
     button.set_label("");
     button.set_child(Some(&overlay));
-    make_draggable_if_local(&button, event);
+    make_draggable(&button, event.id, DragKind::Move);
     button
 }
 
-fn make_draggable_if_local(button: &gtk::Button, event: &Event) {
-    if event.google_event_id.is_some() || event.icloud_event_id.is_some() {
-        return;
-    }
+fn resize_handle(event_id: i64, kind: DragKind) -> gtk::Box {
+    let handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    handle.add_css_class("event-resize-handle");
+    handle.add_css_class(match kind {
+        DragKind::ResizeStart => "event-resize-handle-start",
+        DragKind::ResizeEnd => "event-resize-handle-end",
+        DragKind::Move => unreachable!("move drags never use resize handles"),
+    });
+    handle.set_hexpand(true);
+    handle.set_size_request(-1, 8);
+    handle.set_halign(gtk::Align::Fill);
+    handle.set_valign(match kind {
+        DragKind::ResizeStart => gtk::Align::Start,
+        DragKind::ResizeEnd => gtk::Align::End,
+        DragKind::Move => gtk::Align::Start,
+    });
+    make_draggable(&handle, event_id, kind);
+    handle
+}
 
+fn make_draggable(widget: &impl IsA<gtk::Widget>, event_id: i64, kind: DragKind) {
     let drag = gtk::DragSource::builder()
         .actions(gdk::DragAction::MOVE)
         .build();
-    let event_id = event.id.to_string();
-    drag.connect_prepare(move |_, _, _| {
-        Some(gdk::ContentProvider::for_value(&event_id.to_value()))
-    });
-    button.add_controller(drag);
+    let payload = drag_payload(kind, event_id);
+    drag.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&payload.to_value())));
+    widget.add_controller(drag);
 }
 
 fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {

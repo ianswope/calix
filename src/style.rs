@@ -102,6 +102,25 @@ const CSS: &str = "
     color: @window_fg_color;
 }
 
+.event-resize-handle {
+    background-color: alpha(@accent_bg_color, 0.22);
+    min-height: 8px;
+}
+
+.event-resize-handle:hover {
+    background-color: alpha(@accent_bg_color, 0.35);
+}
+
+.event-resize-handle-start {
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}
+
+.event-resize-handle-end {
+    border-bottom-left-radius: 6px;
+    border-bottom-right-radius: 6px;
+}
+
 .calendar-sidebar {
     background-color: @sidebar_bg_color;
     border-right: 1px solid @borders;
