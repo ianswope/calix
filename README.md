@@ -2,7 +2,7 @@
 
 A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. The event dialog can create events on local, Google, or iCloud calendars; existing synced events can also be edited or deleted. Events can be dragged to another day in the month grid, and moved or resized directly in the week/day grid — including synced events, which push the change back to Google/iCloud.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, or iCloud calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to Google/iCloud. Grid text steps down a size when the window is narrow.
 
 ## Building
 
@@ -85,6 +85,7 @@ Google requires every app to bring its own OAuth client — there's no shared on
    client_id = "your-client-id.apps.googleusercontent.com"
    client_secret = "your-client-secret"
    ```
+   This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
 6. Run Calix, open the calendar sidebar, and click **Add Google** in the Accounts section. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
 
 If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
@@ -107,17 +108,24 @@ The left sidebar lists local calendars and synced Google/iCloud calendars. Use t
 
 The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add Google**, **Sync Google**, **Add iCloud**, and **Sync iCloud**.
 
-This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
+### Working with events
+
+- **Create**: click an empty slot (day cell in month view, hour cell in week/day view), right-click any empty spot for a **New Event** menu at that exact quarter-hour, or use the **+** header button.
+- **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
+- **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to Google/iCloud, and roll back if the remote update fails.
+- **Edit**: click any event to open it.
 
 ## Architecture
 
 - `src/date_util.rs` — pure date-math helpers (month grids, week ranges, month/week shifting), unit tested independent of any GTK state.
-- `src/views/month_view.rs`, `src/views/week_view.rs` — build a single month-grid or week-grid page for a given anchor date.
+- `src/views/month_view.rs`, `src/views/week_view.rs` — build a single month-grid or week-grid page for a given anchor date; `src/views/mod.rs` holds shared helpers like the right-click New Event menu.
+- `src/views/event_widget.rs` — the event chip/block widgets shared by the views.
+- `src/views/drag.rs` — direct-manipulation move/resize for timed blocks in the week/day grid: a `GestureDrag` controller with a snapped live preview and edge auto-scroll, committing only on release (month-view drags use GTK's regular drag-and-drop instead).
 - `src/window.rs` — owns the `AdwCarousel` paging between prev/current/next pages, the header bar (Today / prev / next / Month-Week-Day toggle / New Event / Calendars), sidebar account actions, and the current view-mode + date state.
-- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line).
+- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint).
 - `src/store.rs` — SQLite-backed account/calendar/event storage (create/list/update/delete), with in-memory-DB unit tests independent of the GUI.
 - `src/calendar_dialog.rs` — reusable account/calendar list for the sidebar, including per-calendar visibility toggles.
-- `src/event_dialog.rs` — the create/edit event dialog (`adw::Dialog` + `EntryRow`/`SwitchRow` form).
+- `src/event_dialog.rs` — the create/edit event dialog (`adw::Dialog` + `EntryRow`/`SwitchRow` form); its calendar picker defaults to sidebar-visible calendars with an expandable full list.
 - `src/config.rs` — reads `~/.config/calix/config.toml` for user-supplied API credentials (currently just the Google OAuth client).
 - `src/google/oauth.rs` — the OAuth2 + PKCE sign-in flow (loopback redirect, no embedded browser) and per-account refresh-token storage via the system keyring.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
@@ -135,7 +143,13 @@ This file lives outside the repo and is never read by anything that gets committ
 - [x] Basic two-way Google sync / editing synced Google events
 - [x] Basic two-way iCloud CalDAV sync / editing simple synced iCloud events
 - [x] Calendar picker for creating new events directly on Google/iCloud calendars
+- [x] Drag to move/resize events in the week/day grid (snapped preview, edge auto-scroll)
+- [x] Right-click to create an event at a specific spot
 - [ ] Recurrence exception editing for expanded iCloud recurring events
+- [ ] Recurring event creation
+- [ ] Event alerts / desktop notifications
+- [ ] Automatic background sync
+- [ ] Event search
 - [ ] Packaging (AUR, Flatpak)
 
 ## License
