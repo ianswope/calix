@@ -6,7 +6,7 @@ A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) 
 
 ## Building
 
-Requires a Rust toolchain and GTK4 + libadwaita development headers (on Arch: `gtk4`, `libadwaita`).
+Requires a Rust toolchain and GTK4 (≥ 4.14) + libadwaita (≥ 1.5) development headers (on Arch: `gtk4`, `libadwaita`; on Debian/Ubuntu: `libgtk-4-dev`, `libadwaita-1-dev`).
 
 ```sh
 cargo build
