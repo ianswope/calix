@@ -1,5 +1,9 @@
+// Keyring helpers, shared by both CalDAV account types: iCloud (app-specific
+// password) and generic CalDAV (server password). Both store a single secret
+// under a stable per-account key; only the key derivation differs.
 const KEYRING_SERVICE: &str = "com.ianswope.Calix";
 const KEYRING_USERNAME_PREFIX: &str = "icloud-app-password";
+const CALDAV_KEYRING_PREFIX: &str = "caldav-password";
 
 #[derive(Debug)]
 pub enum CredentialError {
@@ -22,6 +26,16 @@ pub fn token_key(apple_id: &str) -> String {
     format!(
         "{KEYRING_USERNAME_PREFIX}:{}",
         apple_id.trim().to_lowercase()
+    )
+}
+
+/// Keyring key for a generic CalDAV account. Includes the server so the same
+/// username on two different servers gets distinct secrets.
+pub fn caldav_token_key(base_url: &str, username: &str) -> String {
+    format!(
+        "{CALDAV_KEYRING_PREFIX}:{}|{}",
+        base_url.trim().trim_end_matches('/').to_lowercase(),
+        username.trim().to_lowercase()
     )
 }
 

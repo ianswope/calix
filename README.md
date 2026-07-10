@@ -1,6 +1,6 @@
 # Calix
 
-A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Apple/iCloud and Google calendars.
+A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Google, Apple/iCloud, and any CalDAV calendar.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/month-dark.png">
@@ -12,7 +12,7 @@ A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) 
   <img alt="Calix week view" src="docs/screenshots/week.png">
 </picture>
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, or iCloud calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to Google/iCloud. Grid text steps down a size when the window is narrow.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google, iCloud, and generic CalDAV sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, iCloud, or CalDAV calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to the source. Grid text steps down a size when the window is narrow.
 
 ## Building
 
@@ -112,17 +112,29 @@ iCloud uses CalDAV with an Apple app-specific password:
 
 Synced iCloud events can be edited or deleted when they are simple `.ics` resources. Expanded recurring iCloud instances are still read-only until recurrence exceptions are implemented.
 
+## Connecting other CalDAV calendars
+
+Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, and so on. iCloud is just a CalDAV server with a fixed address, so it uses the same engine under the hood.
+
+1. In Calix, open the calendar sidebar and click **Add CalDAV** in the Accounts section.
+2. Enter the server's CalDAV address, your username, and your password:
+   - **Server URL** — your provider's CalDAV endpoint, e.g. `https://caldav.fastmail.com/` or your Nextcloud address like `https://cloud.example.com/remote.php/dav`. Pasting the bare server origin usually works too; Calix falls back to the `/.well-known/caldav` bootstrap to find your account.
+   - **Username / Password** — most providers want an app-specific password rather than your login password. Generate one in your provider's security settings.
+3. The password is saved to your system keyring, not to a file. Use **Sync CalDAV** to refresh all connected CalDAV accounts.
+
+Editing and deleting synced CalDAV events works for simple `.ics` resources, the same as iCloud; expanded recurring instances are read-only for now.
+
 ## Using Calendars
 
-The left sidebar lists local calendars and synced Google/iCloud calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
+The left sidebar lists local calendars and synced Google/iCloud/CalDAV calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
 
-The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add Google**, **Sync Google**, **Add iCloud**, and **Sync iCloud**.
+The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add**/**Sync** buttons for Google, iCloud, and CalDAV.
 
 ### Working with events
 
 - **Create**: click an empty slot (day cell in month view, hour cell in week/day view), right-click any empty spot for a **New Event** menu at that exact quarter-hour, or use the **+** header button.
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
-- **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to Google/iCloud, and roll back if the remote update fails.
+- **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
 - **Edit**: click any event to open it.
 
 ## Architecture
@@ -140,7 +152,8 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - `src/google/oauth.rs` — the OAuth2 + PKCE sign-in flow (loopback redirect, no embedded browser) and per-account refresh-token storage via the system keyring.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
-- `src/icloud/` — CalDAV discovery/sync for iCloud calendars using an Apple app-specific password stored in the system keyring.
+- `src/caldav.rs` — the provider-neutral CalDAV engine: principal/calendar discovery (with a `/.well-known/caldav` fallback), event fetch with server-side recurrence expansion, create/update/delete, and the shared sync loop. Used by both iCloud and generic CalDAV accounts; only the credentials differ.
+- `src/icloud/` — the iCloud adapter over `src/caldav.rs`: the fixed `caldav.icloud.com` root plus app-specific-password keyring helpers (also reused for generic CalDAV account passwords).
 
 ## Roadmap
 
@@ -153,6 +166,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [x] Basic two-way Google sync / editing synced Google events
 - [x] Basic two-way iCloud CalDAV sync / editing simple synced iCloud events
 - [x] Calendar picker for creating new events directly on Google/iCloud calendars
+- [x] Connect any CalDAV server (Fastmail, Nextcloud, Radicale, …) with two-way sync
 - [x] Drag to move/resize events in the week/day grid (snapped preview, edge auto-scroll)
 - [x] Right-click to create an event at a specific spot
 - [ ] Recurrence exception editing for expanded iCloud recurring events

@@ -1,3 +1,4 @@
+use crate::caldav;
 use crate::calendar_dialog;
 use crate::config::Config;
 use crate::date_util::{
@@ -422,11 +423,37 @@ pub fn build(app: &adw::Application) {
         move |_| open_icloud_account_dialog(&ui, &icloud_add_button, &icloud_sync_button)
     ));
 
+    let caldav_sync_button = gtk::Button::with_label("Sync CalDAV");
+    update_caldav_sync_button(&ui, &caldav_sync_button);
+    caldav_sync_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        caldav_sync_button,
+        move |_| sync_caldav_accounts(&ui, &caldav_sync_button)
+    ));
+
+    let caldav_add_button = gtk::Button::with_label("Add CalDAV");
+    caldav_add_button.set_tooltip_text(Some(
+        "Connect any CalDAV server (Fastmail, Nextcloud, Radicale, …)",
+    ));
+    caldav_add_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        caldav_add_button,
+        #[weak]
+        caldav_sync_button,
+        move |_| open_caldav_account_dialog(&ui, &caldav_add_button, &caldav_sync_button)
+    ));
+
     calendar_sidebar.append(&sidebar_actions(
         &google_add_button,
         &google_sync_button,
         &icloud_add_button,
         &icloud_sync_button,
+        &caldav_add_button,
+        &caldav_sync_button,
     ));
     calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
@@ -561,11 +588,14 @@ pub fn build(app: &adw::Application) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sidebar_actions(
     google_add_button: &gtk::Button,
     google_sync_button: &gtk::Button,
     icloud_add_button: &gtk::Button,
     icloud_sync_button: &gtk::Button,
+    caldav_add_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
 ) -> gtk::Widget {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.add_css_class("sidebar-actions");
@@ -590,11 +620,18 @@ fn sidebar_actions(
     icloud_row.append(icloud_sync_button);
     section.append(&icloud_row);
 
+    let caldav_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    caldav_row.append(caldav_add_button);
+    caldav_row.append(caldav_sync_button);
+    section.append(&caldav_row);
+
     for button in [
         google_add_button,
         google_sync_button,
         icloud_add_button,
         icloud_sync_button,
+        caldav_add_button,
+        caldav_sync_button,
     ] {
         button.set_hexpand(true);
         button.set_halign(gtk::Align::Fill);
@@ -733,23 +770,39 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
                 event_id,
             })
         }
-        Some("icloud") => {
-            let (Some(apple_id), Some(token_key), Some(event_href)) = (
+        Some(provider @ ("icloud" | "caldav")) => {
+            let (Some(username), Some(token_key), Some(event_href)) = (
                 event.account_provider_id.clone(),
                 event.account_token_key.clone(),
                 event.icloud_event_id.clone(),
             ) else {
                 return Some(event_dialog::RemoteEvent::Unavailable(
-                    "This iCloud event is missing sync metadata".to_string(),
+                    "This event is missing sync metadata".to_string(),
                 ));
             };
-            Some(event_dialog::RemoteEvent::Icloud {
-                apple_id,
+            let base_url = match caldav_base_url(provider, event.account_server_url.as_deref()) {
+                Ok(base_url) => base_url,
+                Err(error) => return Some(event_dialog::RemoteEvent::Unavailable(error)),
+            };
+            Some(event_dialog::RemoteEvent::Caldav {
+                base_url,
+                username,
                 token_key,
                 event_href,
             })
         }
         _ => None,
+    }
+}
+
+/// The CalDAV base URL for a synced calendar/event: iCloud's fixed root, or a
+/// generic account's stored `server_url`.
+fn caldav_base_url(provider: &str, server_url: Option<&str>) -> Result<String, String> {
+    match provider {
+        "icloud" => Ok(icloud::ICLOUD_CALDAV_ROOT.to_string()),
+        _ => server_url
+            .map(str::to_string)
+            .ok_or_else(|| "This CalDAV account is missing its server address".to_string()),
     }
 }
 
@@ -781,16 +834,18 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
                         error: "Google calendar is not configured on this machine".to_string(),
                     },
                 },
-                Some("icloud") => match (
+                Some(provider @ ("icloud" | "caldav")) => match (
                     calendar.provider_account_id,
                     calendar.token_key,
                     calendar.icloud_calendar_id,
+                    caldav_base_url(provider, calendar.server_url.as_deref()),
                 ) {
-                    (Some(apple_id), Some(token_key), Some(calendar_href)) => {
-                        event_dialog::CreateTarget::Icloud {
+                    (Some(username), Some(token_key), Some(calendar_href), Ok(base_url)) => {
+                        event_dialog::CreateTarget::Caldav {
                             calendar_id: calendar.id,
                             name: calendar.name,
-                            apple_id,
+                            base_url,
+                            username,
                             token_key,
                             calendar_href,
                         }
@@ -798,7 +853,7 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
                     _ => event_dialog::CreateTarget::Unavailable {
                         calendar_id: calendar.id,
                         name: calendar.name,
-                        error: "iCloud calendar is missing sync metadata".to_string(),
+                        error: "CalDAV calendar is missing sync metadata".to_string(),
                     },
                 },
                 _ => event_dialog::CreateTarget::Local {
@@ -1118,7 +1173,7 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
     );
 }
 
-struct IcloudAddResult {
+struct CaldavAddResult {
     display_name: String,
     calendars_synced: usize,
 }
@@ -1213,22 +1268,23 @@ fn add_icloud_account(
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<IcloudAddResult, String> {
-            let credentials = icloud::caldav::Credentials {
-                apple_id: apple_id.clone(),
-                app_password,
+        let result = (|| -> Result<CaldavAddResult, String> {
+            let credentials = caldav::Credentials {
+                base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
+                username: apple_id.clone(),
+                password: app_password,
             };
-            icloud::caldav::discover_calendars(&credentials)?;
+            caldav::discover_calendars(&credentials)?;
 
             let token_key = icloud::credentials::token_key(&apple_id);
             let store = Store::open().map_err(|e| e.to_string())?;
             let account_id = store
                 .upsert_icloud_account(&apple_id, &apple_id, &token_key)
                 .map_err(|e| e.to_string())?;
-            icloud::credentials::save_app_password(&token_key, &credentials.app_password)
+            icloud::credentials::save_app_password(&token_key, &credentials.password)
                 .map_err(|e| e.to_string())?;
-            let calendars_synced = icloud::sync::sync_account(&credentials, &store, account_id)?;
-            Ok(IcloudAddResult {
+            let calendars_synced = caldav::sync_account(&credentials, &store, account_id)?;
+            Ok(CaldavAddResult {
                 display_name: apple_id,
                 calendars_synced,
             })
@@ -1402,11 +1458,12 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
                             account.display_name
                         )
                     })?;
-                let credentials = icloud::caldav::Credentials {
-                    apple_id: account.provider_account_id.clone(),
-                    app_password,
+                let credentials = caldav::Credentials {
+                    base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
+                    username: account.provider_account_id.clone(),
+                    password: app_password,
                 };
-                calendar_count += icloud::sync::sync_account(&credentials, &store, account.id)?;
+                calendar_count += caldav::sync_account(&credentials, &store, account.id)?;
             }
 
             Ok((account_count, calendar_count))
@@ -1452,4 +1509,293 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
             }
         ),
     );
+}
+
+fn update_caldav_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
+    let account_count = ui
+        .store
+        .caldav_accounts()
+        .map(|accounts| accounts.len())
+        .unwrap_or(0);
+    button.set_sensitive(true);
+    button.set_tooltip_text(if account_count > 0 {
+        Some("Fetch the latest events from connected CalDAV accounts")
+    } else {
+        Some("Fetch calendars from connected CalDAV accounts")
+    });
+}
+
+fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
+    let dialog = adw::Dialog::builder()
+        .title("Add CalDAV")
+        .content_width(440)
+        .build();
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let connect_button = gtk::Button::builder()
+        .label("Connect")
+        .css_classes(["suggested-action"])
+        .build();
+
+    let header = adw::HeaderBar::new();
+    header.pack_start(&cancel_button);
+    header.pack_end(&connect_button);
+
+    let server_row = adw::EntryRow::builder().title("Server URL").build();
+    let username_row = adw::EntryRow::builder().title("Username").build();
+    let password_row = adw::PasswordEntryRow::builder().title("Password").build();
+
+    let group = adw::PreferencesGroup::new();
+    group.add(&server_row);
+    group.add(&username_row);
+    group.add(&password_row);
+
+    let note = gtk::Label::new(Some(
+        "Enter your provider's CalDAV address — e.g. https://caldav.fastmail.com/ \
+         or your Nextcloud URL. Many providers want an app password rather than \
+         your login password.",
+    ));
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    note.add_css_class("dim-label");
+
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("error");
+    error_label.set_xalign(0.0);
+    error_label.set_wrap(true);
+    error_label.set_visible(false);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(&group);
+    content.append(&note);
+    content.append(&error_label);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar_view));
+
+    cancel_button.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+
+    connect_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[strong]
+        add_button,
+        #[strong]
+        sync_button,
+        #[weak]
+        dialog,
+        #[weak]
+        error_label,
+        move |_| {
+            let server_url = server_row.text().trim().to_string();
+            let username = username_row.text().trim().to_string();
+            let password = password_row.text().to_string();
+            if server_url.is_empty() || username.is_empty() || password.is_empty() {
+                error_label.set_label("Server URL, username, and password are all required.");
+                error_label.set_visible(true);
+                return;
+            }
+            if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
+                error_label.set_label("The server URL must start with http:// or https://.");
+                error_label.set_visible(true);
+                return;
+            }
+            dialog.close();
+            add_caldav_account(
+                &ui,
+                &add_button,
+                &sync_button,
+                server_url,
+                username,
+                password,
+            );
+        }
+    ));
+
+    dialog.present(Some(&ui.carousel));
+}
+
+fn add_caldav_account(
+    ui: &Rc<Ui>,
+    add_button: &gtk::Button,
+    sync_button: &gtk::Button,
+    server_url: String,
+    username: String,
+    password: String,
+) {
+    add_button.set_sensitive(false);
+    add_button.set_label("Connecting…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<CaldavAddResult, String> {
+            let credentials = caldav::Credentials {
+                base_url: server_url.clone(),
+                username: username.clone(),
+                password,
+            };
+            // Verify the credentials and reachability before persisting.
+            caldav::discover_calendars(&credentials)?;
+
+            let token_key = icloud::credentials::caldav_token_key(&server_url, &username);
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let display_name = format!("{username} ({})", host_label(&server_url));
+            let account_id = store
+                .upsert_caldav_account(&username, &server_url, &display_name, &token_key)
+                .map_err(|e| e.to_string())?;
+            icloud::credentials::save_app_password(&token_key, &credentials.password)
+                .map_err(|e| e.to_string())?;
+            let calendars_synced = caldav::sync_account(&credentials, &store, account_id)?;
+            Ok(CaldavAddResult {
+                display_name,
+                calendars_synced,
+            })
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            add_button,
+            #[strong]
+            sync_button,
+            move || match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Added {} and synced {} calendar(s)",
+                        result.display_name, result.calendars_synced
+                    )));
+                    add_button.set_label("Add CalDAV");
+                    add_button.set_sensitive(true);
+                    update_caldav_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
+                    ui.reset();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "CalDAV connect failed: {}",
+                            first_line(&error)
+                        ))));
+                    add_button.set_label("Add CalDAV");
+                    add_button.set_sensitive(true);
+                    update_caldav_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    add_button.set_label("Add CalDAV");
+                    add_button.set_sensitive(true);
+                    update_caldav_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
+}
+
+fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+    sync_button.set_sensitive(false);
+    sync_button.set_label("Syncing…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(usize, usize), String> {
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let accounts = store.caldav_accounts().map_err(|e| e.to_string())?;
+            if accounts.is_empty() {
+                return Err("No CalDAV accounts connected. Use Add CalDAV first.".to_string());
+            }
+
+            let account_count = accounts.len();
+            let mut calendar_count = 0;
+            for account in accounts {
+                let Some(base_url) = account.server_url.clone() else {
+                    return Err(format!(
+                        "{} is missing its server address; remove and re-add it.",
+                        account.display_name
+                    ));
+                };
+                let password = icloud::credentials::app_password(&account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("missing saved password for {}", account.display_name)
+                    })?;
+                let credentials = caldav::Credentials {
+                    base_url,
+                    username: account.provider_account_id.clone(),
+                    password,
+                };
+                calendar_count += caldav::sync_account(&credentials, &store, account.id)?;
+            }
+
+            Ok((account_count, calendar_count))
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            sync_button,
+            move || match rx.try_recv() {
+                Ok(Ok((account_count, calendar_count))) => {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Synced {calendar_count} CalDAV calendar(s) from {account_count} account(s)"
+                    )));
+                    sync_button.set_label("Sync CalDAV");
+                    update_caldav_sync_button(&ui, &sync_button);
+                    ui.reset_calendar_sidebar();
+                    ui.reset();
+                    glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+                            "CalDAV sync failed: {}",
+                            first_line(&error)
+                        ))));
+                    sync_button.set_label("Sync CalDAV");
+                    update_caldav_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    sync_button.set_label("Sync CalDAV");
+                    sync_button.set_sensitive(true);
+                    update_caldav_sync_button(&ui, &sync_button);
+                    glib::ControlFlow::Break
+                }
+            }
+        ),
+    );
+}
+
+/// Host portion of a server URL, for a compact account label; falls back to
+/// the raw string if it doesn't parse.
+fn host_label(server_url: &str) -> String {
+    url::Url::parse(server_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| server_url.to_string())
 }
