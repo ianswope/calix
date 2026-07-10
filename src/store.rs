@@ -1157,7 +1157,13 @@ mod tests {
         assert!(store.icloud_accounts().unwrap().is_empty());
 
         let calendar_id = store
-            .upsert_caldav_calendar(account_id, "/dav/calendars/me/work/", "Work", "#123456", true)
+            .upsert_caldav_calendar(
+                account_id,
+                "/dav/calendars/me/work/",
+                "Work",
+                "#123456",
+                true,
+            )
             .unwrap();
         let start = Local::now();
         let end = start + Duration::hours(1);
