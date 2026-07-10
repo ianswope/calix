@@ -1,6 +1,9 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
-use crate::views::{event_occurs_on_day, event_widget};
+use crate::views::{
+    drag::{DragKind, parse_drag_payload},
+    event_occurs_on_day, event_widget,
+};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use gtk::glib;
 use gtk::prelude::*;
@@ -20,7 +23,7 @@ pub fn build(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     build_days(
         week_dates(anchor).to_vec(),
@@ -37,7 +40,7 @@ pub fn build_day(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     build_days(vec![day], events, on_create, on_edit, on_move, true)
 }
@@ -47,7 +50,7 @@ fn build_days(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     scroll_to_today: bool,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -154,7 +157,7 @@ fn all_day_row(
     days: &[NaiveDate],
     events: &[Event],
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
     let row = row_with_days(gutter_size_group, |day_area| {
@@ -182,7 +185,7 @@ fn all_day_row(
                 cell.append(&chip);
             }
 
-            add_drop_target(&cell, *day, on_move.clone());
+            add_drop_target(&cell, *day, None, on_move.clone());
             day_area.attach(&cell, i as i32, 0, 1, 1);
         }
     });
@@ -247,7 +250,7 @@ fn day_column(
     day_events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
@@ -280,30 +283,58 @@ fn day_column(
     let overlay = gtk::Overlay::new();
     overlay.add_css_class("week-day-column");
     overlay.set_child(Some(&col));
-    add_drop_target(&overlay, day, on_move);
+    add_drop_target(&overlay, day, Some(HOUR_ROW_HEIGHT), on_move);
 
-    for layout in timed_event_layouts(day, day_events) {
-        let event = layout.event;
-        let start_h = layout.start_hour;
-        let end_h = layout.end_hour;
-        let top = (start_h * HOUR_ROW_HEIGHT as f64).round() as i32;
-        let height = (((end_h - start_h) * HOUR_ROW_HEIGHT as f64).round() as i32)
-            .max(MIN_EVENT_BLOCK_HEIGHT);
+    let layouts = timed_event_layouts(day, day_events);
+    if !layouts.is_empty() {
+        let lane_count = layouts
+            .iter()
+            .map(|layout| layout.lane + 1)
+            .max()
+            .unwrap_or(1);
+        let event_layer = gtk::Grid::new();
+        event_layer.set_hexpand(true);
+        event_layer.set_column_homogeneous(true);
+        event_layer.set_size_request(-1, 24 * HOUR_ROW_HEIGHT);
+        event_layer.set_valign(gtk::Align::Start);
+        event_layer.set_halign(gtk::Align::Fill);
 
-        let block = event_widget::event_button(event, "event-block", MIN_EVENT_BLOCK_HEIGHT);
-        block.set_valign(gtk::Align::Start);
-        block.set_halign(gtk::Align::Fill);
-        block.set_hexpand(true);
-        block.set_margin_top(top);
-        block.set_size_request(-1, height);
-        block.set_margin_start(2);
-        block.set_margin_end(2);
+        let lane_layers = (0..lane_count)
+            .map(|lane| {
+                let lane_background = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                lane_background.set_size_request(-1, 24 * HOUR_ROW_HEIGHT);
+                let lane_layer = gtk::Overlay::new();
+                lane_layer.set_child(Some(&lane_background));
+                lane_layer.set_hexpand(true);
+                event_layer.attach(&lane_layer, lane as i32, 0, 1, 1);
+                lane_layer
+            })
+            .collect::<Vec<_>>();
 
-        let ev = event.clone();
-        let on_edit = on_edit.clone();
-        block.connect_clicked(move |_| on_edit(ev.clone()));
+        for layout in layouts {
+            let event = layout.event;
+            let top = (layout.start_hour * HOUR_ROW_HEIGHT as f64).round() as i32;
+            let height = (((layout.end_hour - layout.start_hour) * HOUR_ROW_HEIGHT as f64).round()
+                as i32)
+                .max(MIN_EVENT_BLOCK_HEIGHT);
 
-        overlay.add_overlay(&block);
+            let block = event_widget::timed_event_widget(
+                event,
+                "event-block",
+                MIN_EVENT_BLOCK_HEIGHT,
+                on_edit.clone(),
+            );
+            block.set_valign(gtk::Align::Start);
+            block.set_halign(gtk::Align::Fill);
+            block.set_hexpand(true);
+            block.set_margin_top(top);
+            block.set_size_request(-1, height);
+            block.set_margin_start(2);
+            block.set_margin_end(2);
+            lane_layers[layout.lane].add_overlay(&block);
+        }
+
+        overlay.add_overlay(&event_layer);
     }
 
     if day == today {
@@ -316,20 +347,27 @@ fn day_column(
 fn add_drop_target(
     widget: &impl IsA<gtk::Widget>,
     date: NaiveDate,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    hour_height: Option<i32>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) {
     let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
-    drop.connect_drop(move |_, value, _, _| {
+    drop.connect_drop(move |_, value, _, y| {
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Ok(event_id) = event_id.parse::<i64>() else {
+        let Some((kind, event_id)) = parse_drag_payload(&event_id) else {
             return false;
         };
-        on_move(event_id, date);
+        let time = hour_height.and_then(|hour_height| time_for_y(y, hour_height));
+        on_move(kind, event_id, date, time);
         true
     });
     widget.add_controller(drop);
+}
+
+fn time_for_y(y: f64, hour_height: i32) -> Option<NaiveTime> {
+    let slots = ((y / hour_height as f64) * 2.0).floor().clamp(0.0, 47.0) as u32;
+    NaiveTime::from_hms_opt(slots / 2, (slots % 2) * 30, 0)
 }
 
 fn add_now_indicator(overlay: &gtk::Overlay) {
@@ -373,6 +411,7 @@ struct TimedEventLayout<'a> {
     event: &'a Event,
     start_hour: f64,
     end_hour: f64,
+    lane: usize,
 }
 
 fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout<'_>> {
@@ -394,6 +433,7 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
                 event,
                 start_hour,
                 end_hour,
+                lane: 0,
             })
         })
         .collect();
@@ -403,6 +443,18 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
             .then_with(|| left.end_hour.total_cmp(&right.end_hour))
     });
 
+    let mut lane_ends = Vec::new();
+    for layout in &mut layouts {
+        let lane = lane_ends
+            .iter()
+            .position(|end: &f64| *end <= layout.start_hour)
+            .unwrap_or_else(|| {
+                lane_ends.push(0.0);
+                lane_ends.len() - 1
+            });
+        lane_ends[lane] = layout.end_hour;
+        layout.lane = lane;
+    }
     layouts
 }
 
@@ -445,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_events_are_retained_in_time_order() {
+    fn overlapping_events_are_split_into_lanes() {
         let events = vec![event(1, 9, 11), event(2, 9, 10), event(3, 10, 12)];
         let day = events[0].start.date_naive();
 
@@ -455,5 +507,7 @@ mod tests {
         assert_eq!(layouts[0].event.id, 2);
         assert_eq!(layouts[1].event.id, 1);
         assert_eq!(layouts[2].event.id, 3);
+        assert_ne!(layouts[0].lane, layouts[1].lane);
+        assert_eq!(layouts[0].lane, layouts[2].lane);
     }
 }

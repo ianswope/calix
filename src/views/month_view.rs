@@ -1,6 +1,9 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
-use crate::views::{event_occurs_on_day, event_widget};
+use crate::views::{
+    drag::{DragKind, parse_drag_payload},
+    event_occurs_on_day, event_widget,
+};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
 use std::rc::Rc;
@@ -18,7 +21,7 @@ pub fn build(
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -78,7 +81,7 @@ fn day_cell(
     day_events: Vec<Event>,
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
     cell.add_css_class("month-cell");
@@ -142,17 +145,17 @@ fn day_cell(
 fn add_drop_target(
     widget: &impl IsA<gtk::Widget>,
     date: NaiveDate,
-    on_move: Rc<dyn Fn(i64, NaiveDate)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) {
     let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
     drop.connect_drop(move |_, value, _, _| {
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Ok(event_id) = event_id.parse::<i64>() else {
+        let Some((kind, event_id)) = parse_drag_payload(&event_id) else {
             return false;
         };
-        on_move(event_id, date);
+        on_move(kind, event_id, date, None);
         true
     });
     widget.add_controller(drop);

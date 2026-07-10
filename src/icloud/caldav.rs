@@ -83,12 +83,17 @@ pub fn update_event(
     event_href: &str,
     draft: &EventDraft,
 ) -> Result<(), String> {
-    if event_href.contains('#') {
-        return Err("Editing expanded recurring iCloud instances is not supported yet".to_string());
-    }
-    let url = absolute_url(event_href)?;
+    let (resource_href, recurrence_id) = event_href
+        .split_once('#')
+        .map_or((event_href, None), |(href, recurrence_id)| {
+            (href, Some(recurrence_id))
+        });
+    let url = absolute_url(resource_href)?;
     let (existing_ics, etag) = fetch_event(credentials, &url)?;
-    let ics = replace_event_fields(&existing_ics, draft)?;
+    let ics = match recurrence_id {
+        Some(recurrence_id) => replace_recurrence_instance(&existing_ics, recurrence_id, draft)?,
+        None => replace_event_fields(&existing_ics, draft)?,
+    };
     put_event(credentials, &url, &ics, etag.as_deref())?;
     Ok(())
 }
@@ -642,6 +647,107 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
     Ok(result.join("\r\n") + "\r\n")
 }
 
+fn replace_recurrence_instance(
+    ics: &str,
+    recurrence_id: &str,
+    draft: &EventDraft,
+) -> Result<String, String> {
+    let lines = unfold_ics(ics);
+    let uid = lines
+        .iter()
+        .find_map(|line| {
+            (property_name(line) == Some("UID"))
+                .then(|| line.split_once(':').map(|(_, value)| value.to_string()))
+                .flatten()
+        })
+        .ok_or_else(|| "iCloud event is missing its UID".to_string())?;
+
+    let mut result = Vec::new();
+    let mut component = Vec::new();
+    let mut in_event = false;
+    for line in lines {
+        if line == "BEGIN:VEVENT" {
+            in_event = true;
+            component.clear();
+        }
+        if in_event {
+            component.push(line.clone());
+        } else {
+            result.push(line.clone());
+        }
+        if line == "END:VEVENT" {
+            let is_replaced_instance = component.iter().any(|component_line| {
+                property_name(component_line) == Some("RECURRENCE-ID")
+                    && component_line
+                        .split_once(':')
+                        .is_some_and(|(_, value)| value == recurrence_id)
+            });
+            if !is_replaced_instance {
+                result.append(&mut component);
+            }
+            in_event = false;
+        }
+    }
+
+    let insert_at = result
+        .iter()
+        .position(|line| line == "END:VCALENDAR")
+        .ok_or_else(|| "iCloud event is missing VCALENDAR closing data".to_string())?;
+    result.splice(
+        insert_at..insert_at,
+        recurrence_exception_lines(&uid, recurrence_id, draft),
+    );
+    Ok(result.join("\r\n") + "\r\n")
+}
+
+fn recurrence_exception_lines(uid: &str, recurrence_id: &str, draft: &EventDraft) -> Vec<String> {
+    let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
+    let recurrence_key = if recurrence_id.len() == 8
+        && recurrence_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        "RECURRENCE-ID;VALUE=DATE"
+    } else {
+        "RECURRENCE-ID"
+    };
+    let mut lines = vec![
+        "BEGIN:VEVENT".to_string(),
+        format!("UID:{uid}"),
+        format!("{recurrence_key}:{recurrence_id}"),
+        format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
+        format!("SUMMARY:{}", escape_ics_text(&draft.title)),
+        format!("{start_key}:{start_value}"),
+        format!("{end_key}:{end_value}"),
+    ];
+    if let Some(location) = &draft.location {
+        lines.push(format!("LOCATION:{}", escape_ics_text(location)));
+    }
+    if let Some(notes) = &draft.notes {
+        lines.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+    }
+    lines.push("END:VEVENT".to_string());
+    lines
+}
+
+fn event_time_fields(draft: &EventDraft) -> (&'static str, String, &'static str, String) {
+    if draft.all_day {
+        (
+            "DTSTART;VALUE=DATE",
+            draft.start.format("%Y%m%d").to_string(),
+            "DTEND;VALUE=DATE",
+            draft.end.format("%Y%m%d").to_string(),
+        )
+    } else {
+        (
+            "DTSTART",
+            caldav_timestamp(draft.start),
+            "DTEND",
+            caldav_timestamp(draft.end),
+        )
+    }
+}
+
 fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
     let (start_key, start_value, end_key, end_value) = if draft.all_day {
         (
@@ -892,5 +998,30 @@ END:VCALENDAR"#;
         assert!(!updated.contains("Old title"));
         assert!(!updated.contains("LOCATION:Old location"));
         assert!(!updated.contains("DESCRIPTION:Old notes"));
+    }
+
+    #[test]
+    fn replacing_recurrence_instance_preserves_series_and_writes_exception() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 10, 15, 0, 0)
+            .single()
+            .unwrap();
+        let draft = EventDraft {
+            title: "Moved standup".to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: None,
+        };
+
+        let updated = replace_recurrence_instance(ics, "20260709T140000Z", &draft).unwrap();
+
+        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert!(updated.contains("UID:weekly-standup"));
+        assert!(updated.contains("RECURRENCE-ID:20260709T140000Z"));
+        assert!(updated.contains("SUMMARY:Moved standup"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
     }
 }

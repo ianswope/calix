@@ -8,9 +8,9 @@ use crate::event_dialog;
 use crate::google;
 use crate::icloud;
 use crate::store::{self, Event, EventDraft, Store};
-use crate::views::{month_view, week_view};
+use crate::views::{drag::DragKind, month_view, week_view};
 use adw::prelude::*;
-use chrono::{DateTime, Local, NaiveDate};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
 use gtk::glib;
 use gtk::glib::clone;
 use std::cell::{Cell, RefCell};
@@ -144,6 +144,52 @@ impl Ui {
                 ui.carousel.scroll_to(&current_page, false);
                 ui.rebuilding.set(false);
             });
+        });
+    }
+
+    /// Advances the carousel by one period without rebuilding the page that
+    /// is currently visible. Keeping that page attached prevents the flash
+    /// caused by clearing the entire carousel at the end of every swipe.
+    fn advance(self: &Rc<Self>, delta: i32) {
+        self.rebuilding.set(true);
+
+        let mut state = self.state.borrow_mut();
+        state.current_date = state.shift(delta);
+        let view_mode = state.view_mode;
+        let current_date = state.current_date;
+        let replacement_date = state.shift_from(current_date, delta);
+        let title = state.title();
+        drop(state);
+
+        let replacement = self.build_page(view_mode, replacement_date);
+        if delta > 0 {
+            if let Some(old_prev) = self.carousel.first_child() {
+                self.carousel.remove(&old_prev);
+            }
+            self.carousel.append(&replacement);
+        } else {
+            if let Some(old_next) = self.carousel.last_child() {
+                self.carousel.remove(&old_next);
+            }
+            self.carousel.insert(&replacement, 0);
+        }
+        self.title_label.set_label(&title);
+
+        let Some(current_page) = self
+            .carousel
+            .first_child()
+            .and_then(|page| page.next_sibling())
+        else {
+            self.rebuilding.set(false);
+            return;
+        };
+        // When moving backward, inserting the new previous page briefly puts
+        // it at position zero. Recenter before GTK can paint that transient
+        // page, otherwise the swipe flashes the wrong week for one frame.
+        self.carousel.scroll_to(&current_page, false);
+        let ui = self.clone();
+        glib::idle_add_local_once(move || {
+            ui.rebuilding.set(false);
         });
     }
 
@@ -547,10 +593,18 @@ fn connect_handlers(
                 return;
             }
             let delta = if index == 0 { -1 } else { 1 };
-            let mut s = ui.state.borrow_mut();
-            s.current_date = s.shift(delta);
-            drop(s);
-            ui.reset();
+            // `page-changed` is emitted while the swipe animation is still
+            // active. Recycling pages here races that animation, most
+            // visibly when a new page is inserted before the current one.
+            if delta > 0 {
+                ui.advance(delta);
+            } else {
+                ui.rebuilding.set(true);
+                let ui = ui.clone();
+                glib::timeout_add_local_once(Duration::from_millis(180), move || {
+                    ui.advance(delta);
+                });
+            }
         }
     ));
 
@@ -725,26 +779,111 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::CreateTarget> {
         .collect()
 }
 
-fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> Rc<dyn Fn(i64, NaiveDate)> {
+fn move_handler(
+    ui: &Rc<Ui>,
+    events: Vec<Event>,
+) -> Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)> {
     let ui = ui.clone();
-    Rc::new(move |event_id, target_date| {
+    Rc::new(move |kind, event_id, target_date, target_time| {
         let Some(event) = events.iter().find(|event| event.id == event_id).cloned() else {
             return;
         };
-        let draft = moved_draft(&event, target_date);
-        if let Err(error) = ui.store.update_event(event.id, &draft) {
-            ui.toast_overlay
-                .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+        let Some(draft) = drag_draft(&event, kind, target_date, target_time) else {
+            ui.toast_overlay.add_toast(adw::Toast::new(
+                "Resize needs a timed slot in week or day view",
+            ));
             return;
+        };
+        let original = event_to_draft(&event);
+        match remote_event_handler(&ui, &event) {
+            Some(event_dialog::RemoteEvent::Unavailable(error)) => {
+                ui.toast_overlay.add_toast(adw::Toast::new(&error));
+            }
+            Some(remote_event) => {
+                if let Err(error) = ui.store.update_event(event.id, &draft) {
+                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                        "Couldn't move event locally: {error}"
+                    )));
+                    return;
+                }
+                ui.reset();
+
+                let (tx, rx) = mpsc::channel();
+                let remote_draft = draft.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(remote_event.update(&remote_draft));
+                });
+                glib::timeout_add_local(
+                    Duration::from_millis(100),
+                    clone!(
+                        #[strong]
+                        ui,
+                        move || match rx.try_recv() {
+                            Ok(Ok(())) => glib::ControlFlow::Break,
+                            Ok(Err(error)) => {
+                                let _ = ui.store.update_event(event.id, &original);
+                                ui.reset();
+                                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                                    "Couldn't move event: {error}"
+                                )));
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                let _ = ui.store.update_event(event.id, &original);
+                                ui.reset();
+                                ui.toast_overlay
+                                    .add_toast(adw::Toast::new("Event move stopped unexpectedly"));
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    ),
+                );
+            }
+            None => {
+                if let Err(error) = ui.store.update_event(event.id, &draft) {
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+                } else {
+                    ui.reset();
+                }
+            }
         }
-        ui.reset();
     })
 }
 
-fn moved_draft(event: &Event, target_date: NaiveDate) -> EventDraft {
+fn event_to_draft(event: &Event) -> EventDraft {
+    EventDraft {
+        title: event.title.clone(),
+        start: event.start,
+        end: event.end,
+        all_day: event.all_day,
+        location: event.location.clone(),
+        notes: event.notes.clone(),
+    }
+}
+
+fn drag_draft(
+    event: &Event,
+    kind: DragKind,
+    target_date: NaiveDate,
+    target_time: Option<NaiveTime>,
+) -> Option<EventDraft> {
+    match kind {
+        DragKind::Move => Some(moved_draft(event, target_date, target_time)),
+        DragKind::ResizeStart => resized_start_draft(event, target_date, target_time),
+        DragKind::ResizeEnd => resized_end_draft(event, target_date, target_time),
+    }
+}
+
+fn moved_draft(
+    event: &Event,
+    target_date: NaiveDate,
+    target_time: Option<NaiveTime>,
+) -> EventDraft {
     let duration = event.end - event.start;
     let start = target_date
-        .and_time(event.start.time())
+        .and_time(target_time.unwrap_or_else(|| event.start.time()))
         .and_local_timezone(Local)
         .single()
         .unwrap_or(event.start);
@@ -756,6 +895,56 @@ fn moved_draft(event: &Event, target_date: NaiveDate) -> EventDraft {
         location: event.location.clone(),
         notes: event.notes.clone(),
     }
+}
+
+fn resized_start_draft(
+    event: &Event,
+    target_date: NaiveDate,
+    target_time: Option<NaiveTime>,
+) -> Option<EventDraft> {
+    if event.all_day {
+        return None;
+    }
+    let target_time = target_time?;
+    let new_start = target_date
+        .and_time(target_time)
+        .and_local_timezone(Local)
+        .single()?;
+    let latest_start = event.end - ChronoDuration::minutes(30);
+    let start = new_start.min(latest_start);
+    Some(EventDraft {
+        title: event.title.clone(),
+        start,
+        end: event.end,
+        all_day: event.all_day,
+        location: event.location.clone(),
+        notes: event.notes.clone(),
+    })
+}
+
+fn resized_end_draft(
+    event: &Event,
+    target_date: NaiveDate,
+    target_time: Option<NaiveTime>,
+) -> Option<EventDraft> {
+    if event.all_day {
+        return None;
+    }
+    let target_time = target_time?;
+    let new_end = target_date
+        .and_time(target_time)
+        .and_local_timezone(Local)
+        .single()?;
+    let earliest_end = event.start + ChronoDuration::minutes(30);
+    let end = new_end.max(earliest_end);
+    Some(EventDraft {
+        title: event.title.clone(),
+        start: event.start,
+        end,
+        all_day: event.all_day,
+        location: event.location.clone(),
+        notes: event.notes.clone(),
+    })
 }
 
 /// Now, rounded up to the next :00 or :30 — a sensible default start time

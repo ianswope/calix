@@ -119,7 +119,7 @@ impl CreateTarget {
 }
 
 impl RemoteEvent {
-    fn update(&self, draft: &EventDraft) -> Result<(), String> {
+    pub fn update(&self, draft: &EventDraft) -> Result<(), String> {
         match self {
             Self::Unavailable(error) => Err(error.clone()),
             Self::Google {
