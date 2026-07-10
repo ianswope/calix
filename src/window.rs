@@ -323,6 +323,10 @@ pub fn build(app: &adw::Application) {
     });
 
     let today_button = gtk::Button::builder().label("Today").build();
+    today_button.add_css_class("header-small");
+    // Header-bar children default to valign fill, which stretches buttons to
+    // the bar's full content height — natural (small) height needs center.
+    today_button.set_valign(gtk::Align::Center);
     let prev_button = gtk::Button::from_icon_name("go-previous-symbolic");
     let next_button = gtk::Button::from_icon_name("go-next-symbolic");
     let nav_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -349,6 +353,10 @@ pub fn build(app: &adw::Application) {
     view_toggle_box.append(&month_toggle);
     view_toggle_box.append(&week_toggle);
     view_toggle_box.append(&day_toggle);
+    view_toggle_box.set_valign(gtk::Align::Center);
+    for toggle in [&month_toggle, &week_toggle, &day_toggle] {
+        toggle.add_css_class("header-small");
+    }
 
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
@@ -464,6 +472,26 @@ pub fn build(app: &adw::Application) {
         .default_height(750)
         .content(&ui.toast_overlay)
         .build();
+
+    // Below this width, step the grid's text down a size (style.rs's
+    // `window.compact-text` rules) so day columns stay readable instead of
+    // ellipsizing everything away.
+    let compact = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        960.0,
+        adw::LengthUnit::Sp,
+    ));
+    compact.connect_apply(clone!(
+        #[weak]
+        window,
+        move |_| window.add_css_class("compact-text")
+    ));
+    compact.connect_unapply(clone!(
+        #[weak]
+        window,
+        move |_| window.remove_css_class("compact-text")
+    ));
+    window.add_breakpoint(compact);
 
     window.present();
 
@@ -725,56 +753,60 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
     }
 }
 
-fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::CreateTarget> {
+fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
     ui.store
         .calendar_connections()
         .unwrap_or_default()
         .into_iter()
-        .map(|calendar| match calendar.provider.as_deref() {
-            Some("google") => match (
-                ui.config.google.clone(),
-                calendar.token_key,
-                calendar.google_calendar_id,
-            ) {
-                (Some(config), Some(token_key), Some(google_calendar_id)) => {
-                    event_dialog::CreateTarget::Google {
+        .map(|calendar| {
+            let visible = calendar.visible;
+            let target = match calendar.provider.as_deref() {
+                Some("google") => match (
+                    ui.config.google.clone(),
+                    calendar.token_key,
+                    calendar.google_calendar_id,
+                ) {
+                    (Some(config), Some(token_key), Some(google_calendar_id)) => {
+                        event_dialog::CreateTarget::Google {
+                            calendar_id: calendar.id,
+                            name: calendar.name,
+                            config,
+                            token_key,
+                            google_calendar_id,
+                        }
+                    }
+                    _ => event_dialog::CreateTarget::Unavailable {
                         calendar_id: calendar.id,
                         name: calendar.name,
-                        config,
-                        token_key,
-                        google_calendar_id,
-                    }
-                }
-                _ => event_dialog::CreateTarget::Unavailable {
-                    calendar_id: calendar.id,
-                    name: calendar.name,
-                    error: "Google calendar is not configured on this machine".to_string(),
+                        error: "Google calendar is not configured on this machine".to_string(),
+                    },
                 },
-            },
-            Some("icloud") => match (
-                calendar.provider_account_id,
-                calendar.token_key,
-                calendar.icloud_calendar_id,
-            ) {
-                (Some(apple_id), Some(token_key), Some(calendar_href)) => {
-                    event_dialog::CreateTarget::Icloud {
+                Some("icloud") => match (
+                    calendar.provider_account_id,
+                    calendar.token_key,
+                    calendar.icloud_calendar_id,
+                ) {
+                    (Some(apple_id), Some(token_key), Some(calendar_href)) => {
+                        event_dialog::CreateTarget::Icloud {
+                            calendar_id: calendar.id,
+                            name: calendar.name,
+                            apple_id,
+                            token_key,
+                            calendar_href,
+                        }
+                    }
+                    _ => event_dialog::CreateTarget::Unavailable {
                         calendar_id: calendar.id,
                         name: calendar.name,
-                        apple_id,
-                        token_key,
-                        calendar_href,
-                    }
-                }
-                _ => event_dialog::CreateTarget::Unavailable {
+                        error: "iCloud calendar is missing sync metadata".to_string(),
+                    },
+                },
+                _ => event_dialog::CreateTarget::Local {
                     calendar_id: calendar.id,
                     name: calendar.name,
-                    error: "iCloud calendar is missing sync metadata".to_string(),
                 },
-            },
-            _ => event_dialog::CreateTarget::Local {
-                calendar_id: calendar.id,
-                name: calendar.name,
-            },
+            };
+            event_dialog::TargetChoice { target, visible }
         })
         .collect()
 }
@@ -910,7 +942,9 @@ fn resized_start_draft(
         .and_time(target_time)
         .and_local_timezone(Local)
         .single()?;
-    let latest_start = event.end - ChronoDuration::minutes(30);
+    // Matches the interactive resize's 15-minute floor (drag::MIN_BLOCK_MINUTES)
+    // so a committed resize never snaps away from its preview.
+    let latest_start = event.end - ChronoDuration::minutes(15);
     let start = new_start.min(latest_start);
     Some(EventDraft {
         title: event.title.clone(),
@@ -935,7 +969,7 @@ fn resized_end_draft(
         .and_time(target_time)
         .and_local_timezone(Local)
         .single()?;
-    let earliest_end = event.start + ChronoDuration::minutes(30);
+    let earliest_end = event.start + ChronoDuration::minutes(15);
     let end = new_end.max(earliest_end);
     Some(EventDraft {
         title: event.title.clone(),

@@ -1,7 +1,8 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
 use crate::views::{
-    drag::{DragKind, parse_drag_payload},
+    add_new_event_menu,
+    drag::{BlockPlacement, DragKind, TimedGrid, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
@@ -73,12 +74,14 @@ fn build_days(
     hour_grid.append(&gutter_column(&gutter_size_group));
 
     let day_area = day_area();
+    let timed_grid = TimedGrid::new(&day_area, days.clone(), HOUR_ROW_HEIGHT, on_move.clone());
     for day in &days {
         let day_events: Vec<Event> = events
             .iter()
             .filter(|event| event_occurs_on_day(event, *day))
             .cloned()
             .collect();
+        let col_index = day_column_index(&days, *day);
         let column = day_column(
             *day,
             today,
@@ -86,10 +89,19 @@ fn build_days(
             on_create.clone(),
             on_edit.clone(),
             on_move.clone(),
+            &timed_grid,
+            col_index as usize,
         );
-        day_area.attach(&column, day_column_index(&days, *day), 0, 1, 1);
+        day_area.attach(&column, col_index, 0, 1, 1);
     }
-    hour_grid.append(&day_area);
+
+    // Overlay a preview layer above the day columns so an in-flight drag can
+    // paint where the event will land without disturbing the real blocks.
+    let grid_overlay = gtk::Overlay::new();
+    grid_overlay.set_hexpand(true);
+    grid_overlay.set_child(Some(&day_area));
+    grid_overlay.add_overlay(timed_grid.preview_layer());
+    hour_grid.append(&grid_overlay);
 
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -244,6 +256,7 @@ fn gutter_column(gutter_size_group: &gtk::SizeGroup) -> gtk::Widget {
     col.upcast()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn day_column(
     day: NaiveDate,
     today: NaiveDate,
@@ -251,6 +264,8 @@ fn day_column(
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    timed_grid: &Rc<TimedGrid>,
+    col_index: usize,
 ) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
@@ -285,6 +300,21 @@ fn day_column(
     overlay.set_child(Some(&col));
     add_drop_target(&overlay, day, Some(HOUR_ROW_HEIGHT), on_move);
 
+    // Right-clicking empty grid space offers a new event at that spot,
+    // snapped down to the quarter hour it lands in.
+    add_new_event_menu(
+        &overlay,
+        move |_, y| {
+            let quarter = ((y / HOUR_ROW_HEIGHT as f64) * 4.0)
+                .floor()
+                .clamp(0.0, 95.0) as u32;
+            day.and_time(NaiveTime::from_hms_opt(quarter / 4, (quarter % 4) * 15, 0)?)
+                .and_local_timezone(Local)
+                .single()
+        },
+        on_create.clone(),
+    );
+
     let layouts = timed_event_layouts(day, day_events);
     if !layouts.is_empty() {
         let lane_count = layouts
@@ -318,11 +348,28 @@ fn day_column(
                 as i32)
                 .max(MIN_EVENT_BLOCK_HEIGHT);
 
+            // An event spanning midnight is clipped to this day's block; an
+            // edge is only draggable when it's the event's own start/end.
+            // Ending exactly at next midnight still counts as ending here —
+            // that's the block's 24:00 bottom edge.
+            let starts_here = event.start.date_naive() == day;
+            let ends_here = event.end.date_naive() == day
+                || (event.end.time() == NaiveTime::MIN
+                    && day.succ_opt() == Some(event.end.date_naive()));
+
             let block = event_widget::timed_event_widget(
                 event,
                 "event-block",
                 MIN_EVENT_BLOCK_HEIGHT,
                 on_edit.clone(),
+                timed_grid,
+                &BlockPlacement {
+                    col: col_index,
+                    top_px: top as f64,
+                    height_px: height as f64,
+                    starts_here,
+                    ends_here,
+                },
             );
             block.set_valign(gtk::Align::Start);
             block.set_halign(gtk::Align::Fill);

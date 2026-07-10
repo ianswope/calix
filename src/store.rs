@@ -72,6 +72,7 @@ pub struct CalendarConnection {
     pub token_key: Option<String>,
     pub google_calendar_id: Option<String>,
     pub icloud_calendar_id: Option<String>,
+    pub visible: bool,
 }
 
 pub struct Store {
@@ -230,7 +231,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT calendars.id, calendars.name, accounts.provider,
                     accounts.provider_account_id, accounts.token_key,
-                    calendars.google_calendar_id, calendars.icloud_calendar_id
+                    calendars.google_calendar_id, calendars.icloud_calendar_id,
+                    calendars.visible
              FROM calendars
              LEFT JOIN accounts ON accounts.id = calendars.account_id
              ORDER BY accounts.provider IS NOT NULL, accounts.display_name, calendars.name",
@@ -244,6 +246,7 @@ impl Store {
                 token_key: row.get(4)?,
                 google_calendar_id: row.get(5)?,
                 icloud_calendar_id: row.get(6)?,
+                visible: row.get::<_, i64>(7)? != 0,
             })
         })?;
         rows.collect()

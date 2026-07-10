@@ -6,6 +6,7 @@ use adw::prelude::*;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use gtk::glib;
 use gtk::glib::clone;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -30,6 +31,15 @@ pub enum RemoteEvent {
         token_key: String,
         event_href: String,
     },
+}
+
+/// A calendar the dialog can create events on, plus whether it belongs to
+/// the default picker set (the calendars currently shown in the sidebar —
+/// accounts can carry dozens of calendars, and the hidden ones shouldn't
+/// crowd the dropdown).
+pub struct TargetChoice {
+    pub target: CreateTarget,
+    pub visible: bool,
 }
 
 #[derive(Clone)]
@@ -187,13 +197,28 @@ impl RemoteEvent {
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     store: Rc<Store>,
-    create_targets: Vec<CreateTarget>,
+    create_targets: Vec<TargetChoice>,
     editing: Option<Event>,
     initial_start: DateTime<Local>,
     on_saved: impl Fn() + 'static,
     remote_event: Option<RemoteEvent>,
 ) {
     let on_saved = Rc::new(on_saved);
+
+    // The calendar picker starts with just the default set (sidebar-visible
+    // calendars) and expands via a trailing "Show all calendars…" item.
+    // Hidden targets are ordered after visible ones so a dropdown index maps
+    // straight into `create_targets` whether or not the list is expanded.
+    let (visible_targets, hidden_targets): (Vec<_>, Vec<_>) = create_targets
+        .into_iter()
+        .partition(|choice| choice.visible);
+    let visible_count = visible_targets.len();
+    let create_targets: Vec<CreateTarget> = visible_targets
+        .into_iter()
+        .chain(hidden_targets)
+        .map(|choice| choice.target)
+        .collect();
+    let collapsible = visible_count > 0 && visible_count < create_targets.len();
 
     let dialog = adw::Dialog::builder()
         .title(if editing.is_some() {
@@ -228,18 +253,55 @@ pub fn open(
         .as_ref()
         .map(|event| event.calendar_name.clone())
         .unwrap_or_else(|| "Local".to_string());
-    let target_names = create_targets
+    let target_names: Vec<String> = create_targets
         .iter()
-        .map(|target| target.name())
-        .collect::<Vec<_>>();
-    let calendar_selector = gtk::DropDown::from_strings(&target_names);
+        .map(|target| target.name().to_string())
+        .collect();
+    let initial_names: Vec<&str> = if collapsible {
+        target_names[..visible_count]
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once("Show all calendars…"))
+            .collect()
+    } else {
+        target_names.iter().map(String::as_str).collect()
+    };
+    let calendar_selector = gtk::DropDown::from_strings(&initial_names);
     let selected_target = create_targets
         .iter()
         .position(|target| {
             target.calendar_id() == editing.as_ref().map_or(1, |event| event.calendar_id)
         })
+        .filter(|position| !collapsible || *position < visible_count)
         .unwrap_or(0);
     calendar_selector.set_selected(selected_target as u32);
+
+    // Until expanded, the index `visible_count` is the "Show all" item, not a
+    // calendar; selecting it swaps in the full list and restores the previous
+    // pick. The guard flag keeps the swap's own notifications inert and lets
+    // the save handler reject the sentinel in the unexpanded state.
+    let picker_expanded = Rc::new(Cell::new(!collapsible));
+    if collapsible {
+        let last_pick = Cell::new(selected_target as u32);
+        let expanded = picker_expanded.clone();
+        let all_names = target_names.clone();
+        calendar_selector.connect_selected_notify(move |selector| {
+            if expanded.get() {
+                return;
+            }
+            if (selector.selected() as usize) != visible_count {
+                last_pick.set(selector.selected());
+                return;
+            }
+            expanded.set(true);
+            let names: Vec<&str> = all_names.iter().map(String::as_str).collect();
+            selector.set_model(Some(&gtk::StringList::new(&names)));
+            selector.set_selected(last_pick.get());
+            // Reopen the popup so the full list is immediately in front of
+            // the user instead of needing a second click.
+            selector.activate();
+        });
+    }
 
     match &editing {
         Some(event) => {
@@ -423,6 +485,8 @@ pub fn open(
         #[strong]
         calendar_selector,
         #[strong]
+        picker_expanded,
+        #[strong]
         save_button,
         #[weak]
         error_label,
@@ -460,7 +524,12 @@ pub fn open(
             };
 
             let Some(event) = editing.as_ref() else {
-                let Some(target) = create_targets.get(calendar_selector.selected() as usize).cloned() else {
+                let selected = calendar_selector.selected() as usize;
+                if !picker_expanded.get() && selected >= visible_count {
+                    error_label.set_label("Choose a calendar");
+                    return;
+                }
+                let Some(target) = create_targets.get(selected).cloned() else {
                     error_label.set_label("Choose a calendar");
                     return;
                 };
