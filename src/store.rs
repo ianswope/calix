@@ -157,8 +157,13 @@ impl Store {
 
         conn.execute_batch(
             "
-            CREATE UNIQUE INDEX IF NOT EXISTS accounts_provider_remote_id
-                ON accounts(provider, provider_account_id);
+            -- Account identity includes the server so the same username on
+            -- two different CalDAV servers is two accounts, not one. google
+            -- and icloud leave server_url NULL, and COALESCE('') keeps their
+            -- identity effectively (provider, provider_account_id) as before.
+            DROP INDEX IF EXISTS accounts_provider_remote_id;
+            CREATE UNIQUE INDEX IF NOT EXISTS accounts_identity
+                ON accounts(provider, provider_account_id, COALESCE(server_url, ''));
             CREATE UNIQUE INDEX IF NOT EXISTS accounts_token_key
                 ON accounts(token_key);
             DROP INDEX IF EXISTS calendars_google_id;
@@ -319,7 +324,7 @@ impl Store {
         self.conn.query_row(
             "INSERT INTO accounts (provider, provider_account_id, display_name, token_key)
              VALUES ('google', ?1, ?2, ?3)
-             ON CONFLICT(provider, provider_account_id)
+             ON CONFLICT(provider, provider_account_id, COALESCE(server_url, ''))
              DO UPDATE SET display_name = ?2, token_key = ?3
              RETURNING id",
             params![provider_account_id, display_name, token_key],
@@ -336,7 +341,7 @@ impl Store {
         self.conn.query_row(
             "INSERT INTO accounts (provider, provider_account_id, display_name, token_key)
              VALUES ('icloud', ?1, ?2, ?3)
-             ON CONFLICT(provider, provider_account_id)
+             ON CONFLICT(provider, provider_account_id, COALESCE(server_url, ''))
              DO UPDATE SET display_name = ?2, token_key = ?3
              RETURNING id",
             params![apple_id, display_name, token_key],
@@ -344,10 +349,10 @@ impl Store {
         )
     }
 
-    /// Creates or updates a generic CalDAV account. `username` is the login
-    /// sent to the server and doubles as the provider-scoped id, so
-    /// reconnecting the same login updates the existing row (including its
-    /// `server_url` if the address changed).
+    /// Creates or updates a generic CalDAV account, keyed on the
+    /// `(username, server_url)` pair: reconnecting the same login to the same
+    /// server updates that row, while the same username on a different server
+    /// is a distinct account.
     pub fn upsert_caldav_account(
         &self,
         username: &str,
@@ -358,7 +363,7 @@ impl Store {
         self.conn.query_row(
             "INSERT INTO accounts (provider, provider_account_id, display_name, token_key, server_url)
              VALUES ('caldav', ?1, ?2, ?3, ?4)
-             ON CONFLICT(provider, provider_account_id)
+             ON CONFLICT(provider, provider_account_id, COALESCE(server_url, ''))
              DO UPDATE SET display_name = ?2, token_key = ?3, server_url = ?4
              RETURNING id",
             params![username, display_name, token_key, server_url],
@@ -1188,6 +1193,59 @@ mod tests {
             events[0].icloud_event_id.as_deref(),
             Some("/dav/calendars/me/work/evt.ics")
         );
+    }
+
+    #[test]
+    fn caldav_identity_is_scoped_to_server() {
+        let store = Store::open_in_memory().unwrap();
+        // Same username, two different servers → two distinct accounts.
+        let fastmail = store
+            .upsert_caldav_account(
+                "me",
+                "https://caldav.fastmail.com/",
+                "me (fastmail)",
+                "caldav-password:https://caldav.fastmail.com|me",
+            )
+            .unwrap();
+        let nextcloud = store
+            .upsert_caldav_account(
+                "me",
+                "https://cloud.example.com/remote.php/dav",
+                "me (nextcloud)",
+                "caldav-password:https://cloud.example.com/remote.php/dav|me",
+            )
+            .unwrap();
+        assert_ne!(fastmail, nextcloud);
+        assert_eq!(store.caldav_accounts().unwrap().len(), 2);
+
+        // Reconnecting the same username+server updates in place, and can move
+        // the display name without spawning a third row.
+        let fastmail_again = store
+            .upsert_caldav_account(
+                "me",
+                "https://caldav.fastmail.com/",
+                "me (fastmail, renamed)",
+                "caldav-password:https://caldav.fastmail.com|me",
+            )
+            .unwrap();
+        assert_eq!(fastmail_again, fastmail);
+        assert_eq!(store.caldav_accounts().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn google_account_identity_unaffected_by_server_url_column() {
+        // Re-authing the same Google account must still update in place, not
+        // create a duplicate, now that the identity index coalesces the
+        // (always-NULL for Google) server_url.
+        let store = Store::open_in_memory().unwrap();
+        let first = store
+            .upsert_google_account("person@example.com", "Person", "google:person")
+            .unwrap();
+        let second = store
+            .upsert_google_account("person@example.com", "Person Renamed", "google:person")
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(store.google_accounts().unwrap().len(), 1);
     }
 
     #[test]
