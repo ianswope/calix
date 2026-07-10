@@ -1,31 +1,70 @@
 use crate::store::Event;
-use crate::views::drag::{DragKind, drag_payload};
+use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, drag_payload};
 use gtk::gdk;
 use gtk::prelude::*;
 use std::f64::consts::PI;
 use std::rc::Rc;
 
 pub fn event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
-    event_button_with_padding(event, css_class, min_height, 2)
+    event_button_with_padding(event, css_class, min_height, 2, true)
 }
 
 pub fn compact_event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
-    event_button_with_padding(event, css_class, min_height, 0)
+    event_button_with_padding(event, css_class, min_height, 0, true)
 }
 
+/// A timed event block for the week/day grid. Moving and resizing are driven
+/// by `grid` (a `GestureDrag` controller with a live preview) rather than
+/// GTK's data-transfer drag-and-drop, so `placement` describes where the
+/// block currently sits in the grid.
 pub fn timed_event_widget(
     event: &Event,
     css_class: &str,
     min_height: i32,
     on_click: Rc<dyn Fn(Event)>,
+    grid: &Rc<TimedGrid>,
+    placement: &BlockPlacement,
 ) -> gtk::Widget {
     let overlay = gtk::Overlay::new();
-    let button = event_button_with_padding(event, css_class, min_height, 0);
+    let button = event_button_with_padding(event, css_class, min_height, 0, false);
     let ev = event.clone();
-    button.connect_clicked(move |_| on_click(ev.clone()));
+    let click = on_click.clone();
+    button.connect_clicked(move |_| click(ev.clone()));
     overlay.set_child(Some(&button));
-    overlay.add_overlay(&resize_handle(event.id, DragKind::ResizeStart));
-    overlay.add_overlay(&resize_handle(event.id, DragKind::ResizeEnd));
+
+    // Moving commits the block's top edge as the event's new start, so only
+    // a block whose top really is the start may move.
+    if placement.starts_here {
+        button.set_cursor_from_name(Some("grab"));
+        grid.install(&button, &button, DragKind::Move, event.id, placement);
+    }
+
+    // Keep a clickable/movable band in the middle even for short blocks by
+    // shrinking the resize handles rather than letting them swallow the block.
+    let handle_height = (placement.height_px / 3.0).clamp(4.0, 10.0) as i32;
+    for (kind, is_own_edge) in [
+        (DragKind::ResizeStart, placement.starts_here),
+        (DragKind::ResizeEnd, placement.ends_here),
+    ] {
+        if !is_own_edge {
+            continue;
+        }
+        let handle = resize_handle(kind, handle_height);
+        grid.install(&handle, &button, kind, event.id, placement);
+
+        // The handle covers the button's edge, so plain clicks on it would
+        // otherwise go dead; forward them to the event's click action. A
+        // drag that crosses the threshold claims the sequence, which cancels
+        // this click before it can fire.
+        let click_gesture = gtk::GestureClick::new();
+        let ev = event.clone();
+        let on_click = on_click.clone();
+        click_gesture.connect_released(move |_, _, _, _| on_click(ev.clone()));
+        handle.add_controller(click_gesture);
+
+        overlay.add_overlay(&handle);
+    }
+
     overlay.upcast()
 }
 
@@ -34,6 +73,7 @@ fn event_button_with_padding(
     css_class: &str,
     min_height: i32,
     vertical_padding: i32,
+    draggable: bool,
 ) -> gtk::Button {
     let color = gtk::gdk::RGBA::parse(event.calendar_color.as_str())
         .unwrap_or_else(|_| gtk::gdk::RGBA::new(0.2, 0.52, 0.89, 1.0));
@@ -96,11 +136,13 @@ fn event_button_with_padding(
         .build();
     button.set_label("");
     button.set_child(Some(&overlay));
-    make_draggable(&button, event.id, DragKind::Move);
+    if draggable {
+        make_draggable(&button, event.id, DragKind::Move);
+    }
     button
 }
 
-fn resize_handle(event_id: i64, kind: DragKind) -> gtk::Box {
+fn resize_handle(kind: DragKind, height: i32) -> gtk::Box {
     let handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
     handle.add_css_class("event-resize-handle");
     handle.add_css_class(match kind {
@@ -109,14 +151,14 @@ fn resize_handle(event_id: i64, kind: DragKind) -> gtk::Box {
         DragKind::Move => unreachable!("move drags never use resize handles"),
     });
     handle.set_hexpand(true);
-    handle.set_size_request(-1, 8);
+    handle.set_size_request(-1, height);
     handle.set_halign(gtk::Align::Fill);
     handle.set_valign(match kind {
         DragKind::ResizeStart => gtk::Align::Start,
         DragKind::ResizeEnd => gtk::Align::End,
         DragKind::Move => gtk::Align::Start,
     });
-    make_draggable(&handle, event_id, kind);
+    handle.set_cursor_from_name(Some("ns-resize"));
     handle
 }
 

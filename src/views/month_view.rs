@@ -1,6 +1,7 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
 use crate::views::{
+    add_new_event_menu,
     drag::{DragKind, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
@@ -34,6 +35,7 @@ pub fn build(
         let weekday_label = gtk::Label::new(Some(label));
         weekday_label.add_css_class("caption-heading");
         weekday_label.add_css_class("dim-label");
+        weekday_label.add_css_class("month-weekday");
         weekday_label.set_margin_top(6);
         weekday_label.set_margin_bottom(6);
         header.append(&weekday_label);
@@ -125,6 +127,18 @@ fn day_cell(
     let spacer = gtk::Box::new(gtk::Orientation::Vertical, 0);
     spacer.set_vexpand(true);
     cell.append(&spacer);
+
+    // Right-clicking empty cell space offers a new event on that day, at
+    // the same 9 AM default a plain click uses.
+    add_new_event_menu(
+        &cell,
+        move |_, _| {
+            date.and_time(NaiveTime::from_hms_opt(9, 0, 0)?)
+                .and_local_timezone(Local)
+                .single()
+        },
+        on_create.clone(),
+    );
 
     let click = gtk::GestureClick::new();
     click.connect_released(move |_, _, _, _| {

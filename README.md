@@ -2,7 +2,7 @@
 
 A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Apple/iCloud and Google calendars.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. The event dialog can create events on local, Google, or iCloud calendars; existing synced events can also be edited or deleted. Local events can be dragged to another day.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google/iCloud sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. The event dialog can create events on local, Google, or iCloud calendars; existing synced events can also be edited or deleted. Events can be dragged to another day in the month grid, and moved or resized directly in the week/day grid — including synced events, which push the change back to Google/iCloud.
 
 ## Building
 
