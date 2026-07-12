@@ -30,11 +30,12 @@ pub fn token_key(apple_id: &str) -> String {
 }
 
 /// Keyring key for a generic CalDAV account. Includes the server so the same
-/// username on two different servers gets distinct secrets.
-pub fn caldav_token_key(base_url: &str, username: &str) -> String {
+/// username on two different servers gets distinct secrets. Callers must pass
+/// a URL from `caldav::canonical_base_url` — the same canonical form used for
+/// the account row — so the keyring and the database agree on identity.
+pub fn caldav_token_key(canonical_base_url: &str, username: &str) -> String {
     format!(
-        "{CALDAV_KEYRING_PREFIX}:{}|{}",
-        base_url.trim().trim_end_matches('/').to_lowercase(),
+        "{CALDAV_KEYRING_PREFIX}:{canonical_base_url}|{}",
         username.trim().to_lowercase()
     )
 }
