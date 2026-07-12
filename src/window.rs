@@ -968,16 +968,30 @@ fn moved_draft(
     target_date: NaiveDate,
     target_time: Option<NaiveTime>,
 ) -> EventDraft {
-    let duration = event.end - event.start;
     let start = target_date
         .and_time(target_time.unwrap_or_else(|| event.start.time()))
         .and_local_timezone(Local)
         .single()
         .unwrap_or(event.start);
+    // An all-day span is a count of calendar days, not elapsed hours: a DST
+    // transition inside the original span would otherwise pull the moved end
+    // off midnight and corrupt the exclusive end date.
+    let end = if event.all_day {
+        let span_days = (event.end.date_naive() - event.start.date_naive())
+            .num_days()
+            .max(1);
+        (start.date_naive() + ChronoDuration::days(span_days))
+            .and_time(NaiveTime::MIN)
+            .and_local_timezone(Local)
+            .single()
+            .unwrap_or(start + (event.end - event.start))
+    } else {
+        start + (event.end - event.start)
+    };
     EventDraft {
         title: event.title.clone(),
         start,
-        end: start + duration,
+        end,
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
@@ -1544,11 +1558,16 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     let server_row = adw::EntryRow::builder().title("Server URL").build();
     let username_row = adw::EntryRow::builder().title("Username").build();
     let password_row = adw::PasswordEntryRow::builder().title("Password").build();
+    let http_row = adw::SwitchRow::builder()
+        .title("Allow unencrypted HTTP")
+        .subtitle("Sends your password in cleartext — only for trusted local networks")
+        .build();
 
     let group = adw::PreferencesGroup::new();
     group.add(&server_row);
     group.add(&username_row);
     group.add(&password_row);
+    group.add(&http_row);
 
     let note = gtk::Label::new(Some(
         "Enter your provider's CalDAV address — e.g. https://caldav.fastmail.com/ \
@@ -1609,6 +1628,23 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
             }
             if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
                 error_label.set_label("The server URL must start with http:// or https://.");
+                error_label.set_visible(true);
+                return;
+            }
+            let server_url = match caldav::canonical_base_url(&server_url) {
+                Ok(url) => url,
+                Err(message) => {
+                    error_label.set_label(&message);
+                    error_label.set_visible(true);
+                    return;
+                }
+            };
+            if server_url.starts_with("http://") && !http_row.is_active() {
+                error_label.set_label(
+                    "This server uses unencrypted HTTP, which would expose your \
+                     password to the network. Use an https:// URL, or enable \
+                     “Allow unencrypted HTTP” for a trusted local network.",
+                );
                 error_label.set_visible(true);
                 return;
             }
@@ -1798,4 +1834,72 @@ fn host_label(server_url: &str) -> String {
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| server_url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn local_midnight(year: i32, month: u32, day: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(year, month, day, 0, 0, 0)
+            .single()
+            .expect("unambiguous local midnight")
+    }
+
+    fn test_event(start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -> Event {
+        Event {
+            id: 1,
+            calendar_id: 1,
+            calendar_name: "Test".to_string(),
+            calendar_color: "#3584e4".to_string(),
+            account_provider: None,
+            account_provider_id: None,
+            account_token_key: None,
+            google_calendar_id: None,
+            title: "Trip".to_string(),
+            start,
+            end,
+            all_day,
+            location: None,
+            notes: None,
+            google_event_id: None,
+            icloud_event_id: None,
+            account_server_url: None,
+        }
+    }
+
+    #[test]
+    fn moved_all_day_draft_keeps_its_calendar_day_span() {
+        // March 7–9, 2026 spans the US spring-forward transition, so in a DST
+        // timezone the elapsed duration is not a whole number of days.
+        let event = test_event(local_midnight(2026, 3, 7), local_midnight(2026, 3, 9), true);
+
+        let target = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let draft = moved_draft(&event, target, None);
+
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(draft.start.time(), NaiveTime::MIN);
+        assert_eq!(
+            draft.end.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 18).unwrap()
+        );
+        assert_eq!(draft.end.time(), NaiveTime::MIN);
+    }
+
+    #[test]
+    fn moved_timed_draft_keeps_its_elapsed_duration() {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 6, 9, 30, 0)
+            .single()
+            .unwrap();
+        let event = test_event(start, start + ChronoDuration::minutes(45), false);
+
+        let target = NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
+        let draft = moved_draft(&event, target, NaiveTime::from_hms_opt(14, 0, 0));
+
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(draft.end - draft.start, ChronoDuration::minutes(45));
+    }
 }

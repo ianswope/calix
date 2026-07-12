@@ -399,6 +399,18 @@ fn same_collection(collection_url: &str, href: &str) -> bool {
     collection_path(collection_url) == collection_path(href)
 }
 
+/// Parses and canonicalizes a CalDAV base URL — lowercased scheme and host,
+/// default port dropped, no trailing slash — so equivalent spellings like
+/// `https://Host/` and `https://host` map to one account row and one keyring
+/// entry instead of duplicate accounts sharing a secret.
+pub fn canonical_base_url(input: &str) -> Result<String, String> {
+    let url = url::Url::parse(input.trim()).map_err(|e| format!("Invalid server URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("The server URL must start with http:// or https://.".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
 fn collection_path(url_or_href: &str) -> String {
     url::Url::parse(url_or_href)
         .map(|url| url.path().trim_end_matches('/').to_string())
@@ -433,17 +445,32 @@ fn request(
 }
 
 /// Resolves a possibly-relative href (as CalDAV servers return in multistatus
-/// responses) against the server's base URL. Absolute hrefs — iCloud routes
-/// principals to partition hosts like `p42-caldav.icloud.com` — pass through.
+/// responses) against the server's base URL. Every request attaches the
+/// account's Basic-auth credentials, so absolute hrefs are only accepted on
+/// the configured origin — plus iCloud's partition hosts (iCloud routes
+/// principals to hosts like `p42-caldav.icloud.com`) over HTTPS. Anything
+/// else would let a hostile server redirect the credentials elsewhere or
+/// downgrade them to cleartext HTTP.
 fn absolute_url(base_url: &str, href: &str) -> Result<String, String> {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        Ok(href.to_string())
+    let root = url::Url::parse(base_url).map_err(|e| e.to_string())?;
+    let resolved = root.join(href).map_err(|e| e.to_string())?;
+    if resolved.origin() == root.origin() || is_icloud_partition_pair(&root, &resolved) {
+        Ok(resolved.to_string())
     } else {
-        let root = url::Url::parse(base_url).map_err(|e| e.to_string())?;
-        root.join(href)
-            .map(|url| url.to_string())
-            .map_err(|e| e.to_string())
+        Err(format!(
+            "CalDAV server returned an href on an unexpected host: {resolved}"
+        ))
     }
+}
+
+fn is_icloud_partition_pair(root: &url::Url, resolved: &url::Url) -> bool {
+    fn https_icloud_host(url: &url::Url) -> bool {
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host == "icloud.com" || host.ends_with(".icloud.com"))
+    }
+    https_icloud_host(root) && https_icloud_host(resolved)
 }
 
 fn multistatus_responses(xml: &str) -> Vec<String> {
@@ -574,7 +601,7 @@ fn parse_event(
         let instance_id = props
             .get("RECURRENCE-ID")
             .or_else(|| props.get("DTSTART"))
-            .map(|property| property.value.clone())
+            .map(recurrence_instance_id)
             .unwrap_or_else(|| start.to_rfc3339());
         format!("{href}#{instance_id}")
     };
@@ -741,11 +768,35 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
     Ok(result.join("\r\n") + "\r\n")
 }
 
+/// Cached identity of an expanded recurrence instance: the `RECURRENCE-ID`
+/// value qualified by its `TZID` parameter (`TZID=Zone:value`), so the
+/// write-back path can reproduce the exact property form the series used
+/// instead of emitting a floating timestamp that names a different — or no —
+/// occurrence. Bare UTC (`...Z`) and all-day (`YYYYMMDD`) values carry no
+/// parameter and stay bare.
+fn recurrence_instance_id(property: &IcsProperty) -> String {
+    match &property.tzid {
+        Some(tzid) => format!("TZID={tzid}:{}", property.value),
+        None => property.value.clone(),
+    }
+}
+
+/// Splits a `recurrence_instance_id` identity back into its optional TZID
+/// and raw datetime value.
+fn split_recurrence_id(recurrence_id: &str) -> (Option<&str>, &str) {
+    recurrence_id
+        .strip_prefix("TZID=")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(tzid, value)| (Some(tzid), value))
+        .unwrap_or((None, recurrence_id))
+}
+
 fn replace_recurrence_instance(
     ics: &str,
     recurrence_id: &str,
     draft: &EventDraft,
 ) -> Result<String, String> {
+    let (_, recurrence_value) = split_recurrence_id(recurrence_id);
     let lines = unfold_ics(ics);
     let uid = lines
         .iter()
@@ -774,7 +825,7 @@ fn replace_recurrence_instance(
                 property_name(component_line) == Some("RECURRENCE-ID")
                     && component_line
                         .split_once(':')
-                        .is_some_and(|(_, value)| value == recurrence_id)
+                        .is_some_and(|(_, value)| value == recurrence_value)
             });
             if !is_replaced_instance {
                 result.append(&mut component);
@@ -796,19 +847,22 @@ fn replace_recurrence_instance(
 
 fn recurrence_exception_lines(uid: &str, recurrence_id: &str, draft: &EventDraft) -> Vec<String> {
     let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
-    let recurrence_key = if recurrence_id.len() == 8
-        && recurrence_id
-            .chars()
-            .all(|character| character.is_ascii_digit())
-    {
-        "RECURRENCE-ID;VALUE=DATE"
-    } else {
-        "RECURRENCE-ID"
+    let (tzid, recurrence_value) = split_recurrence_id(recurrence_id);
+    let recurrence_line = match tzid {
+        Some(tzid) => format!("RECURRENCE-ID;TZID={tzid}:{recurrence_value}"),
+        None if recurrence_value.len() == 8
+            && recurrence_value
+                .chars()
+                .all(|character| character.is_ascii_digit()) =>
+        {
+            format!("RECURRENCE-ID;VALUE=DATE:{recurrence_value}")
+        }
+        None => format!("RECURRENCE-ID:{recurrence_value}"),
     };
     let mut lines = vec![
         "BEGIN:VEVENT".to_string(),
         format!("UID:{uid}"),
-        format!("{recurrence_key}:{recurrence_id}"),
+        recurrence_line,
         format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
         format!("SUMMARY:{}", escape_ics_text(&draft.title)),
         format!("{start_key}:{start_value}"),
@@ -919,6 +973,80 @@ fn unescape_ics_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_base_url_normalizes_equivalent_spellings() {
+        for spelling in ["https://Host.Example.com/", "https://host.example.com"] {
+            assert_eq!(
+                canonical_base_url(spelling).as_deref(),
+                Ok("https://host.example.com")
+            );
+        }
+        assert_eq!(
+            canonical_base_url(" https://host.example.com/dav/ ").as_deref(),
+            Ok("https://host.example.com/dav")
+        );
+    }
+
+    #[test]
+    fn canonical_base_url_rejects_non_http_schemes() {
+        assert!(canonical_base_url("ftp://host.example.com").is_err());
+        assert!(canonical_base_url("not a url").is_err());
+    }
+
+    #[test]
+    fn absolute_url_resolves_relative_hrefs_against_the_base() {
+        assert_eq!(
+            absolute_url("https://host.example.com/dav", "/cal/home/").as_deref(),
+            Ok("https://host.example.com/cal/home/")
+        );
+    }
+
+    #[test]
+    fn absolute_url_keeps_same_origin_absolute_hrefs() {
+        assert_eq!(
+            absolute_url(
+                "https://host.example.com/dav",
+                "https://host.example.com/cal/"
+            )
+            .as_deref(),
+            Ok("https://host.example.com/cal/")
+        );
+    }
+
+    #[test]
+    fn absolute_url_rejects_cross_origin_hrefs() {
+        assert!(absolute_url("https://host.example.com/dav", "https://evil.example.net/").is_err());
+    }
+
+    #[test]
+    fn absolute_url_rejects_downgrade_to_http_on_the_same_host() {
+        assert!(absolute_url("https://host.example.com/dav", "http://host.example.com/").is_err());
+    }
+
+    #[test]
+    fn absolute_url_allows_icloud_partition_hosts() {
+        assert_eq!(
+            absolute_url(
+                "https://caldav.icloud.com",
+                "https://p42-caldav.icloud.com/123456/principal/"
+            )
+            .as_deref(),
+            Ok("https://p42-caldav.icloud.com/123456/principal/")
+        );
+    }
+
+    #[test]
+    fn absolute_url_only_trusts_icloud_hosts_from_an_icloud_base() {
+        assert!(
+            absolute_url(
+                "https://host.example.com/dav",
+                "https://p42-caldav.icloud.com/123456/principal/"
+            )
+            .is_err()
+        );
+        assert!(absolute_url("https://caldav.icloud.com", "https://evil-icloud.com/").is_err());
+    }
 
     #[test]
     fn child_xml_keeps_nested_children_until_matching_close_tag() {
@@ -1117,5 +1245,111 @@ END:VCALENDAR"#;
         assert!(updated.contains("RECURRENCE-ID:20260709T140000Z"));
         assert!(updated.contains("SUMMARY:Moved standup"));
         assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+    }
+
+    #[test]
+    fn parse_events_keeps_recurrence_id_tzid_in_the_instance_identity() {
+        let ics = r#"BEGIN:VCALENDAR
+BEGIN:VEVENT
+SUMMARY:Standup
+DTSTART;TZID=America/New_York:20260709T090000
+DTEND;TZID=America/New_York:20260709T093000
+RECURRENCE-ID;TZID=America/New_York:20260709T090000
+END:VEVENT
+BEGIN:VEVENT
+SUMMARY:Standup
+DTSTART;TZID=America/New_York:20260716T090000
+DTEND;TZID=America/New_York:20260716T093000
+RECURRENCE-ID;TZID=America/New_York:20260716T090000
+END:VEVENT
+END:VCALENDAR"#;
+
+        let events = parse_events("/cal/standup.ics", ics);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].href,
+            "/cal/standup.ics#TZID=America/New_York:20260709T090000"
+        );
+        assert_eq!(
+            events[1].href,
+            "/cal/standup.ics#TZID=America/New_York:20260716T090000"
+        );
+    }
+
+    #[test]
+    fn replacing_recurrence_instance_reproduces_the_tzid_form() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, 15, 0, 0)
+            .single()
+            .unwrap();
+        let draft = EventDraft {
+            title: "Moved standup".to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: None,
+        };
+
+        let updated =
+            replace_recurrence_instance(ics, "TZID=America/New_York:20260709T090000", &draft)
+                .unwrap();
+
+        assert!(updated.contains("RECURRENCE-ID;TZID=America/New_York:20260709T090000"));
+        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+    }
+
+    #[test]
+    fn replacing_recurrence_instance_replaces_an_existing_tzid_exception() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nRECURRENCE-ID;TZID=America/New_York:20260709T090000\r\nSUMMARY:Old exception\r\nDTSTART;TZID=America/New_York:20260709T100000\r\nDTEND;TZID=America/New_York:20260709T103000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, 15, 0, 0)
+            .single()
+            .unwrap();
+        let draft = EventDraft {
+            title: "New exception".to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: None,
+        };
+
+        let updated =
+            replace_recurrence_instance(ics, "TZID=America/New_York:20260709T090000", &draft)
+                .unwrap();
+
+        assert!(!updated.contains("Old exception"));
+        assert!(updated.contains("SUMMARY:New exception"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+        assert_eq!(
+            updated
+                .matches("RECURRENCE-ID;TZID=America/New_York:20260709T090000")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn all_day_recurrence_exception_still_writes_value_date() {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, 0, 0, 0)
+            .single()
+            .unwrap();
+        let draft = EventDraft {
+            title: "Holiday".to_string(),
+            start,
+            end: start + chrono::Duration::days(1),
+            all_day: true,
+            location: None,
+            notes: None,
+        };
+
+        let lines = recurrence_exception_lines("uid", "20260709", &draft);
+
+        assert!(lines.contains(&"RECURRENCE-ID;VALUE=DATE:20260709".to_string()));
     }
 }

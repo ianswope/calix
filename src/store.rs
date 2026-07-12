@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
@@ -101,6 +101,11 @@ impl Store {
     }
 
     fn from_connection(conn: Connection) -> rusqlite::Result<Self> {
+        // The UI thread and each background sync worker hold their own
+        // connection; WAL plus a busy timeout lets them overlap instead of
+        // failing immediately with `database is locked`.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS calendars (
@@ -180,6 +185,14 @@ impl Store {
                 ON events(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL;
             ",
         )?;
+
+        // Rows written before schema version 1 stored local-offset RFC3339
+        // text; rewrite them once so TEXT comparisons are chronological.
+        let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version < 1 {
+            normalize_event_timestamps(&conn)?;
+            conn.pragma_update(None, "user_version", 1)?;
+        }
 
         let store = Store { conn };
         store.ensure_default_calendar()?;
@@ -446,7 +459,7 @@ impl Store {
              ORDER BY events.start_at",
         )?;
         let rows = stmt.query_map(
-            params![range_end.to_rfc3339(), range_start.to_rfc3339()],
+            params![stored_timestamp(&range_end), stored_timestamp(&range_start)],
             row_to_event,
         )?;
         rows.collect()
@@ -459,8 +472,8 @@ impl Store {
             params![
                 calendar_id,
                 draft.title,
-                draft.start.to_rfc3339(),
-                draft.end.to_rfc3339(),
+                stored_timestamp(&draft.start),
+                stored_timestamp(&draft.end),
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
@@ -475,8 +488,8 @@ impl Store {
              location = ?5, notes = ?6 WHERE id = ?7",
             params![
                 draft.title,
-                draft.start.to_rfc3339(),
-                draft.end.to_rfc3339(),
+                stored_timestamp(&draft.start),
+                stored_timestamp(&draft.end),
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
@@ -507,8 +520,8 @@ impl Store {
             params![
                 calendar_id,
                 draft.title,
-                draft.start.to_rfc3339(),
-                draft.end.to_rfc3339(),
+                stored_timestamp(&draft.start),
+                stored_timestamp(&draft.end),
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
@@ -532,8 +545,8 @@ impl Store {
             params![
                 calendar_id,
                 draft.title,
-                draft.start.to_rfc3339(),
-                draft.end.to_rfc3339(),
+                stored_timestamp(&draft.start),
+                stored_timestamp(&draft.end),
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
@@ -560,8 +573,8 @@ impl Store {
                    AND start_at < ?2 AND end_at > ?3",
                 params![
                     calendar_id,
-                    range_end.to_rfc3339(),
-                    range_start.to_rfc3339()
+                    stored_timestamp(&range_end),
+                    stored_timestamp(&range_start)
                 ],
             )?;
             return Ok(());
@@ -578,8 +591,8 @@ impl Store {
                AND start_at < ? AND end_at > ?
                AND google_event_id NOT IN ({placeholders})"
         );
-        let range_end = range_end.to_rfc3339();
-        let range_start = range_start.to_rfc3339();
+        let range_end = stored_timestamp(&range_end);
+        let range_start = stored_timestamp(&range_start);
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id, &range_end, &range_start];
         params.extend(keep_google_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
@@ -600,8 +613,8 @@ impl Store {
                    AND start_at < ?2 AND end_at > ?3",
                 params![
                     calendar_id,
-                    range_end.to_rfc3339(),
-                    range_start.to_rfc3339()
+                    stored_timestamp(&range_end),
+                    stored_timestamp(&range_start)
                 ],
             )?;
             return Ok(());
@@ -618,8 +631,8 @@ impl Store {
                AND start_at < ? AND end_at > ?
                AND icloud_event_id NOT IN ({placeholders})"
         );
-        let range_end = range_end.to_rfc3339();
-        let range_start = range_start.to_rfc3339();
+        let range_end = stored_timestamp(&range_end);
+        let range_start = stored_timestamp(&range_start);
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id, &range_end, &range_start];
         params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
@@ -799,6 +812,57 @@ fn parse_rfc3339(s: &str) -> DateTime<Local> {
         .with_timezone(&Local)
 }
 
+/// Serializes an instant for storage: UTC, whole seconds, `Z` suffix. The
+/// SQL above compares `start_at`/`end_at` as TEXT (range queries, pruning,
+/// ORDER BY), which is only chronological if every stored value shares one
+/// offset and precision — local-offset RFC3339 text does not sort by instant.
+fn stored_timestamp(instant: &DateTime<Local>) -> String {
+    instant
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Rewrites rows stored by earlier versions as local-offset RFC3339 text
+/// (`2026-11-01T01:30:00-04:00`) into the form `stored_timestamp` writes, so
+/// TEXT comparisons stay chronological across the whole table.
+fn normalize_event_timestamps(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("SELECT id, start_at, end_at FROM events")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, start, end) in rows {
+        let normalized_start = normalized_timestamp(&start);
+        let normalized_end = normalized_timestamp(&end);
+        if normalized_start.is_some() || normalized_end.is_some() {
+            conn.execute(
+                "UPDATE events SET start_at = ?1, end_at = ?2 WHERE id = ?3",
+                params![
+                    normalized_start.unwrap_or(start),
+                    normalized_end.unwrap_or(end),
+                    id
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// `Some(normalized)` when `value` parses and isn't already in stored form;
+/// `None` leaves unparseable or already-normalized text untouched.
+fn normalized_timestamp(value: &str) -> Option<String> {
+    let normalized = DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+    (normalized != value).then_some(normalized)
+}
+
 fn data_file_path() -> PathBuf {
     gtk::glib::user_data_dir()
         .join("calix")
@@ -819,6 +883,76 @@ mod tests {
             location: None,
             notes: None,
         }
+    }
+
+    #[test]
+    fn events_are_stored_as_utc_z_timestamps() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 6, 9, 0, 0)
+            .single()
+            .unwrap();
+        let id = store
+            .create_event(
+                store.default_calendar_id(),
+                &draft("Meeting", start, start + Duration::hours(1)),
+            )
+            .unwrap();
+
+        let (start_at, end_at): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT start_at, end_at FROM events WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(start_at, stored_timestamp(&start));
+        assert!(start_at.ends_with('Z'));
+        assert!(end_at.ends_with('Z'));
+
+        // Round-trips back to the same instant through events_between.
+        let events = store
+            .events_between(start - Duration::minutes(1), start + Duration::hours(2))
+            .unwrap();
+        assert_eq!(events[0].start, start);
+    }
+
+    #[test]
+    fn migration_normalizes_legacy_local_offset_timestamps() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (calendar_id, title, start_at, end_at)
+                 VALUES (?1, 'Legacy', '2026-11-01T01:30:00-04:00', '2026-11-01T02:30:00-05:00')",
+                params![store.default_calendar_id()],
+            )
+            .unwrap();
+
+        normalize_event_timestamps(&store.conn).unwrap();
+
+        let (start_at, end_at): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT start_at, end_at FROM events WHERE title = 'Legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(start_at, "2026-11-01T05:30:00Z");
+        assert_eq!(end_at, "2026-11-01T07:30:00Z");
+    }
+
+    #[test]
+    fn normalized_timestamp_leaves_normalized_and_invalid_text_alone() {
+        assert_eq!(normalized_timestamp("2026-11-01T05:30:00Z"), None);
+        assert_eq!(normalized_timestamp("not a timestamp"), None);
+        assert_eq!(
+            normalized_timestamp("2026-11-01T01:30:00-04:00").as_deref(),
+            Some("2026-11-01T05:30:00Z")
+        );
     }
 
     #[test]
