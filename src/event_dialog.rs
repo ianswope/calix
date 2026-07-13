@@ -355,23 +355,12 @@ pub fn open(
     content.set_margin_bottom(18);
     content.set_margin_start(18);
     content.set_margin_end(18);
-    content.append(&group);
-    if let Some(event) = &editing {
-        let links = event_links(event);
-        if !links.is_empty() {
-            let links_group = adw::PreferencesGroup::builder()
-                .title("Meeting links")
-                .build();
-            for link in links {
-                let label = meeting_link_label(&link);
-                let button = gtk::LinkButton::with_label(&link, &label);
-                button.set_halign(gtk::Align::Start);
-                button.set_tooltip_text(Some(&link));
-                links_group.add(&button);
-            }
-            content.append(&links_group);
-        }
+    // Meeting links go first, so they're in view the moment the event opens
+    // instead of being pushed below the fields (and off the bottom).
+    if let Some(links_group) = editing.as_ref().and_then(meeting_links_group) {
+        content.append(&links_group);
     }
+    content.append(&group);
     content.append(&error_label);
 
     if let Some(event) = &editing {
@@ -458,9 +447,18 @@ pub fn open(
         content.append(&delete_button);
     }
 
+    // Scroll the body so a long event — several meeting links, long notes —
+    // can't push fields or the delete button out of reach. Natural-height
+    // propagation keeps short events compact; only overflow scrolls.
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .vexpand(true)
+        .child(&content)
+        .build();
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
-    toolbar_view.set_content(Some(&content));
+    toolbar_view.set_content(Some(&scroller));
     dialog.set_child(Some(&toolbar_view));
 
     cancel_button.connect_clicked(clone!(
@@ -792,6 +790,26 @@ fn urls_in_text(text: &str) -> impl Iterator<Item = String> + '_ {
         let url = Url::parse(candidate).ok()?;
         matches!(url.scheme(), "http" | "https").then(|| candidate.to_string())
     })
+}
+
+/// A "Meeting links" group listing every URL found in the event's location or
+/// notes, or `None` if there are none.
+fn meeting_links_group(event: &Event) -> Option<adw::PreferencesGroup> {
+    let links = event_links(event);
+    if links.is_empty() {
+        return None;
+    }
+    let group = adw::PreferencesGroup::builder()
+        .title("Meeting links")
+        .build();
+    for link in links {
+        let label = meeting_link_label(&link);
+        let button = gtk::LinkButton::with_label(&link, &label);
+        button.set_halign(gtk::Align::Start);
+        button.set_tooltip_text(Some(&link));
+        group.add(&button);
+    }
+    Some(group)
 }
 
 fn meeting_link_label(link: &str) -> String {

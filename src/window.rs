@@ -19,6 +19,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+type CreateFn = Rc<dyn Fn(DateTime<Local>)>;
+type EditFn = Rc<dyn Fn(Event)>;
+type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Month,
@@ -46,9 +50,33 @@ impl ViewMode {
     }
 }
 
+/// Persisted key for the timed-grid zoom (the pixel height of one hour row in
+/// day and week views).
+const ZOOM_SETTING_KEY: &str = "hour_row_height";
+
+/// Reads the saved zoom, clamped to the valid range, falling back to the
+/// default if it's absent or unparseable.
+fn load_hour_row_height(store: &Store) -> i32 {
+    store
+        .setting(ZOOM_SETTING_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(clamp_hour_row_height)
+        .unwrap_or(week_view::DEFAULT_HOUR_ROW_HEIGHT)
+}
+
+fn clamp_hour_row_height(height: i32) -> i32 {
+    height.clamp(
+        week_view::MIN_HOUR_ROW_HEIGHT,
+        week_view::MAX_HOUR_ROW_HEIGHT,
+    )
+}
+
 struct State {
     view_mode: ViewMode,
     current_date: NaiveDate,
+    hour_row_height: i32,
 }
 
 impl State {
@@ -99,14 +127,32 @@ struct Ui {
     state: Rc<RefCell<State>>,
     store: Rc<Store>,
     config: Rc<Config>,
+    // The calendar date the display is currently anchored to. A periodic clock
+    // tick compares it against the real date so a rollover (left open
+    // overnight, or crossed while the machine was suspended) can be noticed and
+    // the "today" highlighting re-anchored.
+    today: Rc<Cell<NaiveDate>>,
     rebuilding: Rc<Cell<bool>>,
+    // Set when a zoom updated only the visible page in place, leaving the
+    // offscreen neighbor pages at the old height. The next swipe rebuilds
+    // everything (via `reset`) instead of recycling a stale neighbor.
+    zoom_dirty: Rc<Cell<bool>>,
 }
 
 impl Ui {
     /// Clears the carousel and rebuilds it with prev/current/next pages
-    /// centered on the selected date.
+    /// centered on the selected date, landing on the usual "now" scroll spot.
     fn reset(self: &Rc<Self>) {
+        self.reset_with(week_view::InitialScroll::NowOrMorning);
+    }
+
+    /// `reset`, but landing the timed grid at `scroll` — used to keep the same
+    /// time in view when a full rebuild happens for reasons other than
+    /// navigation (e.g. the first swipe after an in-place zoom).
+    fn reset_with(self: &Rc<Self>, scroll: week_view::InitialScroll) {
         self.rebuilding.set(true);
+        // A full rebuild makes every page current again.
+        self.zoom_dirty.set(false);
 
         let mut child = self.carousel.first_child();
         while let Some(widget) = child {
@@ -127,9 +173,9 @@ impl Ui {
         let title = state.title();
         drop(state);
 
-        let current_page = self.build_page(view_mode, current_date);
-        let prev_page = self.build_page(view_mode, prev_date);
-        let next_page = self.build_page(view_mode, next_date);
+        let current_page = self.build_page(view_mode, current_date, scroll);
+        let prev_page = self.build_page(view_mode, prev_date, scroll);
+        let next_page = self.build_page(view_mode, next_date, scroll);
 
         self.carousel.append(&prev_page);
         self.carousel.append(&current_page);
@@ -156,13 +202,30 @@ impl Ui {
 
         let mut state = self.state.borrow_mut();
         state.current_date = state.shift(delta);
+        drop(state);
+
+        // A zoom left the neighbor pages at the old height; recycling one as
+        // the new current page would show the wrong zoom. Rebuild all three
+        // instead, keeping the time the user was looking at (reset clears the
+        // flag).
+        if self.zoom_dirty.get() {
+            let scroll = self
+                .visible_scroll_hours()
+                .map(week_view::InitialScroll::AtHour)
+                .unwrap_or(week_view::InitialScroll::NowOrMorning);
+            self.reset_with(scroll);
+            return;
+        }
+
+        let state = self.state.borrow();
         let view_mode = state.view_mode;
         let current_date = state.current_date;
         let replacement_date = state.shift_from(current_date, delta);
         let title = state.title();
         drop(state);
 
-        let replacement = self.build_page(view_mode, replacement_date);
+        let replacement =
+            self.build_page(view_mode, replacement_date, week_view::InitialScroll::NowOrMorning);
         if delta > 0 {
             if let Some(old_prev) = self.carousel.first_child() {
                 self.carousel.remove(&old_prev);
@@ -194,6 +257,44 @@ impl Ui {
         });
     }
 
+    /// Runs on a periodic timer to keep the display anchored to real time.
+    /// Slides the "now" line to the current time, and when the calendar date
+    /// has rolled over re-anchors "today": the highlighting always follows the
+    /// real day, and if the user is still parked on today the visible page
+    /// follows too. Because GLib timeouts fire promptly once the machine wakes,
+    /// this also recovers from a day boundary crossed during suspend.
+    fn tick_clock(self: &Rc<Self>) {
+        let now_date = Local::now().date_naive();
+        let previous = self.today.get();
+
+        // Don't disturb an in-progress swipe/rebuild; the next tick retries
+        // (with `today` still unchanged, so the rollover isn't lost).
+        if now_date != previous && !self.rebuilding.get() {
+            let parked_on_today = self.state.borrow().current_date == previous;
+            self.today.set(now_date);
+            if parked_on_today {
+                self.state.borrow_mut().current_date = now_date;
+                self.reset();
+                return;
+            }
+        }
+
+        self.refresh_now_line();
+    }
+
+    /// Slides every "now" indicator currently in the carousel to the current
+    /// time of day, in place — no rebuild, so the user's scroll position and
+    /// swipe are untouched.
+    fn refresh_now_line(&self) {
+        let hour_row_height = self.state.borrow().hour_row_height;
+        let margin = week_view::now_indicator_margin_top(hour_row_height);
+        let mut child = self.carousel.first_child();
+        while let Some(page) = child {
+            move_now_indicators(&page, margin);
+            child = page.next_sibling();
+        }
+    }
+
     fn reset_calendar_sidebar(self: &Rc<Self>) {
         let mut child = self.calendar_list.first_child();
         while let Some(widget) = child {
@@ -215,11 +316,12 @@ impl Ui {
         ));
     }
 
-    /// Builds one page (month grid or week grid) for `date`, wired up to
-    /// query this page's events from the store and to open the event
-    /// dialog on create/edit clicks.
-    fn build_page(self: &Rc<Self>, view_mode: ViewMode, date: NaiveDate) -> gtk::Widget {
-        let on_create: Rc<dyn Fn(DateTime<Local>)> = {
+    /// The create/edit/move callbacks a timed or month page is wired up with:
+    /// clicking empty space opens a new-event dialog, clicking an event opens
+    /// it, and dragging commits a move/resize. `events` is this page's event
+    /// set, which the move handler needs to resolve a drag back to its event.
+    fn event_callbacks(self: &Rc<Self>, events: Vec<Event>) -> (CreateFn, EditFn, MoveFn) {
+        let on_create: CreateFn = {
             let ui = self.clone();
             Rc::new(move |start: DateTime<Local>| {
                 let ui_for_saved = ui.clone();
@@ -234,7 +336,7 @@ impl Ui {
                 );
             })
         };
-        let on_edit: Rc<dyn Fn(Event)> = {
+        let on_edit: EditFn = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
                 let start = event.start;
@@ -251,36 +353,121 @@ impl Ui {
                 );
             })
         };
+        let on_move = move_handler(self, events);
+        (on_create, on_edit, on_move)
+    }
+
+    /// Builds one page (month grid or week/day grid) for `date`, wired up to
+    /// query this page's events from the store and to open the event dialog on
+    /// create/edit clicks. `initial_scroll` only matters for timed views.
+    fn build_page(
+        self: &Rc<Self>,
+        view_mode: ViewMode,
+        date: NaiveDate,
+        initial_scroll: week_view::InitialScroll,
+    ) -> gtk::Widget {
+        let (range_start, range_end) = match view_mode {
+            ViewMode::Month => month_grid_bounds(date),
+            ViewMode::Week => week_bounds(date),
+            ViewMode::Day => day_bounds(date),
+        };
+        let events = self
+            .store
+            .events_between(store::day_start(range_start), store::day_start(range_end))
+            .unwrap_or_default();
+        let (on_create, on_edit, on_move) = self.event_callbacks(events.clone());
 
         match view_mode {
-            ViewMode::Month => {
-                let (range_start, range_end) = month_grid_bounds(date);
-                let events = self
-                    .store
-                    .events_between(store::day_start(range_start), store::day_start(range_end))
-                    .unwrap_or_default();
-                let on_move = move_handler(self, events.clone());
-                month_view::build(date, &events, on_create, on_edit, on_move)
-            }
+            ViewMode::Month => month_view::build(date, &events, on_create, on_edit, on_move),
             ViewMode::Week => {
-                let (range_start, range_end) = week_bounds(date);
-                let events = self
-                    .store
-                    .events_between(store::day_start(range_start), store::day_start(range_end))
-                    .unwrap_or_default();
-                let on_move = move_handler(self, events.clone());
-                week_view::build(date, &events, on_create, on_edit, on_move)
+                let hour_row_height = self.state.borrow().hour_row_height;
+                week_view::build(
+                    date,
+                    &events,
+                    on_create,
+                    on_edit,
+                    on_move,
+                    hour_row_height,
+                    initial_scroll,
+                )
             }
             ViewMode::Day => {
-                let (range_start, range_end) = day_bounds(date);
-                let events = self
-                    .store
-                    .events_between(store::day_start(range_start), store::day_start(range_end))
-                    .unwrap_or_default();
-                let on_move = move_handler(self, events.clone());
-                week_view::build_day(date, &events, on_create, on_edit, on_move)
+                let hour_row_height = self.state.borrow().hour_row_height;
+                week_view::build_day(
+                    date,
+                    &events,
+                    on_create,
+                    on_edit,
+                    on_move,
+                    hour_row_height,
+                    initial_scroll,
+                )
             }
         }
+    }
+
+    /// The `ScrolledWindow` of the currently visible (middle) page, if it's a
+    /// timed view. It's the page root's last child (below the header and
+    /// all-day rows).
+    fn visible_scrolled(&self) -> Option<gtk::ScrolledWindow> {
+        let page = self.carousel.first_child()?.next_sibling()?;
+        page.last_child().and_downcast::<gtk::ScrolledWindow>()
+    }
+
+    /// The fractional hour currently at the top of the visible timed page,
+    /// derived from its scroll offset and the current hour height.
+    fn visible_scroll_hours(&self) -> Option<f64> {
+        let scrolled = self.visible_scrolled()?;
+        let height = self.state.borrow().hour_row_height;
+        (height > 0).then(|| scrolled.vadjustment().value() / height as f64)
+    }
+
+    /// Re-renders just the visible page's hour grid at `new_height`, reusing
+    /// its scroll container and keeping the same time at the top of the
+    /// viewport. This is the cheap, flash-free path that a live pinch drives
+    /// on every frame — no carousel surgery, no full rebuild. The offscreen
+    /// neighbor pages are left stale until `refresh_neighbor_pages`.
+    fn zoom_visible_page(self: &Rc<Self>, new_height: i32) {
+        let (view_mode, date, old_height) = {
+            let state = self.state.borrow();
+            (state.view_mode, state.current_date, state.hour_row_height)
+        };
+        if view_mode == ViewMode::Month || new_height == old_height {
+            return;
+        }
+        let Some(scrolled) = self.visible_scrolled() else {
+            return;
+        };
+        let vadj = scrolled.vadjustment();
+        let top_hours = if old_height > 0 {
+            vadj.value() / old_height as f64
+        } else {
+            0.0
+        };
+
+        let (days, range) = match view_mode {
+            ViewMode::Week => (week_dates(date).to_vec(), week_bounds(date)),
+            _ => (vec![date], day_bounds(date)),
+        };
+        let events = self
+            .store
+            .events_between(store::day_start(range.0), store::day_start(range.1))
+            .unwrap_or_default();
+        let (on_create, on_edit, on_move) = self.event_callbacks(events.clone());
+        let grid =
+            week_view::build_hour_grid(&days, &events, on_create, on_edit, on_move, new_height);
+        scrolled.set_child(Some(&grid));
+
+        // Set the adjustment to the same time synchronously so the new grid
+        // paints in place on its first frame instead of flashing at midnight
+        // and then jumping (which is what an idle-deferred scroll would do).
+        let upper = (24 * new_height) as f64;
+        vadj.set_upper(upper.max(vadj.page_size()));
+        vadj.set_value((top_hours * new_height as f64).clamp(0.0, (upper - vadj.page_size()).max(0.0)));
+
+        self.state.borrow_mut().hour_row_height = new_height;
+        // The neighbor pages are now stale; the next swipe will rebuild.
+        self.zoom_dirty.set(true);
     }
 }
 
@@ -288,9 +475,11 @@ pub fn build(app: &adw::Application) {
     let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
     let initial_view_mode =
         ViewMode::from_setting(store.setting(ViewMode::SETTING_KEY).unwrap_or_default());
+    let initial_hour_row_height = load_hour_row_height(&store);
     let state = Rc::new(RefCell::new(State {
         view_mode: initial_view_mode,
         current_date: Local::now().date_naive(),
+        hour_row_height: initial_hour_row_height,
     }));
 
     let carousel = adw::Carousel::builder()
@@ -318,10 +507,30 @@ pub fn build(app: &adw::Application) {
         state,
         store,
         config: Rc::new(Config::load()),
+        today: Rc::new(Cell::new(Local::now().date_naive())),
         // Guards against `page-changed`/`toggled` firing (and reentering
         // `rebuild`) as a side effect of our own programmatic changes.
         rebuilding: Rc::new(Cell::new(false)),
+        zoom_dirty: Rc::new(Cell::new(false)),
     });
+
+    // Keep the display anchored to real time: slide the "now" line and, on a
+    // date rollover, re-anchor "today". A half-minute cadence keeps the line
+    // reasonably fresh and bounds how long a suspend/resume rollover can linger
+    // — GLib's monotonic timeout fires promptly once the machine wakes.
+    glib::timeout_add_seconds_local(
+        30,
+        clone!(
+            #[weak]
+            ui,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                ui.tick_clock();
+                glib::ControlFlow::Continue
+            }
+        ),
+    );
 
     let today_button = gtk::Button::builder().label("Today").build();
     today_button.add_css_class("header-small");
@@ -358,6 +567,22 @@ pub fn build(app: &adw::Application) {
     for toggle in [&month_toggle, &week_toggle, &day_toggle] {
         toggle.add_css_class("header-small");
     }
+
+    // Stretch/compress the visible day in week and day views. Hidden in
+    // month view, where there is no timed grid to zoom.
+    let zoom_out_button = gtk::Button::from_icon_name("zoom-out-symbolic");
+    zoom_out_button.set_tooltip_text(Some("Compress the day — fit more hours on screen"));
+    let zoom_in_button = gtk::Button::from_icon_name("zoom-in-symbolic");
+    zoom_in_button.set_tooltip_text(Some("Stretch the day out — show finer detail"));
+    let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    zoom_box.add_css_class("linked");
+    zoom_box.append(&zoom_out_button);
+    zoom_box.append(&zoom_in_button);
+    zoom_box.set_valign(gtk::Align::Center);
+    for button in [&zoom_out_button, &zoom_in_button] {
+        button.add_css_class("header-small");
+    }
+    refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
 
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
     new_event_button.set_tooltip_text(Some("New Event"));
@@ -477,6 +702,7 @@ pub fn build(app: &adw::Application) {
     header.pack_start(&nav_box);
     header.set_title_widget(Some(&ui.title_label));
     header.pack_end(&view_toggle_box);
+    header.pack_end(&zoom_box);
     header.pack_end(&new_event_button);
     header.pack_end(&calendars_button);
 
@@ -546,6 +772,12 @@ pub fn build(app: &adw::Application) {
         week_toggle,
         #[strong]
         day_toggle,
+        #[strong]
+        zoom_box,
+        #[strong]
+        zoom_out_button,
+        #[strong]
+        zoom_in_button,
         move |carousel, _clock| {
             if carousel.width() <= 0 {
                 return glib::ControlFlow::Continue;
@@ -570,6 +802,12 @@ pub fn build(app: &adw::Application) {
                     week_toggle,
                     #[strong]
                     day_toggle,
+                    #[strong]
+                    zoom_box,
+                    #[strong]
+                    zoom_out_button,
+                    #[strong]
+                    zoom_in_button,
                     move || {
                         connect_handlers(
                             &ui,
@@ -579,6 +817,9 @@ pub fn build(app: &adw::Application) {
                             &month_toggle,
                             &week_toggle,
                             &day_toggle,
+                            &zoom_box,
+                            &zoom_out_button,
+                            &zoom_in_button,
                         );
                     }
                 ),
@@ -641,6 +882,7 @@ fn sidebar_actions(
     section.upcast()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn connect_handlers(
     ui: &Rc<Ui>,
     today_button: &gtk::Button,
@@ -649,6 +891,9 @@ fn connect_handlers(
     month_toggle: &gtk::ToggleButton,
     week_toggle: &gtk::ToggleButton,
     day_toggle: &gtk::ToggleButton,
+    zoom_box: &gtk::Box,
+    zoom_out_button: &gtk::Button,
+    zoom_in_button: &gtk::Button,
 ) {
     ui.carousel.connect_page_changed(clone!(
         #[strong]
@@ -705,38 +950,160 @@ fn connect_handlers(
         }
     ));
 
-    month_toggle.connect_toggled(clone!(
+    for (toggle, mode) in [
+        (month_toggle, ViewMode::Month),
+        (week_toggle, ViewMode::Week),
+        (day_toggle, ViewMode::Day),
+    ] {
+        toggle.connect_toggled(clone!(
+            #[strong]
+            ui,
+            #[strong]
+            zoom_box,
+            #[strong]
+            zoom_out_button,
+            #[strong]
+            zoom_in_button,
+            move |btn| {
+                if btn.is_active() {
+                    set_view_mode(&ui, mode);
+                    ui.reset();
+                    refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
+                }
+            }
+        ));
+    }
+
+    zoom_out_button.connect_clicked(clone!(
         #[strong]
         ui,
-        move |btn| {
-            if btn.is_active() {
-                set_view_mode(&ui, ViewMode::Month);
-                ui.reset();
-            }
+        #[strong]
+        zoom_box,
+        #[strong]
+        zoom_out_button,
+        #[strong]
+        zoom_in_button,
+        move |_| {
+            adjust_zoom(&ui, -1);
+            refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
         }
     ));
 
-    week_toggle.connect_toggled(clone!(
+    zoom_in_button.connect_clicked(clone!(
         #[strong]
         ui,
-        move |btn| {
-            if btn.is_active() {
-                set_view_mode(&ui, ViewMode::Week);
-                ui.reset();
-            }
+        #[strong]
+        zoom_box,
+        #[strong]
+        zoom_out_button,
+        #[strong]
+        zoom_in_button,
+        move |_| {
+            adjust_zoom(&ui, 1);
+            refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
         }
     ));
 
-    day_toggle.connect_toggled(clone!(
+    // Trackpad pinch-to-zoom (and two-finger touch), like Apple Calendar. The
+    // gesture lives on the carousel, which outlives page rebuilds, so it stays
+    // attached across reset(). A pinch scales the hour height continuously,
+    // relative to where it began. Each frame re-renders only the visible page's
+    // grid in place — cheap and flash-free, keeping the pinched-around time
+    // fixed — while the offscreen neighbor pages and the saved setting are only
+    // reconciled once, when the gesture ends.
+    let pinch = gtk::GestureZoom::new();
+    let pinch_base_height = Rc::new(Cell::new(0i32));
+    pinch.connect_begin(clone!(
         #[strong]
         ui,
-        move |btn| {
-            if btn.is_active() {
-                set_view_mode(&ui, ViewMode::Day);
-                ui.reset();
+        #[strong]
+        pinch_base_height,
+        move |_, _| pinch_base_height.set(ui.state.borrow().hour_row_height)
+    ));
+    pinch.connect_scale_changed(clone!(
+        #[strong]
+        ui,
+        #[strong]
+        pinch_base_height,
+        #[strong]
+        zoom_box,
+        #[strong]
+        zoom_out_button,
+        #[strong]
+        zoom_in_button,
+        move |_, scale| {
+            let base = pinch_base_height.get();
+            if base == 0 || ui.state.borrow().view_mode == ViewMode::Month {
+                return;
+            }
+            let target = clamp_hour_row_height((base as f64 * scale).round() as i32);
+            if target != ui.state.borrow().hour_row_height {
+                ui.zoom_visible_page(target);
+                refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
             }
         }
     ));
+    pinch.connect_end(clone!(
+        #[strong]
+        ui,
+        #[strong]
+        pinch_base_height,
+        move |_, _| {
+            if pinch_base_height.get() == 0 || ui.state.borrow().view_mode == ViewMode::Month {
+                return;
+            }
+            // The visible page was re-zoomed live; just persist the result.
+            // Neighbor pages stay stale until the next swipe rebuilds them.
+            let height = ui.state.borrow().hour_row_height;
+            let _ = ui.store.set_setting(ZOOM_SETTING_KEY, &height.to_string());
+        }
+    ));
+    ui.carousel.add_controller(pinch);
+}
+
+/// How much one zoom-button press changes the hour height, in px.
+const ZOOM_BUTTON_STEP: i32 = 12;
+
+/// Depth-first, sets `margin` on every "now" indicator in the subtree. The
+/// indicator has no indicator descendants, so its subtree isn't recursed into.
+fn move_now_indicators(widget: &gtk::Widget, margin: i32) {
+    if widget.widget_name().as_str() == week_view::NOW_INDICATOR_WIDGET_NAME {
+        widget.set_margin_top(margin);
+        return;
+    }
+    let mut child = widget.first_child();
+    while let Some(node) = child {
+        move_now_indicators(&node, margin);
+        child = node.next_sibling();
+    }
+}
+
+/// Sync the zoom control's visibility (week and day views only) and each
+/// button's sensitivity (disabled once the smallest/largest height is reached)
+/// to the current state.
+fn refresh_zoom_controls(
+    ui: &Rc<Ui>,
+    zoom_box: &gtk::Box,
+    zoom_out_button: &gtk::Button,
+    zoom_in_button: &gtk::Button,
+) {
+    let state = ui.state.borrow();
+    zoom_box.set_visible(state.view_mode != ViewMode::Month);
+    zoom_out_button.set_sensitive(state.hour_row_height > week_view::MIN_HOUR_ROW_HEIGHT);
+    zoom_in_button.set_sensitive(state.hour_row_height < week_view::MAX_HOUR_ROW_HEIGHT);
+}
+
+/// Steps the zoom by `steps` button-steps (negative compresses, positive
+/// stretches): re-render the visible page in place and persist. A no-op once
+/// the end of the range is reached.
+fn adjust_zoom(ui: &Rc<Ui>, steps: i32) {
+    let current = ui.state.borrow().hour_row_height;
+    let target = clamp_hour_row_height(current + steps * ZOOM_BUTTON_STEP);
+    if target == current {
+        return;
+    }
+    ui.zoom_visible_page(target);
+    let _ = ui.store.set_setting(ZOOM_SETTING_KEY, &target.to_string());
 }
 
 fn set_view_mode(ui: &Rc<Ui>, view_mode: ViewMode) {
