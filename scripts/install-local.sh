@@ -13,6 +13,7 @@ fi
 install -Dm755 "$ROOT_DIR/target/release/calix" "$BIN_DIR/calix"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.desktop" "$DATA_DIR/applications/$APP_ID.desktop"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.svg" "$DATA_DIR/icons/hicolor/scalable/apps/$APP_ID.svg"
+install -Dm644 "$ROOT_DIR/dist/$APP_ID.metainfo.xml" "$DATA_DIR/metainfo/$APP_ID.metainfo.xml"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$DATA_DIR/applications" >/dev/null 2>&1 || true
