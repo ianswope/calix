@@ -10,9 +10,28 @@ use gtk::glib;
 use gtk::prelude::*;
 use std::rc::Rc;
 
-const HOUR_ROW_HEIGHT: i32 = 48;
+/// Bounds for the height (px) of one hour row in the timed grid. The minimum
+/// fits the whole 24-hour day on screen at once; the maximum stretches it out
+/// for fine detail. Zoom — the header buttons and trackpad pinch — moves
+/// freely between them, so the height is continuous, not a fixed set of stops.
+pub const MIN_HOUR_ROW_HEIGHT: i32 = 20;
+pub const MAX_HOUR_ROW_HEIGHT: i32 = 160;
+/// The height used before the user has ever adjusted the zoom.
+pub const DEFAULT_HOUR_ROW_HEIGHT: i32 = 48;
 const GUTTER_WIDTH: i32 = 56;
 const MIN_EVENT_BLOCK_HEIGHT: i32 = 20;
+
+/// Where a freshly rendered timed grid should scroll to.
+#[derive(Clone, Copy)]
+pub enum InitialScroll {
+    /// A couple hours before now if today is in range, otherwise 8 AM — the
+    /// sensible landing spot when navigating to a period.
+    NowOrMorning,
+    /// Put this (fractional) hour at the top of the viewport. Used when a page
+    /// is re-rendered in place — e.g. its grid rebuilt at a new zoom — so the
+    /// time the user was looking at stays put instead of jumping to "now".
+    AtHour(f64),
+}
 
 /// Builds a full week page: day-of-week header plus a scrollable 24-hour
 /// grid, with a "now" indicator line on today's column if it's in view.
@@ -25,6 +44,8 @@ pub fn build(
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    hour_row_height: i32,
+    initial_scroll: InitialScroll,
 ) -> gtk::Widget {
     build_days(
         week_dates(anchor).to_vec(),
@@ -32,7 +53,8 @@ pub fn build(
         on_create,
         on_edit,
         on_move,
-        true,
+        hour_row_height,
+        initial_scroll,
     )
 }
 
@@ -42,17 +64,29 @@ pub fn build_day(
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    hour_row_height: i32,
+    initial_scroll: InitialScroll,
 ) -> gtk::Widget {
-    build_days(vec![day], events, on_create, on_edit, on_move, true)
+    build_days(
+        vec![day],
+        events,
+        on_create,
+        on_edit,
+        on_move,
+        hour_row_height,
+        initial_scroll,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_days(
     days: Vec<NaiveDate>,
     events: &[Event],
     on_create: Rc<dyn Fn(DateTime<Local>)>,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
-    scroll_to_today: bool,
+    hour_row_height: i32,
+    initial_scroll: InitialScroll,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -69,19 +103,71 @@ fn build_days(
         &gutter_size_group,
     ));
 
+    let grid = build_hour_grid(&days, events, on_create, on_edit, on_move, hour_row_height);
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .overlay_scrolling(true)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&grid)
+        .build();
+
+    // Land on the requested scroll position once layout settles (the
+    // adjustment's range isn't known until the grid is allocated).
+    let scroll_hours = initial_scroll_hours(&days, today, initial_scroll);
+    glib::idle_add_local_once(glib::clone!(
+        #[weak]
+        scrolled,
+        move || {
+            scrolled
+                .vadjustment()
+                .set_value(scroll_hours * hour_row_height as f64);
+        }
+    ));
+
+    root.append(&scrolled);
+    root.upcast()
+}
+
+/// The (fractional) hour to place at the top of the viewport for `initial`.
+fn initial_scroll_hours(days: &[NaiveDate], today: NaiveDate, initial: InitialScroll) -> f64 {
+    match initial {
+        InitialScroll::AtHour(hour) => hour,
+        InitialScroll::NowOrMorning if days.contains(&today) => {
+            Local::now().time().hour().saturating_sub(2) as f64
+        }
+        InitialScroll::NowOrMorning => 8.0,
+    }
+}
+
+/// Builds just the scrollable hour grid (gutter + day columns + drag preview)
+/// that goes inside a page's `ScrolledWindow`. Kept separate from the page
+/// chrome so a page can be re-zoomed by swapping this out while reusing its
+/// scroll container — which keeps the scroll position and avoids a rebuild
+/// flash.
+pub fn build_hour_grid(
+    days: &[NaiveDate],
+    events: &[Event],
+    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_edit: Rc<dyn Fn(Event)>,
+    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    hour_row_height: i32,
+) -> gtk::Widget {
+    let today = Local::now().date_naive();
+
     let hour_grid = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     hour_grid.set_hexpand(true);
-    hour_grid.append(&gutter_column(&gutter_size_group));
+    hour_grid.append(&gutter_column(hour_row_height));
 
     let day_area = day_area();
-    let timed_grid = TimedGrid::new(&day_area, days.clone(), HOUR_ROW_HEIGHT, on_move.clone());
-    for day in &days {
+    let timed_grid = TimedGrid::new(&day_area, days.to_vec(), hour_row_height, on_move.clone());
+    for day in days {
         let day_events: Vec<Event> = events
             .iter()
             .filter(|event| event_occurs_on_day(event, *day))
             .cloned()
             .collect();
-        let col_index = day_column_index(&days, *day);
+        let col_index = day_column_index(days, *day);
         let column = day_column(
             *day,
             today,
@@ -91,6 +177,7 @@ fn build_days(
             on_move.clone(),
             &timed_grid,
             col_index as usize,
+            hour_row_height,
         );
         day_area.attach(&column, col_index, 0, 1, 1);
     }
@@ -103,37 +190,7 @@ fn build_days(
     grid_overlay.add_overlay(timed_grid.preview_layer());
     hour_grid.append(&grid_overlay);
 
-    let scrolled = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .overlay_scrolling(true)
-        .hexpand(true)
-        .vexpand(true)
-        .child(&hour_grid)
-        .build();
-
-    // Land on a sensible starting scroll position (a couple hours before
-    // now, or 8 AM for weeks that don't include today) once layout settles.
-    let scroll_hour = if scroll_to_today && days.contains(&today) {
-        today
-            .and_time(Local::now().time())
-            .time()
-            .hour()
-            .saturating_sub(2)
-    } else {
-        8
-    };
-    glib::idle_add_local_once(glib::clone!(
-        #[weak]
-        scrolled,
-        move || {
-            scrolled
-                .vadjustment()
-                .set_value((scroll_hour * HOUR_ROW_HEIGHT as u32) as f64);
-        }
-    ));
-
-    root.append(&scrolled);
-    root.upcast()
+    hour_grid.upcast()
 }
 
 fn day_header_row(
@@ -238,14 +295,13 @@ fn day_column_index(days: &[NaiveDate], day: NaiveDate) -> i32 {
         .expect("day belongs to the rendered range") as i32
 }
 
-fn gutter_column(gutter_size_group: &gtk::SizeGroup) -> gtk::Widget {
+fn gutter_column(hour_row_height: i32) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_size_request(GUTTER_WIDTH, -1);
     col.add_css_class("week-gutter");
-    gutter_size_group.add_widget(&col);
     for hour in 0..24u32 {
         let label = gtk::Label::new(Some(&hour_label(hour)));
-        label.set_size_request(-1, HOUR_ROW_HEIGHT);
+        label.set_size_request(-1, hour_row_height);
         label.set_valign(gtk::Align::Start);
         label.set_halign(gtk::Align::End);
         label.set_margin_end(6);
@@ -266,6 +322,7 @@ fn day_column(
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     timed_grid: &Rc<TimedGrid>,
     col_index: usize,
+    hour_row_height: i32,
 ) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
@@ -276,7 +333,7 @@ fn day_column(
 
     for hour in 0..24u32 {
         let cell = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        cell.set_size_request(-1, HOUR_ROW_HEIGHT);
+        cell.set_size_request(-1, hour_row_height);
         cell.add_css_class("hour-cell");
 
         let click = gtk::GestureClick::new();
@@ -298,14 +355,14 @@ fn day_column(
     let overlay = gtk::Overlay::new();
     overlay.add_css_class("week-day-column");
     overlay.set_child(Some(&col));
-    add_drop_target(&overlay, day, Some(HOUR_ROW_HEIGHT), on_move);
+    add_drop_target(&overlay, day, Some(hour_row_height), on_move);
 
     // Right-clicking empty grid space offers a new event at that spot,
     // snapped down to the quarter hour it lands in.
     add_new_event_menu(
         &overlay,
         move |_, y| {
-            let quarter = ((y / HOUR_ROW_HEIGHT as f64) * 4.0)
+            let quarter = ((y / hour_row_height as f64) * 4.0)
                 .floor()
                 .clamp(0.0, 95.0) as u32;
             day.and_time(NaiveTime::from_hms_opt(quarter / 4, (quarter % 4) * 15, 0)?)
@@ -315,24 +372,51 @@ fn day_column(
         on_create.clone(),
     );
 
+    // Render each overlap cluster as its own band: a homogeneous grid whose
+    // column count is the cluster's lane count, positioned over the cluster's
+    // time range. Events in a cluster split its width equally; a lone event's
+    // cluster is one column, so it spans the whole day column. Bands cover only
+    // their own time range, so gaps between events stay clickable.
     let layouts = timed_event_layouts(day, day_events);
-    if !layouts.is_empty() {
-        let lane_count = layouts
+    let mut index = 0;
+    while index < layouts.len() {
+        let cluster = layouts[index].cluster;
+        let columns = layouts[index].columns.max(1);
+        let mut end = index;
+        while end < layouts.len() && layouts[end].cluster == cluster {
+            end += 1;
+        }
+        let cluster_layouts = &layouts[index..end];
+
+        let band_start_hour = cluster_layouts
             .iter()
-            .map(|layout| layout.lane + 1)
+            .map(|layout| layout.start_hour)
+            .fold(f64::INFINITY, f64::min);
+        let band_top = (band_start_hour * hour_row_height as f64).round() as i32;
+        let band_height = cluster_layouts
+            .iter()
+            .map(|layout| {
+                let top = (layout.start_hour * hour_row_height as f64).round() as i32;
+                let height = (((layout.end_hour - layout.start_hour) * hour_row_height as f64)
+                    .round() as i32)
+                    .max(MIN_EVENT_BLOCK_HEIGHT);
+                (top - band_top) + height
+            })
             .max()
-            .unwrap_or(1);
+            .unwrap_or(MIN_EVENT_BLOCK_HEIGHT);
+
         let event_layer = gtk::Grid::new();
         event_layer.set_hexpand(true);
         event_layer.set_column_homogeneous(true);
-        event_layer.set_size_request(-1, 24 * HOUR_ROW_HEIGHT);
-        event_layer.set_valign(gtk::Align::Start);
         event_layer.set_halign(gtk::Align::Fill);
+        event_layer.set_valign(gtk::Align::Start);
+        event_layer.set_margin_top(band_top);
+        event_layer.set_size_request(-1, band_height);
 
-        let lane_layers = (0..lane_count)
+        let lane_layers = (0..columns)
             .map(|lane| {
                 let lane_background = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                lane_background.set_size_request(-1, 24 * HOUR_ROW_HEIGHT);
+                lane_background.set_size_request(-1, band_height);
                 let lane_layer = gtk::Overlay::new();
                 lane_layer.set_child(Some(&lane_background));
                 lane_layer.set_hexpand(true);
@@ -341,10 +425,10 @@ fn day_column(
             })
             .collect::<Vec<_>>();
 
-        for layout in layouts {
+        for layout in cluster_layouts {
             let event = layout.event;
-            let top = (layout.start_hour * HOUR_ROW_HEIGHT as f64).round() as i32;
-            let height = (((layout.end_hour - layout.start_hour) * HOUR_ROW_HEIGHT as f64).round()
+            let top = (layout.start_hour * hour_row_height as f64).round() as i32;
+            let height = (((layout.end_hour - layout.start_hour) * hour_row_height as f64).round()
                 as i32)
                 .max(MIN_EVENT_BLOCK_HEIGHT);
 
@@ -374,7 +458,9 @@ fn day_column(
             block.set_valign(gtk::Align::Start);
             block.set_halign(gtk::Align::Fill);
             block.set_hexpand(true);
-            block.set_margin_top(top);
+            // Positioned relative to the band; `top_px` above stays absolute so
+            // the drag math is unaffected.
+            block.set_margin_top(top - band_top);
             block.set_size_request(-1, height);
             block.set_margin_start(2);
             block.set_margin_end(2);
@@ -382,10 +468,11 @@ fn day_column(
         }
 
         overlay.add_overlay(&event_layer);
+        index = end;
     }
 
     if day == today {
-        add_now_indicator(&overlay);
+        add_now_indicator(&overlay, hour_row_height);
     }
 
     overlay.upcast()
@@ -417,16 +504,25 @@ fn time_for_y(y: f64, hour_height: i32) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(slots / 2, (slots % 2) * 30, 0)
 }
 
-fn add_now_indicator(overlay: &gtk::Overlay) {
-    let now = Local::now().time();
-    let offset =
-        ((now.hour() as f64 + now.minute() as f64 / 60.0) / 24.0) * (24 * HOUR_ROW_HEIGHT) as f64;
+/// Widget name carried by the "now" indicator box so a periodic clock tick can
+/// find it in the live widget tree and slide it to the current time in place.
+pub const NOW_INDICATOR_WIDGET_NAME: &str = "calix-now-indicator";
 
+/// Top margin (px) that puts the "now" indicator at the current time of day on
+/// a grid with the given hour-row height.
+pub fn now_indicator_margin_top(hour_row_height: i32) -> i32 {
+    let now = Local::now().time();
+    let offset = (now.hour() as f64 + now.minute() as f64 / 60.0) * hour_row_height as f64;
+    offset.round() as i32
+}
+
+fn add_now_indicator(overlay: &gtk::Overlay, hour_row_height: i32) {
     let indicator = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    indicator.set_widget_name(NOW_INDICATOR_WIDGET_NAME);
     indicator.set_can_target(false);
     indicator.set_valign(gtk::Align::Start);
     indicator.set_halign(gtk::Align::Fill);
-    indicator.set_margin_top(offset.round() as i32);
+    indicator.set_margin_top(now_indicator_margin_top(hour_row_height));
     indicator.set_size_request(-1, 8);
 
     let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -458,7 +554,16 @@ struct TimedEventLayout<'a> {
     event: &'a Event,
     start_hour: f64,
     end_hour: f64,
+    /// Column index within this event's overlap cluster.
     lane: usize,
+    /// Number of columns in this event's overlap cluster. The event is rendered
+    /// `1 / columns` of the day-column width, so a non-overlapping event
+    /// (`columns == 1`) fills the whole width and overlapping events take an
+    /// equal fractional share (half or less).
+    columns: usize,
+    /// Index of the overlap cluster, so the renderer can group a cluster's
+    /// events into a single width-splitting grid.
+    cluster: usize,
 }
 
 fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout<'_>> {
@@ -481,6 +586,8 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
                 start_hour,
                 end_hour,
                 lane: 0,
+                columns: 1,
+                cluster: 0,
             })
         })
         .collect();
@@ -490,17 +597,40 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
             .then_with(|| left.end_hour.total_cmp(&right.end_hour))
     });
 
-    let mut lane_ends = Vec::new();
-    for layout in &mut layouts {
-        let lane = lane_ends
-            .iter()
-            .position(|end: &f64| *end <= layout.start_hour)
-            .unwrap_or_else(|| {
-                lane_ends.push(0.0);
-                lane_ends.len() - 1
-            });
-        lane_ends[lane] = layout.end_hour;
-        layout.lane = lane;
+    // Split into overlap clusters — maximal runs of transitively overlapping
+    // events — and pack each cluster into as few columns as it needs. Width is
+    // shared only within a cluster, so a run with no overlap is a one-column
+    // cluster that spans the full day-column width.
+    let mut cluster = 0;
+    let mut index = 0;
+    while index < layouts.len() {
+        let mut cluster_end = layouts[index].end_hour;
+        let mut end = index + 1;
+        while end < layouts.len() && layouts[end].start_hour < cluster_end {
+            cluster_end = cluster_end.max(layouts[end].end_hour);
+            end += 1;
+        }
+
+        let mut lane_ends: Vec<f64> = Vec::new();
+        for layout in &mut layouts[index..end] {
+            let lane = lane_ends
+                .iter()
+                .position(|lane_end: &f64| *lane_end <= layout.start_hour)
+                .unwrap_or_else(|| {
+                    lane_ends.push(0.0);
+                    lane_ends.len() - 1
+                });
+            lane_ends[lane] = layout.end_hour;
+            layout.lane = lane;
+            layout.cluster = cluster;
+        }
+        let columns = lane_ends.len();
+        for layout in &mut layouts[index..end] {
+            layout.columns = columns;
+        }
+
+        cluster += 1;
+        index = end;
     }
     layouts
 }
@@ -557,5 +687,41 @@ mod tests {
         assert_eq!(layouts[2].event.id, 3);
         assert_ne!(layouts[0].lane, layouts[1].lane);
         assert_eq!(layouts[0].lane, layouts[2].lane);
+        // All three are transitively linked (1 overlaps both 2 and 3), so they
+        // form one two-column cluster and each takes half the width.
+        assert!(layouts.iter().all(|layout| layout.cluster == 0));
+        assert!(layouts.iter().all(|layout| layout.columns == 2));
+    }
+
+    #[test]
+    fn non_overlapping_events_each_span_full_width() {
+        let events = vec![event(1, 9, 10), event(2, 14, 15)];
+        let day = events[0].start.date_naive();
+
+        let layouts = timed_event_layouts(day, &events);
+
+        assert_eq!(layouts.len(), 2);
+        assert!(layouts.iter().all(|layout| layout.columns == 1));
+        assert_ne!(layouts[0].cluster, layouts[1].cluster);
+    }
+
+    #[test]
+    fn only_the_overlapping_cluster_is_split() {
+        // A lone morning event, then an overlapping pair in the afternoon.
+        let events = vec![event(1, 9, 10), event(2, 12, 13), event(3, 12, 14)];
+        let day = events[0].start.date_naive();
+
+        let layouts = timed_event_layouts(day, &events);
+
+        let lone = layouts.iter().find(|layout| layout.event.id == 1).unwrap();
+        assert_eq!(lone.columns, 1);
+
+        let overlap: Vec<_> = layouts
+            .iter()
+            .filter(|layout| layout.event.id != 1)
+            .collect();
+        assert!(overlap.iter().all(|layout| layout.columns == 2));
+        assert!(overlap.iter().all(|layout| layout.cluster == overlap[0].cluster));
+        assert_ne!(lone.cluster, overlap[0].cluster);
     }
 }
