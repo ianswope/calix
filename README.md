@@ -1,5 +1,7 @@
 # Calix
 
+[![CI](https://github.com/ianswope/calix/actions/workflows/ci.yml/badge.svg)](https://github.com/ianswope/calix/actions/workflows/ci.yml)
+
 A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Google, Apple/iCloud, and any CalDAV calendar.
 
 <picture>
@@ -81,25 +83,6 @@ scripts/build-release.sh
 
 The archive is written to `target/dist/calix-<version>-linux-<arch>.tar.gz`. It contains the release binary, desktop entry, icon, docs, and an `install.sh` script that installs to `~/.local` by default. Users still need GTK4 + libadwaita runtime libraries available from their distribution.
 
-## Connecting Google Calendar
-
-Google requires every app to bring its own OAuth client — there's no shared one you can just use. Setup takes about 10 minutes:
-
-1. Create a project at [console.cloud.google.com](https://console.cloud.google.com) and enable the **Google Calendar API** for it.
-2. Under **Google Auth Platform → Audience**, set the app to External, and add your own Google account under **Test users** (the app stays unverified/"Testing," which is fine for personal use — publishing for public verification is a separate, much heavier process not needed here).
-3. Under **Data Access**, add the `.../auth/calendar` scope.
-4. Under **Clients**, create an OAuth client of type **Desktop app**. Copy the Client ID and Client Secret.
-5. Create `~/.config/calix/config.toml`:
-   ```toml
-   [google]
-   client_id = "your-client-id.apps.googleusercontent.com"
-   client_secret = "your-client-secret"
-   ```
-   This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
-6. Run Calix, open the calendar sidebar, and click **Add Google** in the Accounts section. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
-
-If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
-
 ## Connecting iCloud Calendar
 
 iCloud uses CalDAV with an Apple app-specific password:
@@ -123,6 +106,25 @@ Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, 
 3. The password is saved to your system keyring, not to a file. Use **Sync CalDAV** to refresh all connected CalDAV accounts.
 
 Editing and deleting synced CalDAV events works for simple `.ics` resources, the same as iCloud; expanded recurring instances are read-only for now.
+
+## Connecting Google Calendar
+
+Google is the one provider that needs real setup: Google requires every app to bring its own OAuth client — there's no shared one you can just use. If you just want to try Calix, connect an iCloud or CalDAV account first; those need nothing but a password. Otherwise, setup takes about 10 minutes:
+
+1. Create a project at [console.cloud.google.com](https://console.cloud.google.com) and enable the **Google Calendar API** for it.
+2. Under **Google Auth Platform → Audience**, set the app to External, and add your own Google account under **Test users** (the app stays unverified/"Testing," which is fine for personal use — publishing for public verification is a separate, much heavier process not needed here).
+3. Under **Data Access**, add the `.../auth/calendar` scope.
+4. Under **Clients**, create an OAuth client of type **Desktop app**. Copy the Client ID and Client Secret.
+5. Create `~/.config/calix/config.toml`:
+   ```toml
+   [google]
+   client_id = "your-client-id.apps.googleusercontent.com"
+   client_secret = "your-client-secret"
+   ```
+   This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
+6. Run Calix, open the calendar sidebar, and click **Add Google** in the Accounts section. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
+
+If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
 
 ## Using Calendars
 
@@ -175,6 +177,10 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [ ] Automatic background sync
 - [ ] Event search
 - [ ] Packaging (AUR, Flatpak)
+
+## Contributing
+
+Contributions are very welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started. Issues labeled [`good first issue`](https://github.com/ianswope/calix/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped for a first contribution, and [`help wanted`](https://github.com/ianswope/calix/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) marks the features I'd most like help with.
 
 ## License
 

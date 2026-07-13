@@ -17,7 +17,8 @@
       "build-commands": [
         "cargo --offline install --path . --root /app",
         "install -Dm644 dist/com.ianswope.Calix.desktop /app/share/applications/com.ianswope.Calix.desktop",
-        "install -Dm644 dist/com.ianswope.Calix.svg /app/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg"
+        "install -Dm644 dist/com.ianswope.Calix.svg /app/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg",
+        "install -Dm644 dist/com.ianswope.Calix.metainfo.xml /app/share/metainfo/com.ianswope.Calix.metainfo.xml"
       ],
       "sources": [
         { "type": "dir", "path": ".." },

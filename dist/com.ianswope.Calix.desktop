@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Calix
-Comment=Native GTK calendar with Google and iCloud sync
+Comment=Native GTK calendar with Google, iCloud, and CalDAV sync
 Exec=calix
 Icon=com.ianswope.Calix
 Terminal=false

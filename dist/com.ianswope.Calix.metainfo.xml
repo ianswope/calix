@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.ianswope.Calix</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Calix</name>
+  <summary>Swipeable calendar with cloud sync</summary>
+
+  <description>
+    <p>
+      Calix is a native calendar for Linux, built with GTK4 and libadwaita.
+      It syncs both ways with Google Calendar, iCloud, and any CalDAV server
+      (Fastmail, Nextcloud, Radicale, and more), and keeps everything in a
+      local SQLite store so the app stays fast and works offline.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Swipeable month, week, and day views</li>
+      <li>Two-way sync with Google, iCloud, and generic CalDAV accounts</li>
+      <li>Drag events to move or resize them, with a live snapped preview</li>
+      <li>Create events by clicking or right-clicking anywhere on the grid</li>
+      <li>Show or hide individual calendars from a native sidebar</li>
+      <li>Passwords and tokens stored in the system keyring, never in files</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.ianswope.Calix.desktop</launchable>
+
+  <developer id="com.ianswope">
+    <name>Ian Swope</name>
+  </developer>
+
+  <url type="homepage">https://github.com/ianswope/calix</url>
+  <url type="bugtracker">https://github.com/ianswope/calix/issues</url>
+  <url type="vcs-browser">https://github.com/ianswope/calix</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Month view</caption>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.2.0/docs/screenshots/month.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Week view</caption>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.2.0/docs/screenshots/week.png</image>
+    </screenshot>
+  </screenshots>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+  </branding>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.2.0" date="2026-07-12">
+      <description>
+        <p>
+          Generic CalDAV account support with two-way sync, drag to move and
+          resize events in the week and day grids, and right-click event
+          creation.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>
