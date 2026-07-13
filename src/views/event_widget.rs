@@ -136,6 +136,9 @@ fn event_button_with_padding(
         .build();
     button.set_label("");
     button.set_child(Some(&overlay));
+    if !event.title.is_empty() {
+        button.set_tooltip_text(Some(event.title.as_str()));
+    }
     if draggable {
         make_draggable(&button, event.id, DragKind::Move);
     }
