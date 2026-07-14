@@ -206,11 +206,33 @@ window.compact-text .drag-preview-label {
 ";
 
 pub fn load() {
+    let display = gdk::Display::default().expect("a display is available");
+
     let provider = gtk::CssProvider::new();
     provider.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().expect("a display is available"),
+        &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+
+    // If Omarchy is present, recolor libadwaita from the active theme. The
+    // overrides load at USER priority so they win over libadwaita's own
+    // (theme-priority) color definitions, and force the matching color scheme
+    // so symbolic icons and dark-aware widgets line up with the palette. The
+    // layout CSS above keeps referencing the same color names either way.
+    if let Some(overrides) = crate::omarchy::theme_overrides() {
+        let color_provider = gtk::CssProvider::new();
+        color_provider.load_from_string(&overrides.css);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &color_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_USER,
+        );
+        adw::StyleManager::default().set_color_scheme(if overrides.dark {
+            adw::ColorScheme::ForceDark
+        } else {
+            adw::ColorScheme::ForceLight
+        });
+    }
 }

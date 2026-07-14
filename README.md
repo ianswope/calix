@@ -14,7 +14,7 @@ A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) 
   <img alt="Calix week view" src="docs/screenshots/week.png">
 </picture>
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google, iCloud, and generic CalDAV sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, iCloud, or CalDAV calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to the source. Grid text steps down a size when the window is narrow.
+**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google, iCloud, and generic CalDAV sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, iCloud, or CalDAV calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to the source. Grid text steps down a size when the window is narrow. On [Omarchy](https://omarchy.org/), Calix picks up the active theme's colors automatically, so it matches the rest of the desktop.
 
 ## Building
 
@@ -146,7 +146,8 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - `src/views/event_widget.rs` — the event chip/block widgets shared by the views.
 - `src/views/drag.rs` — direct-manipulation move/resize for timed blocks in the week/day grid: a `GestureDrag` controller with a snapped live preview and edge auto-scroll, committing only on release (month-view drags use GTK's regular drag-and-drop instead).
 - `src/window.rs` — owns the `AdwCarousel` paging between prev/current/next pages, the header bar (Today / prev / next / Month-Week-Day toggle / New Event / Calendars), sidebar account actions, and the current view-mode + date state.
-- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint).
+- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint), plus loading the Omarchy color overrides at startup.
+- `src/omarchy.rs` — reads the active Omarchy theme's `colors.toml` and recolors libadwaita to match (accent, surfaces, borders, and light/dark scheme); a no-op on machines without Omarchy.
 - `src/store.rs` — SQLite-backed account/calendar/event storage (create/list/update/delete), with in-memory-DB unit tests independent of the GUI.
 - `src/calendar_dialog.rs` — reusable account/calendar list for the sidebar, including per-calendar visibility toggles.
 - `src/event_dialog.rs` — the create/edit event dialog (`adw::Dialog` + `EntryRow`/`SwitchRow` form); its calendar picker defaults to sidebar-visible calendars with an expandable full list.
@@ -171,6 +172,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [x] Connect any CalDAV server (Fastmail, Nextcloud, Radicale, …) with two-way sync
 - [x] Drag to move/resize events in the week/day grid (snapped preview, edge auto-scroll)
 - [x] Right-click to create an event at a specific spot
+- [x] Match the active Omarchy theme's colors automatically
 - [ ] Recurrence exception editing for expanded iCloud recurring events
 - [ ] Recurring event creation
 - [ ] Event alerts / desktop notifications
