@@ -721,7 +721,11 @@ mod tests {
             .filter(|layout| layout.event.id != 1)
             .collect();
         assert!(overlap.iter().all(|layout| layout.columns == 2));
-        assert!(overlap.iter().all(|layout| layout.cluster == overlap[0].cluster));
+        assert!(
+            overlap
+                .iter()
+                .all(|layout| layout.cluster == overlap[0].cluster)
+        );
         assert_ne!(lone.cluster, overlap[0].cluster);
     }
 }

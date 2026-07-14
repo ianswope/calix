@@ -224,8 +224,11 @@ impl Ui {
         let title = state.title();
         drop(state);
 
-        let replacement =
-            self.build_page(view_mode, replacement_date, week_view::InitialScroll::NowOrMorning);
+        let replacement = self.build_page(
+            view_mode,
+            replacement_date,
+            week_view::InitialScroll::NowOrMorning,
+        );
         if delta > 0 {
             if let Some(old_prev) = self.carousel.first_child() {
                 self.carousel.remove(&old_prev);
@@ -463,7 +466,9 @@ impl Ui {
         // and then jumping (which is what an idle-deferred scroll would do).
         let upper = (24 * new_height) as f64;
         vadj.set_upper(upper.max(vadj.page_size()));
-        vadj.set_value((top_hours * new_height as f64).clamp(0.0, (upper - vadj.page_size()).max(0.0)));
+        vadj.set_value(
+            (top_hours * new_height as f64).clamp(0.0, (upper - vadj.page_size()).max(0.0)),
+        );
 
         self.state.borrow_mut().hour_row_height = new_height;
         // The neighbor pages are now stale; the next swipe will rebuild.
