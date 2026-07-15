@@ -54,6 +54,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.0" date="2026-07-15">
+      <description>
+        <p>
+          Week and day grids gain a zoom control and a live current-time
+          marker, event titles show in full as a hover tooltip, and the window
+          now matches the active Omarchy theme's colors. This release also
+          scopes CalDAV account identity to the (username, server) pair and
+          fixes seven audit findings across sync, storage, and drag handling.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-07-12">
       <description>
         <p>
