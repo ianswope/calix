@@ -185,3 +185,67 @@ fn elevate(base: Rgb, level: f32, dark: bool) -> Rgb {
 fn on_color(c: Rgb) -> Rgb {
     if luminance(c) > 0.6 { BLACK } else { WHITE }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_accepts_both_spellings_and_case() {
+        assert_eq!(to_hex(parse_hex("#ff8800").unwrap()), "#ff8800");
+        // A leading '#' is optional, and casing is normalized on the way out.
+        assert_eq!(to_hex(parse_hex("FF8800").unwrap()), "#ff8800");
+        // Surrounding whitespace (as toml values sometimes carry) is trimmed.
+        assert_eq!(to_hex(parse_hex("  #ff8800  ").unwrap()), "#ff8800");
+    }
+
+    #[test]
+    fn parse_hex_rejects_malformed_input() {
+        assert!(parse_hex("#fff").is_none()); // 3-digit shorthand unsupported
+        assert!(parse_hex("#ff88000").is_none()); // too long
+        assert!(parse_hex("#gg8800").is_none()); // non-hex digit
+        assert!(parse_hex("").is_none());
+    }
+
+    #[test]
+    fn to_hex_zero_pads_each_channel() {
+        assert_eq!(to_hex(Rgb { r: 0, g: 5, b: 16 }), "#000510");
+    }
+
+    #[test]
+    fn luminance_weights_green_over_red_over_blue() {
+        assert_eq!(luminance(WHITE), 1.0);
+        assert_eq!(luminance(BLACK), 0.0);
+        let pure = |r, g, b| luminance(Rgb { r, g, b });
+        // Rec. 709: for equal-intensity primaries, green reads brightest and
+        // blue darkest — this ordering is what drives the dark/light decision.
+        assert!(pure(0, 255, 0) > pure(255, 0, 0));
+        assert!(pure(255, 0, 0) > pure(0, 0, 255));
+    }
+
+    #[test]
+    fn mix_interpolates_between_endpoints() {
+        assert_eq!(to_hex(mix(BLACK, WHITE, 0.0)), "#000000");
+        assert_eq!(to_hex(mix(BLACK, WHITE, 1.0)), "#ffffff");
+        // 0.5 lands on the rounded midpoint (127.5 rounds to 128).
+        assert_eq!(to_hex(mix(BLACK, WHITE, 0.5)), "#808080");
+    }
+
+    #[test]
+    fn elevate_lightens_on_dark_themes_and_darkens_on_light() {
+        let gray = Rgb {
+            r: 128,
+            g: 128,
+            b: 128,
+        };
+        assert!(luminance(elevate(gray, 0.1, true)) > luminance(gray));
+        assert!(luminance(elevate(gray, 0.1, false)) < luminance(gray));
+    }
+
+    #[test]
+    fn on_color_picks_a_legible_ink() {
+        // Black text over a light fill, white text over a dark one.
+        assert_eq!(to_hex(on_color(WHITE)), to_hex(BLACK));
+        assert_eq!(to_hex(on_color(BLACK)), to_hex(WHITE));
+    }
+}

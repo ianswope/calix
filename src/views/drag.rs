@@ -461,3 +461,50 @@ fn format_minutes(minutes: f64) -> String {
     };
     format!("{display_hour}:{minute:02} {suffix}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_payload_round_trips_through_parse() {
+        for kind in [DragKind::Move, DragKind::ResizeStart, DragKind::ResizeEnd] {
+            let payload = drag_payload(kind, 42);
+            assert_eq!(parse_drag_payload(&payload), Some((kind, 42)));
+        }
+    }
+
+    #[test]
+    fn parse_drag_payload_rejects_malformed_values() {
+        assert!(parse_drag_payload("move").is_none()); // no ':' separator
+        assert!(parse_drag_payload("teleport:42").is_none()); // unknown kind
+        assert!(parse_drag_payload("move:notanumber").is_none()); // bad id
+    }
+
+    #[test]
+    fn snap_rounds_to_the_nearest_gridline() {
+        // 15px grid: 17 rounds down to 15, 23 rounds up to 30.
+        assert_eq!(snap(17.0, 15.0), 15.0);
+        assert_eq!(snap(23.0, 15.0), 30.0);
+        // A non-positive grid disables snapping (leaves the value untouched)
+        // rather than dividing by zero.
+        assert_eq!(snap(17.0, 0.0), 17.0);
+    }
+
+    #[test]
+    fn time_of_maps_minutes_to_time_and_clamps() {
+        assert_eq!(time_of(0.0), NaiveTime::from_hms_opt(0, 0, 0));
+        assert_eq!(time_of(90.0), NaiveTime::from_hms_opt(1, 30, 0));
+        // Midnight-of-next-day (1440) has no same-day NaiveTime, so it clamps
+        // to the last representable minute of the day.
+        assert_eq!(time_of(MINUTES_PER_DAY), NaiveTime::from_hms_opt(23, 59, 0));
+    }
+
+    #[test]
+    fn format_minutes_uses_twelve_hour_clock() {
+        assert_eq!(format_minutes(0.0), "12:00 AM"); // midnight
+        assert_eq!(format_minutes(9.0 * 60.0 + 5.0), "9:05 AM");
+        assert_eq!(format_minutes(12.0 * 60.0), "12:00 PM"); // noon
+        assert_eq!(format_minutes(13.0 * 60.0 + 30.0), "1:30 PM");
+    }
+}
