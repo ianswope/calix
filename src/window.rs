@@ -616,7 +616,7 @@ pub fn build(app: &adw::Application) {
         ui,
         #[weak]
         google_sync_button,
-        move |_| sync_google_accounts(&ui, &google_sync_button)
+        move |_| sync_google_accounts(&ui, &google_sync_button, false)
     ));
 
     let google_add_button = gtk::Button::with_label("Add Google");
@@ -638,7 +638,7 @@ pub fn build(app: &adw::Application) {
         ui,
         #[weak]
         icloud_sync_button,
-        move |_| sync_icloud_accounts(&ui, &icloud_sync_button)
+        move |_| sync_icloud_accounts(&ui, &icloud_sync_button, false)
     ));
 
     let icloud_add_button = gtk::Button::with_label("Add iCloud");
@@ -660,7 +660,7 @@ pub fn build(app: &adw::Application) {
         ui,
         #[weak]
         caldav_sync_button,
-        move |_| sync_caldav_accounts(&ui, &caldav_sync_button)
+        move |_| sync_caldav_accounts(&ui, &caldav_sync_button, false)
     ));
 
     let caldav_add_button = gtk::Button::with_label("Add CalDAV");
@@ -687,6 +687,58 @@ pub fn build(app: &adw::Application) {
     ));
     calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
+
+    // Refresh from every connected account as soon as the window is up, then
+    // keep the grid fresh with a periodic background re-sync while the app
+    // stays open. Both passes are quiet on success (errors still toast) so they
+    // don't nag; `sync_connected_accounts` touches only providers that have an
+    // account and aren't already mid-sync. The launch pass is deferred a beat
+    // so the window paints first.
+    glib::timeout_add_local_once(
+        Duration::from_millis(100),
+        clone!(
+            #[strong]
+            ui,
+            #[weak]
+            google_sync_button,
+            #[weak]
+            icloud_sync_button,
+            #[weak]
+            caldav_sync_button,
+            move || {
+                sync_connected_accounts(
+                    &ui,
+                    &google_sync_button,
+                    &icloud_sync_button,
+                    &caldav_sync_button,
+                );
+            }
+        ),
+    );
+    glib::timeout_add_seconds_local(
+        15 * 60,
+        clone!(
+            #[weak]
+            ui,
+            #[weak]
+            google_sync_button,
+            #[weak]
+            icloud_sync_button,
+            #[weak]
+            caldav_sync_button,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                sync_connected_accounts(
+                    &ui,
+                    &google_sync_button,
+                    &icloud_sync_button,
+                    &caldav_sync_button,
+                );
+                glib::ControlFlow::Continue
+            }
+        ),
+    );
 
     let calendars_button = gtk::ToggleButton::new();
     calendars_button.set_child(Some(&gtk::Image::from_icon_name(
@@ -1726,7 +1778,48 @@ fn add_icloud_account(
 /// Syncs every connected Google account. The network work runs on a
 /// background thread; the thread opens its own SQLite connection because
 /// `Store` wraps a `rusqlite::Connection`, which is not `Send`.
-fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+/// Fires a quiet background sync for every provider that has a connected
+/// account and isn't already syncing. Shared by the launch pass and the
+/// periodic re-sync timer. A disabled sync button marks a provider whose sync
+/// is still in flight, so it's skipped rather than stacking a second request.
+fn sync_connected_accounts(
+    ui: &Rc<Ui>,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+) {
+    if google_sync_button.is_sensitive()
+        && ui
+            .store
+            .google_accounts()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    {
+        sync_google_accounts(ui, google_sync_button, true);
+    }
+    if icloud_sync_button.is_sensitive()
+        && ui
+            .store
+            .icloud_accounts()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    {
+        sync_icloud_accounts(ui, icloud_sync_button, true);
+    }
+    if caldav_sync_button.is_sensitive()
+        && ui
+            .store
+            .caldav_accounts()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    {
+        sync_caldav_accounts(ui, caldav_sync_button, true);
+    }
+}
+
+/// `quiet` suppresses the success toast (errors are always surfaced) so
+/// automatic launch/periodic syncs don't nag; manual clicks pass `false`.
+fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
     let Some(google_config) = ui.config.google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
@@ -1790,9 +1883,11 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok((account_count, calendar_count))) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Synced {calendar_count} calendar(s) from {account_count} account(s)"
-                    )));
+                    if !quiet {
+                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "Synced {calendar_count} calendar(s) from {account_count} account(s)"
+                        )));
+                    }
                     sync_button.set_label("Sync Google");
                     update_google_sync_button(&ui, &sync_button);
                     ui.reset_calendar_sidebar();
@@ -1820,7 +1915,7 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
     );
 }
 
-fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
     sync_button.set_sensitive(false);
     sync_button.set_label("Syncing…");
 
@@ -1866,9 +1961,11 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok((account_count, calendar_count))) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Synced {calendar_count} iCloud calendar(s) from {account_count} account(s)"
-                    )));
+                    if !quiet {
+                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "Synced {calendar_count} iCloud calendar(s) from {account_count} account(s)"
+                        )));
+                    }
                     sync_button.set_label("Sync iCloud");
                     update_icloud_sync_button(&ui, &sync_button);
                     ui.reset_calendar_sidebar();
@@ -2119,7 +2216,7 @@ fn add_caldav_account(
     );
 }
 
-fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
+fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
     sync_button.set_sensitive(false);
     sync_button.set_label("Syncing…");
 
@@ -2168,9 +2265,11 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok((account_count, calendar_count))) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Synced {calendar_count} CalDAV calendar(s) from {account_count} account(s)"
-                    )));
+                    if !quiet {
+                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "Synced {calendar_count} CalDAV calendar(s) from {account_count} account(s)"
+                        )));
+                    }
                     sync_button.set_label("Sync CalDAV");
                     update_caldav_sync_button(&ui, &sync_button);
                     ui.reset_calendar_sidebar();
