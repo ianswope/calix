@@ -1,9 +1,9 @@
 use crate::config::GoogleConfig;
-use oauth2::basic::BasicClient;
+use oauth2::basic::{BasicClient, BasicErrorResponseType};
 use oauth2::reqwest;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
-    RefreshToken, Scope, TokenResponse, TokenUrl,
+    RefreshToken, RequestTokenError, Scope, StandardErrorResponse, TokenResponse, TokenUrl,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -30,6 +30,9 @@ pub struct SignInTokens {
 pub enum AuthError {
     Io(std::io::Error),
     Oauth(String),
+    /// The saved refresh token was rejected by Google (`invalid_grant`): it was
+    /// revoked or expired, and the account must be reconnected.
+    RefreshTokenRejected,
     MissingRedirectCode,
     StateMismatch,
     NoRefreshToken,
@@ -42,6 +45,12 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::Io(e) => write!(f, "network error: {e}"),
             AuthError::Oauth(e) => write!(f, "Google rejected the request: {e}"),
+            AuthError::RefreshTokenRejected => {
+                write!(
+                    f,
+                    "your Google sign-in expired — click Add Google to reconnect"
+                )
+            }
             AuthError::MissingRedirectCode => {
                 write!(f, "Google's redirect didn't include an authorization code")
             }
@@ -169,9 +178,31 @@ pub fn get_access_token(
     let token = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token))
         .request(&http_client)
-        .map_err(|e| AuthError::Oauth(e.to_string()))?;
+        .map_err(refresh_token_error)?;
 
     Ok(Some(token.access_token().secret().clone()))
+}
+
+/// Converts a refresh-token exchange error into an `AuthError`, logging the raw
+/// error to stderr so it stays diagnosable after the toast disappears. Google
+/// answers `invalid_grant` when the saved refresh token has been revoked or has
+/// expired (a Testing-mode OAuth client expires them after 7 days), so we
+/// surface that as a "reconnect" prompt rather than an opaque error code.
+fn refresh_token_error<RE>(
+    error: RequestTokenError<RE, StandardErrorResponse<BasicErrorResponseType>>,
+) -> AuthError
+where
+    RE: std::error::Error + 'static,
+{
+    eprintln!("calix: Google token refresh failed: {error}");
+    match &error {
+        RequestTokenError::ServerResponse(response)
+            if matches!(response.error(), BasicErrorResponseType::InvalidGrant) =>
+        {
+            AuthError::RefreshTokenRejected
+        }
+        _ => AuthError::Oauth(error.to_string()),
+    }
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, AuthError> {
