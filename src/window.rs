@@ -1800,6 +1800,7 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button) {
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
+                    eprintln!("calix: Google sync failed: {error}");
                     ui.toast_overlay
                         .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
                             "Google sync failed: {}",
