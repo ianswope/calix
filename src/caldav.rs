@@ -650,6 +650,7 @@ fn parse_event(
             // Events are fetched with server-side <C:expand>, so each occurrence
             // arrives as its own one-off VEVENT without an RRULE.
             recurrence: None,
+            reminder_minutes: None,
         },
     })
 }
@@ -1459,6 +1460,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();
@@ -1488,6 +1490,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let updated = replace_recurrence_instance(ics, "20260709T140000Z", &draft).unwrap();
@@ -1544,6 +1547,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let updated =
@@ -1570,6 +1574,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let updated =
@@ -1601,6 +1606,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
@@ -1622,6 +1628,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
+            reminder_minutes: None,
         };
 
         let ics = new_event_ics("uid-1", &draft);
@@ -1676,6 +1683,7 @@ END:VCALENDAR"#;
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         }
     }
 
@@ -1759,6 +1767,7 @@ END:VCALENDAR"#;
             location: None,
             notes: Some("New agenda".to_string()),
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();

@@ -438,6 +438,7 @@ mod tests {
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
@@ -457,6 +458,7 @@ mod tests {
             location: None,
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
+            reminder_minutes: None,
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();

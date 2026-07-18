@@ -139,6 +139,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
 - **Edit**: click any event to open it.
+- **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts work on any event, including synced ones, but live only on this machine (they aren't written back to Google/CalDAV) and fire while Calix is running — pair them with autostarting Calix if you rely on them.
 
 ## Architecture
 
@@ -150,6 +151,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint), plus loading the Omarchy color overrides at startup.
 - `src/omarchy.rs` — reads the active Omarchy theme's `colors.toml` and recolors libadwaita to match (accent, surfaces, borders, and light/dark scheme); a no-op on machines without Omarchy.
 - `src/store.rs` — SQLite-backed account/calendar/event storage (create/list/update/delete), with in-memory-DB unit tests independent of the GUI.
+- `src/notify.rs` — pure event-alert logic: the dialog's alert choices, which alerts come due in a tick window, and notification wording; the minute tick and `gio::Notification` wiring live in `window.rs`.
 - `src/calendar_dialog.rs` — reusable account/calendar list for the sidebar, including per-calendar visibility toggles.
 - `src/event_dialog.rs` — the create/edit event dialog (`adw::Dialog` + `EntryRow`/`SwitchRow` form); its calendar picker defaults to sidebar-visible calendars with an expandable full list.
 - `src/config.rs` — reads `~/.config/calix/config.toml` for user-supplied API credentials (currently just the Google OAuth client).
@@ -178,7 +180,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [x] Automatic background sync (on launch and every 15 minutes)
 - [x] Recurrence editing for synced CalDAV/iCloud series — edit or delete one occurrence or the whole series
 - [ ] Per-occurrence editing for local recurring events; whole-series edits for Google recurring events
-- [ ] Event alerts / desktop notifications
+- [x] Event alerts / desktop notifications (local to the machine, while Calix runs)
 - [ ] Event search
 - [ ] Packaging (AUR, Flatpak)
 

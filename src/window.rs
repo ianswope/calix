@@ -13,6 +13,7 @@ use crate::sync::SyncOutcome;
 use crate::views::{drag::DragKind, month_view, week_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
+use gtk::gio;
 use gtk::glib;
 use gtk::glib::clone;
 use std::cell::{Cell, RefCell};
@@ -546,6 +547,45 @@ pub fn build(app: &adw::Application) {
             glib::ControlFlow::Break,
             move || {
                 ui.tick_clock();
+                glib::ControlFlow::Continue
+            }
+        ),
+    );
+
+    // Surface event alerts as desktop notifications. Each tick checks the
+    // window since the previous one — contiguous half-open windows, so an
+    // alert fires exactly once even when suspend/resume delays a tick (it
+    // then fires late rather than silently dropping). The two-day query
+    // horizon comfortably covers the longest lead time, one day.
+    let notify_app = app.clone();
+    let last_alert_check = Cell::new(Local::now());
+    glib::timeout_add_seconds_local(
+        60,
+        clone!(
+            #[weak]
+            ui,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move || {
+                let now = Local::now();
+                let since = last_alert_check.replace(now);
+                let Ok(events) = ui
+                    .store
+                    .events_between(since, now + ChronoDuration::days(2))
+                else {
+                    return glib::ControlFlow::Continue;
+                };
+                for event in crate::notify::due_alerts(&events, since, now) {
+                    let notification = gio::Notification::new(&event.title);
+                    notification.set_body(Some(&crate::notify::notification_body(&event, now)));
+                    // Id'd by occurrence so a repeated send replaces instead
+                    // of stacking, and each occurrence of a series alerts
+                    // separately.
+                    notify_app.send_notification(
+                        Some(&format!("event-{}-{}", event.id, event.start.timestamp())),
+                        &notification,
+                    );
+                }
                 glib::ControlFlow::Continue
             }
         ),
@@ -1386,6 +1426,7 @@ fn event_to_draft(event: &Event) -> EventDraft {
         location: event.location.clone(),
         notes: event.notes.clone(),
         recurrence: event.recurrence,
+        reminder_minutes: event.reminder_minutes,
     }
 }
 
@@ -1435,6 +1476,7 @@ fn moved_draft(
         location: event.location.clone(),
         notes: event.notes.clone(),
         recurrence: event.recurrence,
+        reminder_minutes: event.reminder_minutes,
     }
 }
 
@@ -1463,6 +1505,7 @@ fn resized_start_draft(
         location: event.location.clone(),
         notes: event.notes.clone(),
         recurrence: event.recurrence,
+        reminder_minutes: event.reminder_minutes,
     })
 }
 
@@ -1489,6 +1532,7 @@ fn resized_end_draft(
         location: event.location.clone(),
         notes: event.notes.clone(),
         recurrence: event.recurrence,
+        reminder_minutes: event.reminder_minutes,
     })
 }
 
@@ -2360,6 +2404,7 @@ mod tests {
             icloud_event_id: None,
             account_server_url: None,
             recurrence: None,
+            reminder_minutes: None,
         }
     }
 
