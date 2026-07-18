@@ -168,6 +168,35 @@ impl RemoteEvent {
         }
     }
 
+    /// Whether this is one occurrence of a CalDAV series (an `href#instance`),
+    /// i.e. a case where "this event" vs "all events" is a meaningful choice.
+    pub fn is_series_instance(&self) -> bool {
+        matches!(self, Self::Caldav { event_href, .. } if event_href.contains('#'))
+    }
+
+    /// Applies an edit to every occurrence of a series, shifting the series by
+    /// `start_delta` (how far the edited occurrence's start moved).
+    pub fn update_all_events(
+        &self,
+        draft: &EventDraft,
+        start_delta: chrono::Duration,
+    ) -> Result<(), String> {
+        match self {
+            Self::Caldav {
+                base_url,
+                username,
+                token_key,
+                event_href,
+            } => {
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                caldav::update_series(&credentials, event_href, start_delta, draft)
+            }
+            // Only CalDAV series expose the choice today; anything else edits
+            // in place as usual.
+            _ => self.update(draft),
+        }
+    }
+
     fn delete(&self) -> Result<(), String> {
         match self {
             Self::Unavailable(error) => Err(error.clone()),
@@ -257,6 +286,15 @@ pub fn open(
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
+    // Shown only when editing one occurrence of a series: apply the change to
+    // just this occurrence or the whole series. Index 0 = this, 1 = all.
+    let scope_row = adw::ComboRow::builder()
+        .title("Change")
+        .model(&gtk::StringList::new(&["This event", "All events"]))
+        .build();
+    let editing_series_instance = remote_event
+        .as_ref()
+        .is_some_and(RemoteEvent::is_series_instance);
     let error_label = gtk::Label::new(None);
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
@@ -365,6 +403,9 @@ pub fn open(
     // series (or a synced expanded instance) is a separate feature.
     if editing.is_none() {
         group.add(&repeat_row);
+    }
+    if editing_series_instance {
+        group.add(&scope_row);
     }
     group.add(&location_row);
     group.add(&notes_row);
@@ -625,10 +666,19 @@ pub fn open(
             if let Some(remote_event) = remote_event.clone() {
                 save_button.set_sensitive(false);
                 let event_id = event.id;
+                // "All events" shifts the series by however far this occurrence's
+                // start moved; anything else edits just this occurrence.
+                let all_events = scope_row.selected() == 1;
+                let start_delta = draft.start - event.start;
                 let (tx, rx) = mpsc::channel();
                 let remote_draft = draft.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(remote_event.update(&remote_draft));
+                    let result = if all_events {
+                        remote_event.update_all_events(&remote_draft, start_delta)
+                    } else {
+                        remote_event.update(&remote_draft)
+                    };
+                    let _ = tx.send(result);
                 });
                 glib::timeout_add_local(
                     Duration::from_millis(100),

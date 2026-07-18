@@ -175,6 +175,25 @@ pub fn update_event(
     Ok(())
 }
 
+/// Edits a whole series ("all events") from one of its occurrences, shifting the
+/// series by `start_delta` (the amount that occurrence's start moved).
+/// `event_href` may be either the master resource or an `href#instance`.
+pub fn update_series(
+    credentials: &Credentials,
+    event_href: &str,
+    start_delta: chrono::Duration,
+    draft: &EventDraft,
+) -> Result<(), String> {
+    let resource_href = event_href
+        .split_once('#')
+        .map_or(event_href, |(href, _)| href);
+    let url = absolute_url(&credentials.base_url, resource_href)?;
+    let (existing_ics, etag) = fetch_event(credentials, &url)?;
+    let ics = edit_master_series(&existing_ics, start_delta, draft)?;
+    put_event(credentials, &url, &ics, etag.as_deref())?;
+    Ok(())
+}
+
 pub fn create_event(
     credentials: &Credentials,
     calendar_href: &str,
@@ -888,6 +907,135 @@ fn replace_recurrence_instance(
     Ok(result.join("\r\n") + "\r\n")
 }
 
+/// Edits every occurrence of a series (an "all events" edit made from one
+/// occurrence): shifts the master `VEVENT`'s start/end by `start_delta` (so the
+/// whole series moves by however far that occurrence moved, keeping its
+/// timezone form and recurrence pattern) and replaces its summary/location/
+/// notes from `draft`. Override `VEVENT`s and everything else are left as-is.
+fn edit_master_series(
+    ics: &str,
+    start_delta: chrono::Duration,
+    draft: &EventDraft,
+) -> Result<String, String> {
+    let mut result = Vec::new();
+    let mut component: Vec<String> = Vec::new();
+    let mut in_event = false;
+    let mut edited = false;
+    for line in unfold_ics(ics) {
+        if is_component_boundary(&line, "BEGIN", "VEVENT") {
+            in_event = true;
+            component.clear();
+        }
+        if in_event {
+            component.push(line.clone());
+        } else {
+            result.push(line.clone());
+        }
+        if is_component_boundary(&line, "END", "VEVENT") {
+            in_event = false;
+            // The master is the VEVENT without a RECURRENCE-ID; override
+            // VEVENTs (customized single instances) are copied through as-is.
+            let is_master = !component.iter().any(|component_line| {
+                property_name(component_line)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
+            });
+            if is_master {
+                edited = true;
+                result.extend(rewrite_master_vevent(&component, start_delta, draft));
+            } else {
+                result.append(&mut component);
+            }
+            component.clear();
+        }
+    }
+    if !edited {
+        return Err("Could not find the series to edit".to_string());
+    }
+    Ok(result.join("\r\n") + "\r\n")
+}
+
+/// Rewrites the master `VEVENT`'s lines for an "all events" edit: refreshes the
+/// summary/location/notes right after `BEGIN:VEVENT`, shifts `DTSTART`/`DTEND`
+/// by `start_delta` in place (keeping their form), and leaves the `RRULE`, any
+/// nested `VALARM`, and other properties untouched.
+fn rewrite_master_vevent(
+    component: &[String],
+    start_delta: chrono::Duration,
+    draft: &EventDraft,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    // VALARM (and other nested components) carry their own DTSTART etc.; only
+    // the VEVENT's own depth-0 properties are the event's.
+    let mut nested_depth = 0usize;
+    for (index, line) in component.iter().enumerate() {
+        if index == 0 {
+            out.push(line.clone());
+            out.push(format!("DTSTAMP:{}", caldav_timestamp(Local::now())));
+            out.push(format!("SUMMARY:{}", escape_ics_text(&draft.title)));
+            if let Some(location) = &draft.location {
+                out.push(format!("LOCATION:{}", escape_ics_text(location)));
+            }
+            if let Some(notes) = &draft.notes {
+                out.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+            }
+            continue;
+        }
+        if is_component_keyword(line, "BEGIN") {
+            nested_depth += 1;
+            out.push(line.clone());
+            continue;
+        }
+        if is_component_boundary(line, "END", "VEVENT") {
+            out.push(line.clone());
+            continue;
+        }
+        if is_component_keyword(line, "END") {
+            nested_depth = nested_depth.saturating_sub(1);
+            out.push(line.clone());
+            continue;
+        }
+        if nested_depth == 0
+            && let Some(name) = property_name(line)
+        {
+            let name = name.to_ascii_uppercase();
+            // Re-added fresh above, so drop the originals.
+            if matches!(
+                name.as_str(),
+                "DTSTAMP" | "SUMMARY" | "LOCATION" | "DESCRIPTION"
+            ) {
+                continue;
+            }
+            if (name == "DTSTART" || name == "DTEND")
+                && !start_delta.is_zero()
+                && let Some((key, value)) = line.split_once(':')
+            {
+                out.push(format!("{key}:{}", shift_ics_value(value, start_delta)));
+                continue;
+            }
+        }
+        out.push(line.clone());
+    }
+    out
+}
+
+/// Shifts an iCalendar date or date-time property value by `delta`, preserving
+/// its form: `YYYYMMDDTHHMMSSZ` (UTC), `YYYYMMDDTHHMMSS` (with a TZID param on
+/// the line), or `YYYYMMDD` (all-day). An unparseable value is left untouched.
+fn shift_ics_value(value: &str, delta: chrono::Duration) -> String {
+    if let Some(naive) = value.strip_suffix('Z') {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(naive, "%Y%m%dT%H%M%S") {
+            return format!("{}Z", (dt + delta).format("%Y%m%dT%H%M%S"));
+        }
+    } else if value.contains('T') {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S") {
+            return (dt + delta).format("%Y%m%dT%H%M%S").to_string();
+        }
+    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y%m%d") {
+        return (date + delta).format("%Y%m%d").to_string();
+    }
+    value.to_string()
+}
+
 /// Excludes one occurrence of a series from its resource: adds an `EXDATE` for
 /// `recurrence_id` to the master `VEVENT` and drops any override `VEVENT` that
 /// redefined that same instance, so the occurrence disappears entirely.
@@ -1513,6 +1661,67 @@ END:VCALENDAR"#;
         let updated = exclude_recurrence_instance(ics, "20260701").unwrap();
 
         assert!(updated.contains("EXDATE;VALUE=DATE:20260701"));
+    }
+
+    fn series_draft(title: &str) -> EventDraft {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 1, 9, 0, 0)
+            .single()
+            .unwrap();
+        EventDraft {
+            title: title.to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: None,
+            recurrence: None,
+        }
+    }
+
+    #[test]
+    fn editing_all_events_shifts_the_series_start_and_end_by_the_delta() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Old title\r\nDTSTART:20260701T140000Z\r\nDTEND:20260701T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated =
+            edit_master_series(ics, chrono::Duration::hours(2), &series_draft("New title"))
+                .unwrap();
+
+        assert!(updated.contains("DTSTART:20260701T160000Z"));
+        assert!(updated.contains("DTEND:20260701T163000Z"));
+        assert!(updated.contains("SUMMARY:New title"));
+        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert!(!updated.contains("Old title"));
+    }
+
+    #[test]
+    fn editing_all_events_preserves_the_tzid_form_and_other_instances() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260701T090000\r\nDTEND;TZID=America/New_York:20260701T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID;TZID=America/New_York:20260708T090000\r\nSUMMARY:Moved one\r\nDTSTART;TZID=America/New_York:20260708T100000\r\nDTEND;TZID=America/New_York:20260708T103000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated =
+            edit_master_series(ics, chrono::Duration::hours(1), &series_draft("Renamed")).unwrap();
+
+        // Master shifted by an hour, in the same TZID form.
+        assert!(updated.contains("DTSTART;TZID=America/New_York:20260701T100000"));
+        assert!(updated.contains("SUMMARY:Renamed"));
+        // The already-customized instance is left exactly as it was.
+        assert!(updated.contains("RECURRENCE-ID;TZID=America/New_York:20260708T090000"));
+        assert!(updated.contains("SUMMARY:Moved one"));
+        assert!(updated.contains("DTSTART;TZID=America/New_York:20260708T100000"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+    }
+
+    #[test]
+    fn editing_all_events_adds_location_and_notes_when_the_draft_has_them() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART:20260701T140000Z\r\nDTEND:20260701T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let mut draft = series_draft("Standup");
+        draft.location = Some("Room 5".to_string());
+        draft.notes = Some("Bring notes".to_string());
+
+        let updated = edit_master_series(ics, chrono::Duration::zero(), &draft).unwrap();
+
+        assert!(updated.contains("LOCATION:Room 5"));
+        assert!(updated.contains("DESCRIPTION:Bring notes"));
     }
 
     #[test]
