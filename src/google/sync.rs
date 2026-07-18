@@ -140,6 +140,9 @@ fn event_draft(event: &calendar_api::EventItem) -> Option<EventDraft> {
         all_day,
         location: event.location.clone(),
         notes: notes_with_conference_links(event),
+        // Google is queried with singleEvents=true, so each occurrence arrives
+        // already expanded as its own one-off item.
+        recurrence: None,
     })
 }
 

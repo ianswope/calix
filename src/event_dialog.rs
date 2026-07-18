@@ -2,6 +2,7 @@ use crate::caldav;
 use crate::config::GoogleConfig;
 use crate::google;
 use crate::icloud;
+use crate::recurrence::Frequency;
 use crate::store::{Event, EventDraft, Store};
 use adw::prelude::*;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
@@ -247,6 +248,15 @@ pub fn open(
     let end_row = adw::EntryRow::new();
     let location_row = adw::EntryRow::builder().title("Location").build();
     let notes_row = adw::EntryRow::builder().title("Notes").build();
+    // "Does not repeat" at index 0, then Frequency::ALL — matching
+    // Frequency::picker_index / from_picker_index.
+    let repeat_labels: Vec<&str> = std::iter::once("Does not repeat")
+        .chain(Frequency::ALL.iter().map(|freq| freq.label()))
+        .collect();
+    let repeat_row = adw::ComboRow::builder()
+        .title("Repeat")
+        .model(&gtk::StringList::new(&repeat_labels))
+        .build();
     let error_label = gtk::Label::new(None);
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
@@ -312,6 +322,10 @@ pub fn open(
             set_time_rows(&start_row, &end_row, event.start, event.end, event.all_day);
             location_row.set_text(event.location.as_deref().unwrap_or(""));
             notes_row.set_text(event.notes.as_deref().unwrap_or(""));
+            // The repeat row is hidden while editing, but keeping it in sync
+            // means the save handler reads back the event's existing rule
+            // unchanged instead of clearing it.
+            repeat_row.set_selected(Frequency::picker_index(event.recurrence));
         }
         None => {
             set_time_rows(
@@ -347,6 +361,11 @@ pub fn open(
     group.add(&all_day_row);
     group.add(&start_row);
     group.add(&end_row);
+    // Authoring a recurrence is create-only for now; editing an existing
+    // series (or a synced expanded instance) is a separate feature.
+    if editing.is_none() {
+        group.add(&repeat_row);
+    }
     group.add(&location_row);
     group.add(&notes_row);
 
@@ -521,6 +540,7 @@ pub fn open(
                 all_day,
                 location: non_empty(location_row.text().to_string()),
                 notes: non_empty(notes_row.text().to_string()),
+                recurrence: Frequency::from_picker_index(repeat_row.selected()),
             };
 
             let Some(event) = editing.as_ref() else {

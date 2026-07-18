@@ -309,6 +309,11 @@ struct GoogleEventPatch {
     description: Option<String>,
     start: GoogleEventDateTime,
     end: GoogleEventDateTime,
+    // Omitted entirely for a one-off event so its payload is byte-for-byte what
+    // Calix sent before recurrence existed (also leaves an expanded instance's
+    // PATCH untouched). A recurring event sends `["RRULE:FREQ=…"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recurrence: Option<Vec<String>>,
 }
 
 impl GoogleEventPatch {
@@ -319,6 +324,9 @@ impl GoogleEventPatch {
             description: draft.notes.clone(),
             start: GoogleEventDateTime::from_start(draft),
             end: GoogleEventDateTime::from_end(draft),
+            recurrence: draft
+                .recurrence
+                .map(|freq| vec![format!("RRULE:{}", freq.to_rrule())]),
         }
     }
 }
@@ -429,12 +437,35 @@ mod tests {
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
 
         assert!(json["location"].is_null());
         assert!(json["description"].is_null());
+    }
+
+    #[test]
+    fn google_patch_serializes_recurrence_as_an_rrule_array_only_when_present() {
+        let now = Local::now();
+        let mut draft = crate::store::EventDraft {
+            title: "Standup".to_string(),
+            start: now,
+            end: now + chrono::Duration::hours(1),
+            all_day: false,
+            location: None,
+            notes: None,
+            recurrence: Some(crate::recurrence::Frequency::Weekly),
+        };
+
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+        assert_eq!(json["recurrence"], serde_json::json!(["RRULE:FREQ=WEEKLY"]));
+
+        // A one-off event omits the field so its payload is unchanged.
+        draft.recurrence = None;
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+        assert!(json.get("recurrence").is_none());
     }
 
     #[test]
