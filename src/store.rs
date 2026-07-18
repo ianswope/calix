@@ -1,15 +1,14 @@
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
 
-/// Midnight of `date` in the local timezone, for turning a `NaiveDate`
-/// range (as used by the calendar grids) into the `DateTime` range
-/// `events_between` expects.
+/// The first instant of `date` in the local timezone, for turning a
+/// `NaiveDate` range (as used by the calendar grids) into the `DateTime` range
+/// `events_between` expects. Delegates to [`crate::date_util::local_day_start`],
+/// which has an explicit policy for civil dates whose midnight was skipped or
+/// repeated by a DST transition instead of panicking.
 pub fn day_start(date: NaiveDate) -> DateTime<Local> {
-    Local
-        .from_local_datetime(&date.and_time(NaiveTime::MIN))
-        .single()
-        .expect("midnight is never DST-ambiguous for any real timezone")
+    crate::date_util::local_day_start(date)
 }
 
 #[derive(Clone)]
@@ -872,7 +871,7 @@ fn data_file_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
 
     fn draft(title: &str, start: DateTime<Local>, end: DateTime<Local>) -> EventDraft {
         EventDraft {

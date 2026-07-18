@@ -11,6 +11,7 @@ mod icloud;
 mod omarchy;
 mod store;
 mod style;
+mod sync;
 mod views;
 mod window;
 

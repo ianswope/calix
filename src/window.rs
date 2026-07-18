@@ -9,6 +9,7 @@ use crate::event_dialog;
 use crate::google;
 use crate::icloud;
 use crate::store::{self, Event, EventDraft, Store};
+use crate::sync::SyncOutcome;
 use crate::views::{drag::DragKind, month_view, week_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
@@ -1526,7 +1527,7 @@ fn update_icloud_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
 
 struct GoogleAddResult {
     display_name: String,
-    calendars_synced: usize,
+    outcome: SyncOutcome,
 }
 
 /// Runs the interactive OAuth flow for a new Google account, identifies the
@@ -1556,11 +1557,10 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                 .map_err(|e| e.to_string())?;
             google::oauth::save_refresh_token(&token_key, &tokens.refresh_token)
                 .map_err(|e| e.to_string())?;
-            let calendars_synced =
-                google::sync::sync_account(&tokens.access_token, &store, account_id)?;
+            let outcome = google::sync::sync_account(&tokens.access_token, &store, account_id)?;
             Ok(GoogleAddResult {
                 display_name,
-                calendars_synced,
+                outcome,
             })
         })();
         let _ = tx.send(result);
@@ -1577,10 +1577,11 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Added {} and synced {} calendar(s)",
-                        result.display_name, result.calendars_synced
-                    )));
+                    ui.toast_overlay.add_toast(adw::Toast::new(
+                        &result
+                            .outcome
+                            .added_summary(&result.display_name, "calendar"),
+                    ));
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
                     update_google_sync_button(&ui, &sync_button);
@@ -1613,7 +1614,7 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
 
 struct CaldavAddResult {
     display_name: String,
-    calendars_synced: usize,
+    outcome: SyncOutcome,
 }
 
 fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
@@ -1721,10 +1722,10 @@ fn add_icloud_account(
                 .map_err(|e| e.to_string())?;
             icloud::credentials::save_app_password(&token_key, &credentials.password)
                 .map_err(|e| e.to_string())?;
-            let calendars_synced = caldav::sync_account(&credentials, &store, account_id)?;
+            let outcome = caldav::sync_account(&credentials, &store, account_id)?;
             Ok(CaldavAddResult {
                 display_name: apple_id,
-                calendars_synced,
+                outcome,
             })
         })();
         let _ = tx.send(result);
@@ -1741,10 +1742,11 @@ fn add_icloud_account(
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Added {} and synced {} iCloud calendar(s)",
-                        result.display_name, result.calendars_synced
-                    )));
+                    ui.toast_overlay.add_toast(adw::Toast::new(
+                        &result
+                            .outcome
+                            .added_summary(&result.display_name, "iCloud calendar"),
+                    ));
                     add_button.set_label("Add iCloud");
                     add_button.set_sensitive(true);
                     update_icloud_sync_button(&ui, &sync_button);
@@ -1832,7 +1834,7 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, usize), String> {
+        let result = (|| -> Result<(usize, SyncOutcome), String> {
             let store = Store::open().map_err(|e| e.to_string())?;
             let mut accounts = store.google_accounts().map_err(|e| e.to_string())?;
             if accounts.is_empty()
@@ -1855,7 +1857,7 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                 return Err("No Google accounts connected. Use Add Google first.".to_string());
             }
             let account_count = accounts.len();
-            let mut calendar_count = 0;
+            let mut outcome = SyncOutcome::default();
 
             for account in accounts {
                 let token = google::oauth::get_access_token(&google_config, &account.token_key)
@@ -1866,10 +1868,10 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                             account.display_name, account.provider_account_id
                         )
                     })?;
-                calendar_count += google::sync::sync_account(&token, &store, account.id)?;
+                outcome.merge(google::sync::sync_account(&token, &store, account.id)?);
             }
 
-            Ok((account_count, calendar_count))
+            Ok((account_count, outcome))
         })();
         let _ = tx.send(result);
     });
@@ -1882,11 +1884,11 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             #[strong]
             sync_button,
             move || match rx.try_recv() {
-                Ok(Ok((account_count, calendar_count))) => {
-                    if !quiet {
-                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                            "Synced {calendar_count} calendar(s) from {account_count} account(s)"
-                        )));
+                Ok(Ok((account_count, outcome))) => {
+                    if !quiet || !outcome.failed.is_empty() {
+                        ui.toast_overlay.add_toast(adw::Toast::new(
+                            &outcome.synced_summary("calendar", account_count),
+                        ));
                     }
                     sync_button.set_label("Sync Google");
                     update_google_sync_button(&ui, &sync_button);
@@ -1922,7 +1924,7 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, usize), String> {
+        let result = (|| -> Result<(usize, SyncOutcome), String> {
             let store = Store::open().map_err(|e| e.to_string())?;
             let accounts = store.icloud_accounts().map_err(|e| e.to_string())?;
             if accounts.is_empty() {
@@ -1930,7 +1932,7 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             }
 
             let account_count = accounts.len();
-            let mut calendar_count = 0;
+            let mut outcome = SyncOutcome::default();
             for account in accounts {
                 let app_password = icloud::credentials::app_password(&account.token_key)
                     .map_err(|e| e.to_string())?
@@ -1945,10 +1947,10 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                     username: account.provider_account_id.clone(),
                     password: app_password,
                 };
-                calendar_count += caldav::sync_account(&credentials, &store, account.id)?;
+                outcome.merge(caldav::sync_account(&credentials, &store, account.id)?);
             }
 
-            Ok((account_count, calendar_count))
+            Ok((account_count, outcome))
         })();
         let _ = tx.send(result);
     });
@@ -1961,11 +1963,11 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             #[strong]
             sync_button,
             move || match rx.try_recv() {
-                Ok(Ok((account_count, calendar_count))) => {
-                    if !quiet {
-                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                            "Synced {calendar_count} iCloud calendar(s) from {account_count} account(s)"
-                        )));
+                Ok(Ok((account_count, outcome))) => {
+                    if !quiet || !outcome.failed.is_empty() {
+                        ui.toast_overlay.add_toast(adw::Toast::new(
+                            &outcome.synced_summary("iCloud calendar", account_count),
+                        ));
                     }
                     sync_button.set_label("Sync iCloud");
                     update_icloud_sync_button(&ui, &sync_button);
@@ -2163,10 +2165,10 @@ fn add_caldav_account(
                 .map_err(|e| e.to_string())?;
             icloud::credentials::save_app_password(&token_key, &credentials.password)
                 .map_err(|e| e.to_string())?;
-            let calendars_synced = caldav::sync_account(&credentials, &store, account_id)?;
+            let outcome = caldav::sync_account(&credentials, &store, account_id)?;
             Ok(CaldavAddResult {
                 display_name,
-                calendars_synced,
+                outcome,
             })
         })();
         let _ = tx.send(result);
@@ -2183,10 +2185,11 @@ fn add_caldav_account(
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Added {} and synced {} calendar(s)",
-                        result.display_name, result.calendars_synced
-                    )));
+                    ui.toast_overlay.add_toast(adw::Toast::new(
+                        &result
+                            .outcome
+                            .added_summary(&result.display_name, "calendar"),
+                    ));
                     add_button.set_label("Add CalDAV");
                     add_button.set_sensitive(true);
                     update_caldav_sync_button(&ui, &sync_button);
@@ -2223,7 +2226,7 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, usize), String> {
+        let result = (|| -> Result<(usize, SyncOutcome), String> {
             let store = Store::open().map_err(|e| e.to_string())?;
             let accounts = store.caldav_accounts().map_err(|e| e.to_string())?;
             if accounts.is_empty() {
@@ -2231,7 +2234,7 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             }
 
             let account_count = accounts.len();
-            let mut calendar_count = 0;
+            let mut outcome = SyncOutcome::default();
             for account in accounts {
                 let Some(base_url) = account.server_url.clone() else {
                     return Err(format!(
@@ -2249,10 +2252,10 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                     username: account.provider_account_id.clone(),
                     password,
                 };
-                calendar_count += caldav::sync_account(&credentials, &store, account.id)?;
+                outcome.merge(caldav::sync_account(&credentials, &store, account.id)?);
             }
 
-            Ok((account_count, calendar_count))
+            Ok((account_count, outcome))
         })();
         let _ = tx.send(result);
     });
@@ -2265,11 +2268,11 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             #[strong]
             sync_button,
             move || match rx.try_recv() {
-                Ok(Ok((account_count, calendar_count))) => {
-                    if !quiet {
-                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                            "Synced {calendar_count} CalDAV calendar(s) from {account_count} account(s)"
-                        )));
+                Ok(Ok((account_count, outcome))) => {
+                    if !quiet || !outcome.failed.is_empty() {
+                        ui.toast_overlay.add_toast(adw::Toast::new(
+                            &outcome.synced_summary("CalDAV calendar", account_count),
+                        ));
                     }
                     sync_button.set_label("Sync CalDAV");
                     update_caldav_sync_button(&ui, &sync_button);
