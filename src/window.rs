@@ -343,6 +343,19 @@ impl Ui {
         let on_edit: EditFn = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
+                // Local recurring events render as many occurrences that share
+                // the master's id; editing any of them edits the series, so open
+                // the stored master (its real start) rather than the clicked
+                // occurrence, which would otherwise re-anchor the whole series.
+                let event = if event.recurrence.is_some() {
+                    ui.store
+                        .event_by_id(event.id)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(event)
+                } else {
+                    event
+                };
                 let start = event.start;
                 let ui_for_saved = ui.clone();
                 let remote_event = remote_event_handler(&ui, &event);

@@ -32,9 +32,14 @@ pub fn timed_event_widget(
     button.connect_clicked(move |_| click(ev.clone()));
     overlay.set_child(Some(&button));
 
+    // A local recurring event is drawn as many occurrences sharing one id;
+    // moving or resizing one would rewrite the whole series, so it stays
+    // read-only until per-instance recurrence editing exists.
+    let movable = event.recurrence.is_none();
+
     // Moving commits the block's top edge as the event's new start, so only
     // a block whose top really is the start may move.
-    if placement.starts_here {
+    if placement.starts_here && movable {
         button.set_cursor_from_name(Some("grab"));
         grid.install(&button, &button, DragKind::Move, event.id, placement);
     }
@@ -46,7 +51,7 @@ pub fn timed_event_widget(
         (DragKind::ResizeStart, placement.starts_here),
         (DragKind::ResizeEnd, placement.ends_here),
     ] {
-        if !is_own_edge {
+        if !is_own_edge || !movable {
             continue;
         }
         let handle = resize_handle(kind, handle_height);
@@ -139,7 +144,10 @@ fn event_button_with_padding(
     if !event.title.is_empty() {
         button.set_tooltip_text(Some(event.title.as_str()));
     }
-    if draggable {
+    // A local recurring event is drawn as many occurrences sharing one id, so
+    // dragging one would move the whole series to that date; leave it read-only
+    // until per-instance recurrence editing exists.
+    if draggable && event.recurrence.is_none() {
         make_draggable(&button, event.id, DragKind::Move);
     }
     button

@@ -1,6 +1,6 @@
 use crate::recurrence::Frequency;
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 
 /// The first instant of `date` in the local timezone, for turning a
@@ -446,31 +446,55 @@ impl Store {
     }
 
     /// Events whose [start, end) span overlaps the given half-open range.
+    /// Recurring events are expanded into their occurrences within the range.
     pub fn events_between(
         &self,
         range_start: DateTime<Local>,
         range_end: DateTime<Local>,
     ) -> rusqlite::Result<Vec<Event>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT events.id, events.calendar_id, calendars.name, calendars.color,
-                    accounts.provider, accounts.provider_account_id, accounts.token_key,
-                    calendars.google_calendar_id,
-                    events.title, events.start_at,
-                    events.end_at, events.all_day, events.location, events.notes,
-                    events.google_event_id, events.icloud_event_id,
-                    accounts.server_url, events.recurrence
-             FROM events
-             JOIN calendars ON calendars.id = events.calendar_id
-             LEFT JOIN accounts ON accounts.id = calendars.account_id
-             WHERE events.start_at < ?1 AND events.end_at > ?2
-             AND calendars.visible != 0
-             ORDER BY events.start_at",
-        )?;
-        let rows = stmt.query_map(
-            params![stored_timestamp(&range_end), stored_timestamp(&range_start)],
-            row_to_event,
-        )?;
-        rows.collect()
+        // Non-recurring rows — including server-expanded synced instances, whose
+        // recurrence column is NULL — filtered to the range.
+        let mut stmt = self.conn.prepare(&format!(
+            "{EVENT_SELECT}
+             WHERE events.recurrence IS NULL
+               AND events.start_at < ?1 AND events.end_at > ?2
+               AND calendars.visible != 0"
+        ))?;
+        let mut events: Vec<Event> = stmt
+            .query_map(
+                params![stored_timestamp(&range_end), stored_timestamp(&range_start)],
+                row_to_event,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // Recurring events have no server to expand them, and a master's own
+        // stored span may fall outside the range, so fetch them all (unfiltered
+        // by date) and expand client-side into the range.
+        let mut recurring = self.conn.prepare(&format!(
+            "{EVENT_SELECT} WHERE events.recurrence IS NOT NULL AND calendars.visible != 0"
+        ))?;
+        let masters = recurring
+            .query_map([], row_to_event)?
+            .collect::<rusqlite::Result<Vec<Event>>>()?;
+        for master in masters {
+            events.extend(expand_recurring(&master, range_start, range_end));
+        }
+
+        events.sort_by_key(|event| event.start);
+        Ok(events)
+    }
+
+    /// The stored event with `id`, if any. Unlike [`Self::events_between`] this
+    /// returns the raw row — for a recurring event that's the series master, not
+    /// an expanded occurrence.
+    pub fn event_by_id(&self, id: i64) -> rusqlite::Result<Option<Event>> {
+        self.conn
+            .query_row(
+                &format!("{EVENT_SELECT} WHERE events.id = ?1"),
+                params![id],
+                row_to_event,
+            )
+            .optional()
     }
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
@@ -781,6 +805,51 @@ fn ensure_column(
     Ok(())
 }
 
+/// The columns [`row_to_event`] reads, with the joins supplying the calendar
+/// and account fields. Callers append their own `WHERE` (and any `ORDER BY`).
+const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name, calendars.color,
+            accounts.provider, accounts.provider_account_id, accounts.token_key,
+            calendars.google_calendar_id,
+            events.title, events.start_at,
+            events.end_at, events.all_day, events.location, events.notes,
+            events.google_event_id, events.icloud_event_id,
+            accounts.server_url, events.recurrence
+     FROM events
+     JOIN calendars ON calendars.id = events.calendar_id
+     LEFT JOIN accounts ON accounts.id = calendars.account_id";
+
+/// The occurrences of a recurring `master` overlapping the range. Each is a
+/// clone carrying the master's id and recurrence, so clicking any occurrence
+/// opens the series and dragging stays disabled (see `event_widget`).
+fn expand_recurring(
+    master: &Event,
+    range_start: DateTime<Local>,
+    range_end: DateTime<Local>,
+) -> Vec<Event> {
+    let Some(freq) = master.recurrence else {
+        return Vec::new();
+    };
+    let duration = master.end - master.start;
+    crate::recurrence::occurrences_in(master.start, duration, freq, range_start, range_end)
+        .into_iter()
+        .map(|start| {
+            let mut occurrence = master.clone();
+            occurrence.end = if master.all_day {
+                // Keep an all-day span a whole number of calendar days, the same
+                // policy as a moved all-day draft, so DST can't nudge the end.
+                let span_days = (master.end.date_naive() - master.start.date_naive())
+                    .num_days()
+                    .max(1);
+                day_start(start.date_naive() + chrono::Duration::days(span_days))
+            } else {
+                start + duration
+            };
+            occurrence.start = start;
+            occurrence
+        })
+        .collect()
+}
+
 fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     let start_at: String = row.get(9)?;
     let end_at: String = row.get(10)?;
@@ -917,6 +986,39 @@ mod tests {
         let events = store
             .events_between(start - Duration::minutes(1), start + Duration::hours(2))
             .unwrap();
+        assert_eq!(events[0].recurrence, Some(Frequency::Weekly));
+    }
+
+    #[test]
+    fn a_weekly_local_event_expands_into_weeks_beyond_the_masters_own() {
+        let store = Store::open_in_memory().unwrap();
+        // 2026-07-02 is a Thursday.
+        let base = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", base, base + Duration::hours(1));
+        weekly.recurrence = Some(Frequency::Weekly);
+        store
+            .create_event(store.default_calendar_id(), &weekly)
+            .unwrap();
+
+        // A one-day window two weeks past the master's start still shows it.
+        let range_start = Local
+            .with_ymd_and_hms(2026, 7, 16, 0, 0, 0)
+            .single()
+            .unwrap();
+        let range_end = Local
+            .with_ymd_and_hms(2026, 7, 17, 0, 0, 0)
+            .single()
+            .unwrap();
+        let events = store.events_between(range_start, range_end).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].start.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
+        );
         assert_eq!(events[0].recurrence, Some(Frequency::Weekly));
     }
 
