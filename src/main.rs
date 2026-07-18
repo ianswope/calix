@@ -8,6 +8,7 @@ mod date_util;
 mod event_dialog;
 mod google;
 mod icloud;
+mod notify;
 mod omarchy;
 mod recurrence;
 mod store;

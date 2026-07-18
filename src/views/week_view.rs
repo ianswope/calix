@@ -672,6 +672,7 @@ mod tests {
             icloud_event_id: None,
             account_server_url: None,
             recurrence: None,
+            reminder_minutes: None,
         }
     }
 

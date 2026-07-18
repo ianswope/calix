@@ -2,6 +2,7 @@ use crate::caldav;
 use crate::config::GoogleConfig;
 use crate::google;
 use crate::icloud;
+use crate::notify;
 use crate::recurrence::Frequency;
 use crate::store::{Event, EventDraft, Store};
 use adw::prelude::*;
@@ -307,6 +308,16 @@ pub fn open(
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
+    // Alert choices in notify::ALERT_CHOICES order — matching
+    // notify::picker_index / from_picker_index.
+    let alert_labels: Vec<&str> = notify::ALERT_CHOICES
+        .iter()
+        .map(|(label, _)| *label)
+        .collect();
+    let alert_row = adw::ComboRow::builder()
+        .title("Alert")
+        .model(&gtk::StringList::new(&alert_labels))
+        .build();
     // Shown only when editing one occurrence of a series: governs whether Save
     // and Delete affect just this occurrence or the whole series (0 = this, 1
     // = all).
@@ -386,6 +397,7 @@ pub fn open(
             // means the save handler reads back the event's existing rule
             // unchanged instead of clearing it.
             repeat_row.set_selected(Frequency::picker_index(event.recurrence));
+            alert_row.set_selected(notify::picker_index(event.reminder_minutes));
         }
         None => {
             set_time_rows(
@@ -429,6 +441,7 @@ pub fn open(
     if editing_series_instance {
         group.add(&scope_row);
     }
+    group.add(&alert_row);
     group.add(&location_row);
     group.add(&notes_row);
 
@@ -616,6 +629,7 @@ pub fn open(
                 location: non_empty(location_row.text().to_string()),
                 notes: non_empty(notes_row.text().to_string()),
                 recurrence: Frequency::from_picker_index(repeat_row.selected()),
+                reminder_minutes: notify::from_picker_index(alert_row.selected()),
             };
 
             let Some(event) = editing.as_ref() else {

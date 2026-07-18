@@ -37,6 +37,10 @@ pub struct Event {
     /// server-expanded (each occurrence a separate one-off row), so this is set
     /// only on locally-authored recurring events.
     pub recurrence: Option<Frequency>,
+    /// Desktop-alert lead time in minutes before the start; `None` = no
+    /// alert. Local to this machine — never pushed to Google/CalDAV, and the
+    /// sync upserts leave it alone so it survives re-syncs.
+    pub reminder_minutes: Option<i64>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -51,6 +55,7 @@ pub struct EventDraft {
     pub location: Option<String>,
     pub notes: Option<String>,
     pub recurrence: Option<Frequency>,
+    pub reminder_minutes: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -164,6 +169,9 @@ impl Store {
         // Stores an event's recurrence as its iCalendar RRULE value (e.g.
         // "FREQ=WEEKLY"); NULL for one-off events. See `crate::recurrence`.
         ensure_column(&conn, "events", "recurrence", "TEXT")?;
+        // Desktop-alert lead time in minutes; NULL = no alert. Local-only:
+        // the sync upserts never write it, so it survives re-syncs.
+        ensure_column(&conn, "events", "reminder_minutes", "INTEGER")?;
         // Base URL for a generic CalDAV account's server; NULL for google and
         // icloud (iCloud uses a fixed well-known root).
         ensure_column(&conn, "accounts", "server_url", "TEXT")?;
@@ -499,8 +507,8 @@ impl Store {
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence, reminder_minutes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 calendar_id,
                 draft.title,
@@ -510,6 +518,7 @@ impl Store {
                 draft.location,
                 draft.notes,
                 draft.recurrence.map(Frequency::to_rrule),
+                draft.reminder_minutes,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -518,7 +527,7 @@ impl Store {
     pub fn update_event(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE events SET title = ?1, start_at = ?2, end_at = ?3, all_day = ?4,
-             location = ?5, notes = ?6, recurrence = ?7 WHERE id = ?8",
+             location = ?5, notes = ?6, recurrence = ?7, reminder_minutes = ?8 WHERE id = ?9",
             params![
                 draft.title,
                 stored_timestamp(&draft.start),
@@ -527,6 +536,7 @@ impl Store {
                 draft.location,
                 draft.notes,
                 draft.recurrence.map(Frequency::to_rrule),
+                draft.reminder_minutes,
                 id,
             ],
         )?;
@@ -813,7 +823,7 @@ const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name
             events.title, events.start_at,
             events.end_at, events.all_day, events.location, events.notes,
             events.google_event_id, events.icloud_event_id,
-            accounts.server_url, events.recurrence
+            accounts.server_url, events.recurrence, events.reminder_minutes
      FROM events
      JOIN calendars ON calendars.id = events.calendar_id
      LEFT JOIN accounts ON accounts.id = calendars.account_id";
@@ -875,6 +885,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
             .get::<_, Option<String>>(17)?
             .as_deref()
             .and_then(Frequency::from_rrule),
+        reminder_minutes: row.get(18)?,
     })
 }
 
@@ -967,6 +978,7 @@ mod tests {
             location: None,
             notes: None,
             recurrence: None,
+            reminder_minutes: None,
         }
     }
 
@@ -1429,6 +1441,99 @@ mod tests {
             events[0].icloud_event_id.as_deref(),
             Some("/calendars/work/evt-1.ics")
         );
+    }
+
+    #[test]
+    fn reminder_minutes_round_trip_through_create_and_read() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 10, 0, 0)
+            .single()
+            .unwrap();
+        let mut with_alert = draft("Dentist", start, start + Duration::hours(1));
+        with_alert.reminder_minutes = Some(30);
+        store
+            .create_event(store.default_calendar_id(), &with_alert)
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), start + Duration::hours(2))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(30));
+    }
+
+    #[test]
+    fn sync_upsert_preserves_a_locally_set_reminder() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account(
+                "person@example.com",
+                "person@example.com",
+                "icloud-app-password:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 12, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/calendars/work/evt-1.ics",
+                &draft("Lunch", start, end),
+            )
+            .unwrap();
+
+        // The user picks an alert on the synced event locally…
+        let events = store
+            .events_between(start - end.signed_duration_since(start), end)
+            .unwrap();
+        let mut with_alert = draft("Lunch", start, end);
+        with_alert.reminder_minutes = Some(10);
+        store.update_event(events[0].id, &with_alert).unwrap();
+
+        // …then the next sync rewrites the row from the remote copy.
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/calendars/work/evt-1.ics",
+                &draft("Lunch (moved)", start, end),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Lunch (moved)");
+        assert_eq!(events[0].reminder_minutes, Some(10));
+    }
+
+    #[test]
+    fn expanded_recurring_occurrences_carry_the_masters_reminder() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 6, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut daily = draft("Standup", start, start + Duration::hours(1));
+        daily.recurrence = Some(Frequency::Daily);
+        daily.reminder_minutes = Some(5);
+        store
+            .create_event(store.default_calendar_id(), &daily)
+            .unwrap();
+
+        let window_start = start + Duration::days(10);
+        let events = store
+            .events_between(window_start, window_start + Duration::days(1))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(5));
     }
 
     #[test]

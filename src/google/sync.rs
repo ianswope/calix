@@ -143,6 +143,7 @@ fn event_draft(event: &calendar_api::EventItem) -> Option<EventDraft> {
         // Google is queried with singleEvents=true, so each occurrence arrives
         // already expanded as its own one-off item.
         recurrence: None,
+        reminder_minutes: None,
     })
 }
 
