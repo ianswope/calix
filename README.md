@@ -173,10 +173,10 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [x] Drag to move/resize events in the week/day grid (snapped preview, edge auto-scroll)
 - [x] Right-click to create an event at a specific spot
 - [x] Match the active Omarchy theme's colors automatically
-- [ ] Recurrence exception editing for expanded iCloud recurring events
-- [ ] Recurring event creation
+- [x] Recurring event creation (daily/weekly/monthly/yearly), expanded on the grid
+- [x] Automatic background sync (on launch and every 15 minutes)
+- [ ] Recurrence editing (change or add exceptions to an existing series)
 - [ ] Event alerts / desktop notifications
-- [ ] Automatic background sync
 - [ ] Event search
 - [ ] Packaging (AUR, Flatpak)
 
