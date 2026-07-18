@@ -1,5 +1,5 @@
 pkgname=calix
-pkgver=0.2.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
 arch=('x86_64')

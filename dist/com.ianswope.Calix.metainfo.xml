@@ -54,6 +54,17 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.0" date="2026-07-18">
+      <description>
+        <p>
+          Calix now syncs automatically in the background — on launch and
+          every 15 minutes — so connected calendars stay current without a
+          manual refresh. An expired Google sign-in surfaces a clear reconnect
+          prompt instead of failing quietly, and this release fixes several
+          issues across sync, storage, and iCalendar handling.
+        </p>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-07-15">
       <description>
         <p>
