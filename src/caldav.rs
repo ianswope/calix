@@ -1,4 +1,5 @@
 use crate::store::{EventDraft, Store};
+use crate::sync::SyncOutcome;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
 use oauth2::reqwest;
@@ -49,12 +50,13 @@ pub fn discover_calendars(credentials: &Credentials) -> Result<Vec<RemoteCalenda
 /// Discovers a CalDAV account's calendars, syncs each one's events into the
 /// store's CalDAV columns, and prunes rows that no longer exist server-side.
 /// Used for both iCloud and generic `caldav` accounts — only the credentials
-/// differ. Returns the number of calendars synced.
+/// differ. Returns a [`SyncOutcome`] recording which calendars synced and which
+/// failed.
 pub fn sync_account(
     credentials: &Credentials,
     store: &Store,
     account_id: i64,
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     let calendars = discover_calendars(credentials)?;
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
     let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
@@ -66,6 +68,7 @@ pub fn sync_account(
         .prune_caldav_calendars(account_id, &calendar_ids)
         .map_err(|e| e.to_string())?;
 
+    let mut outcome = SyncOutcome::default();
     for calendar in &calendars {
         let local_calendar_id = store
             .upsert_caldav_calendar(
@@ -84,6 +87,7 @@ pub fn sync_account(
                     "calix: failed to sync CalDAV calendar {} ({}): {}",
                     calendar.name, calendar.href, error
                 );
+                outcome.record_failure(calendar.name.clone());
                 continue;
             }
         };
@@ -97,9 +101,10 @@ pub fn sync_account(
         store
             .prune_caldav_events(local_calendar_id, &synced_ids, time_min, time_max)
             .map_err(|e| e.to_string())?;
+        outcome.record_success();
     }
 
-    Ok(calendars.len())
+    Ok(outcome)
 }
 
 pub fn calendar_events(
@@ -630,13 +635,18 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
     let mut events = Vec::new();
     let mut props = HashMap::new();
     let mut in_event = false;
+    // Depth of nested components (e.g. VALARM) below the VEVENT. Only the
+    // VEVENT's own properties — depth 0 — are the event's; an alarm's
+    // `DESCRIPTION`/`DTSTART` must not overwrite the event's own.
+    let mut nested_depth = 0usize;
     for line in unfold_ics(ics) {
-        if line == "BEGIN:VEVENT" {
+        if is_component_boundary(&line, "BEGIN", "VEVENT") {
             in_event = true;
+            nested_depth = 0;
             props = HashMap::new();
             continue;
         }
-        if line == "END:VEVENT" {
+        if is_component_boundary(&line, "END", "VEVENT") {
             if in_event {
                 events.push(std::mem::take(&mut props));
             }
@@ -646,11 +656,22 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
         if !in_event {
             continue;
         }
+        if is_component_keyword(&line, "BEGIN") {
+            nested_depth += 1;
+            continue;
+        }
+        if is_component_keyword(&line, "END") {
+            nested_depth = nested_depth.saturating_sub(1);
+            continue;
+        }
+        if nested_depth > 0 {
+            continue;
+        }
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
         let mut parts = name.split(';');
-        let key = parts.next().unwrap_or(name).to_string();
+        let key = parts.next().unwrap_or(name).to_ascii_uppercase();
         let tzid = parts.find_map(|parameter| {
             parameter
                 .split_once('=')
@@ -668,16 +689,25 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
     events
 }
 
+/// True if `line` is the boundary `BEGIN:`/`END:` of the given component,
+/// matched case-insensitively (iCalendar names are case-insensitive).
+fn is_component_boundary(line: &str, keyword: &str, component: &str) -> bool {
+    line.split_once(':').is_some_and(|(name, value)| {
+        name.eq_ignore_ascii_case(keyword) && value.eq_ignore_ascii_case(component)
+    })
+}
+
+/// True if `line` opens (`BEGIN:`) or closes (`END:`) any component.
+fn is_component_keyword(line: &str, keyword: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(name, _)| name.eq_ignore_ascii_case(keyword))
+}
+
 fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)> {
     let value = property.value.as_str();
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
         let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
-        return Some((
-            Local
-                .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
-                .single()?,
-            true,
-        ));
+        return Some((crate::date_util::local_day_start(date), true));
     }
 
     if let Some(stripped) = value.strip_suffix('Z') {
@@ -705,27 +735,13 @@ fn caldav_timestamp(dt: DateTime<Local>) -> String {
 fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String> {
     let event_count = unfold_ics(ics)
         .iter()
-        .filter(|line| line.as_str() == "BEGIN:VEVENT")
+        .filter(|line| is_component_boundary(line, "BEGIN", "VEVENT"))
         .count();
     if event_count != 1 {
         return Err("Editing recurring events is not supported yet".to_string());
     }
 
-    let (start_key, start_value, end_key, end_value) = if draft.all_day {
-        (
-            "DTSTART;VALUE=DATE",
-            draft.start.format("%Y%m%d").to_string(),
-            "DTEND;VALUE=DATE",
-            draft.end.format("%Y%m%d").to_string(),
-        )
-    } else {
-        (
-            "DTSTART",
-            caldav_timestamp(draft.start),
-            "DTEND",
-            caldav_timestamp(draft.end),
-        )
-    };
+    let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
     let mut replacement = vec![
         format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
         format!("SUMMARY:{}", escape_ics_text(&draft.title)),
@@ -741,22 +757,38 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
 
     let mut result = Vec::new();
     let mut in_event = false;
+    // Depth of nested components (e.g. VALARM): the fields we rewrite must only
+    // be stripped from the VEVENT itself, never from an alarm that carries its
+    // own `DESCRIPTION`/`DTSTART`.
+    let mut nested_depth = 0usize;
     for line in unfold_ics(ics) {
-        if line == "BEGIN:VEVENT" {
+        if is_component_boundary(&line, "BEGIN", "VEVENT") {
             in_event = true;
+            nested_depth = 0;
             result.push(line);
             result.append(&mut replacement);
             continue;
         }
-        if line == "END:VEVENT" {
+        if is_component_boundary(&line, "END", "VEVENT") {
             in_event = false;
             result.push(line);
             continue;
         }
+        if in_event && is_component_keyword(&line, "BEGIN") {
+            nested_depth += 1;
+            result.push(line);
+            continue;
+        }
+        if in_event && is_component_keyword(&line, "END") {
+            nested_depth = nested_depth.saturating_sub(1);
+            result.push(line);
+            continue;
+        }
         if in_event
+            && nested_depth == 0
             && property_name(&line).is_some_and(|name| {
                 matches!(
-                    name,
+                    name.to_ascii_uppercase().as_str(),
                     "DTSTAMP" | "SUMMARY" | "DTSTART" | "DTEND" | "LOCATION" | "DESCRIPTION"
                 )
             })
@@ -801,7 +833,8 @@ fn replace_recurrence_instance(
     let uid = lines
         .iter()
         .find_map(|line| {
-            (property_name(line) == Some("UID"))
+            property_name(line)
+                .is_some_and(|name| name.eq_ignore_ascii_case("UID"))
                 .then(|| line.split_once(':').map(|(_, value)| value.to_string()))
                 .flatten()
         })
@@ -811,7 +844,7 @@ fn replace_recurrence_instance(
     let mut component = Vec::new();
     let mut in_event = false;
     for line in lines {
-        if line == "BEGIN:VEVENT" {
+        if is_component_boundary(&line, "BEGIN", "VEVENT") {
             in_event = true;
             component.clear();
         }
@@ -820,9 +853,10 @@ fn replace_recurrence_instance(
         } else {
             result.push(line.clone());
         }
-        if line == "END:VEVENT" {
+        if is_component_boundary(&line, "END", "VEVENT") {
             let is_replaced_instance = component.iter().any(|component_line| {
-                property_name(component_line) == Some("RECURRENCE-ID")
+                property_name(component_line)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
                     && component_line
                         .split_once(':')
                         .is_some_and(|(_, value)| value == recurrence_value)
@@ -836,7 +870,7 @@ fn replace_recurrence_instance(
 
     let insert_at = result
         .iter()
-        .position(|line| line == "END:VCALENDAR")
+        .position(|line| is_component_boundary(line, "END", "VCALENDAR"))
         .ok_or_else(|| "Event is missing VCALENDAR closing data".to_string())?;
     result.splice(
         insert_at..insert_at,
@@ -1351,5 +1385,50 @@ END:VCALENDAR"#;
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
 
         assert!(lines.contains(&"RECURRENCE-ID;VALUE=DATE:20260709".to_string()));
+    }
+
+    #[test]
+    fn nested_alarm_description_does_not_overwrite_the_event_description() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\nDTSTART:20260110T090000Z\r\nDTEND:20260110T093000Z\r\nDESCRIPTION:Real agenda\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let events = parse_events("/cal/1.ics", ics);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].draft.notes.as_deref(), Some("Real agenda"));
+    }
+
+    #[test]
+    fn editing_an_event_leaves_its_nested_alarm_intact() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\nDTSTART:20260110T090000Z\r\nDTEND:20260110T093000Z\r\nDESCRIPTION:Old agenda\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let start = Local::now();
+        let draft = EventDraft {
+            title: "Standup".to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: Some("New agenda".to_string()),
+        };
+
+        let updated = replace_event_fields(ics, &draft).unwrap();
+
+        // The alarm and its own fields survive untouched...
+        assert_eq!(updated.matches("BEGIN:VALARM").count(), 1);
+        assert_eq!(updated.matches("END:VALARM").count(), 1);
+        assert!(updated.contains("TRIGGER:-PT10M"));
+        assert!(updated.contains("DESCRIPTION:Reminder"));
+        // ...while the event's own description is replaced, not the alarm's.
+        assert!(updated.contains("DESCRIPTION:New agenda"));
+        assert!(!updated.contains("Old agenda"));
+    }
+
+    #[test]
+    fn parses_lowercase_component_and_property_names() {
+        let ics = "begin:vcalendar\r\nbegin:vevent\r\nuid:evt-2\r\nsummary:Lunch\r\ndtstart:20260110T120000Z\r\ndtend:20260110T130000Z\r\nend:vevent\r\nend:vcalendar\r\n";
+
+        let events = parse_events("/cal/2.ics", ics);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].draft.title, "Lunch");
     }
 }

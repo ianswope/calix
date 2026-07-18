@@ -1,4 +1,4 @@
-use chrono::{Datelike, Months, NaiveDate, Weekday};
+use chrono::{DateTime, Datelike, Local, Months, NaiveDate, NaiveTime, TimeZone, Weekday};
 
 /// First day of the week, matching Apple/Google Calendar's US default.
 const WEEK_START: Weekday = Weekday::Sun;
@@ -65,6 +65,37 @@ pub fn shift_days(date: NaiveDate, delta: i32) -> NaiveDate {
     date + chrono::Duration::days(delta as i64)
 }
 
+/// The first instant of the calendar day `date` in timezone `tz`.
+///
+/// Almost every day starts at 00:00, but real timezone histories include days
+/// whose midnight was skipped or repeated by a DST/offset transition — for
+/// example São Paulo sprang forward at 00:00 on 2017-10-15 (so that day has no
+/// midnight), and Pacific/Apia skipped all of 2011-12-30 for the date-line
+/// change. Rather than panic (as `.single().expect(...)` would) or silently
+/// drop the day (as `.single()?` would), resolve to the first wall-clock
+/// instant the civil day actually reached.
+pub fn day_start_in<Tz: TimeZone>(tz: &Tz, date: NaiveDate) -> DateTime<Tz> {
+    let midnight = date.and_time(NaiveTime::MIN);
+    if let Some(instant) = tz.from_local_datetime(&midnight).earliest() {
+        return instant;
+    }
+    // Midnight itself was skipped: walk forward to the first minute this civil
+    // day (or, for a wholly skipped date, the next one) actually reached.
+    (1..=48 * 60)
+        .find_map(|minutes| {
+            tz.from_local_datetime(&(midnight + chrono::Duration::minutes(minutes)))
+                .earliest()
+        })
+        .unwrap_or_else(|| tz.from_utc_datetime(&midnight))
+}
+
+/// [`day_start_in`] specialized to the system's local timezone — turning a
+/// `NaiveDate` (as the calendar grids use) into the local `DateTime` that the
+/// storage and sync layers work in.
+pub fn local_day_start(date: NaiveDate) -> DateTime<Local> {
+    day_start_in(&Local, date)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +147,34 @@ mod tests {
     fn shift_days_moves_by_one_day() {
         assert_eq!(shift_days(d(2026, 7, 8), 1), d(2026, 7, 9));
         assert_eq!(shift_days(d(2026, 7, 8), -1), d(2026, 7, 7));
+    }
+
+    #[test]
+    fn day_start_is_midnight_for_an_ordinary_day() {
+        let tz = chrono_tz::America::New_York;
+        assert_eq!(
+            day_start_in(&tz, d(2026, 3, 10)).naive_local(),
+            d(2026, 3, 10).and_hms_opt(0, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn day_start_uses_the_first_real_instant_when_midnight_is_skipped() {
+        // São Paulo sprang forward at midnight on 2017-10-15 (00:00 -> 01:00),
+        // so that civil day never had a 00:00. Old code panicked here.
+        let tz = chrono_tz::America::Sao_Paulo;
+        assert_eq!(
+            day_start_in(&tz, d(2017, 10, 15)).naive_local(),
+            d(2017, 10, 15).and_hms_opt(1, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn day_start_survives_a_wholly_skipped_civil_date() {
+        // Pacific/Apia skipped all of 2011-12-30 for the date-line change; the
+        // requirement is a real instant rather than a panic.
+        let tz = chrono_tz::Pacific::Apia;
+        let start = day_start_in(&tz, d(2011, 12, 30));
+        assert!(start.naive_local() >= d(2011, 12, 30).and_hms_opt(0, 0, 0).unwrap());
     }
 }

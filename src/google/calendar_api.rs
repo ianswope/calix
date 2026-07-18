@@ -133,10 +133,7 @@ impl EventDateTime {
             return Some((parsed.with_timezone(&Local), false));
         }
         let date = NaiveDate::parse_from_str(self.date.as_deref()?, "%Y-%m-%d").ok()?;
-        let start_of_day = Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
-            .single()?;
-        Some((start_of_day, true))
+        Some((crate::date_util::local_day_start(date), true))
     }
 }
 
