@@ -1372,6 +1372,7 @@ fn event_to_draft(event: &Event) -> EventDraft {
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
+        recurrence: event.recurrence,
     }
 }
 
@@ -1420,6 +1421,7 @@ fn moved_draft(
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
+        recurrence: event.recurrence,
     }
 }
 
@@ -1447,6 +1449,7 @@ fn resized_start_draft(
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
+        recurrence: event.recurrence,
     })
 }
 
@@ -1472,6 +1475,7 @@ fn resized_end_draft(
         all_day: event.all_day,
         location: event.location.clone(),
         notes: event.notes.clone(),
+        recurrence: event.recurrence,
     })
 }
 
@@ -2342,6 +2346,7 @@ mod tests {
             google_event_id: None,
             icloud_event_id: None,
             account_server_url: None,
+            recurrence: None,
         }
     }
 

@@ -622,6 +622,9 @@ fn parse_event(
             notes: props
                 .get("DESCRIPTION")
                 .map(|property| property.value.clone()),
+            // Events are fetched with server-side <C:expand>, so each occurrence
+            // arrives as its own one-off VEVENT without an RRULE.
+            recurrence: None,
         },
     })
 }
@@ -957,6 +960,9 @@ fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
         format!("{start_key}:{start_value}"),
         format!("{end_key}:{end_value}"),
     ];
+    if let Some(freq) = draft.recurrence {
+        lines.push(format!("RRULE:{}", freq.to_rrule()));
+    }
     if let Some(location) = &draft.location {
         lines.push(format!("LOCATION:{}", escape_ics_text(location)));
     }
@@ -1242,6 +1248,7 @@ END:VCALENDAR"#;
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();
@@ -1270,6 +1277,7 @@ END:VCALENDAR"#;
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let updated = replace_recurrence_instance(ics, "20260709T140000Z", &draft).unwrap();
@@ -1325,6 +1333,7 @@ END:VCALENDAR"#;
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let updated =
@@ -1350,6 +1359,7 @@ END:VCALENDAR"#;
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let updated =
@@ -1380,11 +1390,36 @@ END:VCALENDAR"#;
             all_day: true,
             location: None,
             notes: None,
+            recurrence: None,
         };
 
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
 
         assert!(lines.contains(&"RECURRENCE-ID;VALUE=DATE:20260709".to_string()));
+    }
+
+    #[test]
+    fn new_event_ics_writes_an_rrule_only_for_a_recurring_draft() {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut draft = EventDraft {
+            title: "Standup".to_string(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            all_day: false,
+            location: None,
+            notes: None,
+            recurrence: Some(crate::recurrence::Frequency::Weekly),
+        };
+
+        let ics = new_event_ics("uid-1", &draft);
+        assert!(ics.contains("RRULE:FREQ=WEEKLY"));
+
+        draft.recurrence = None;
+        let ics = new_event_ics("uid-1", &draft);
+        assert!(!ics.contains("RRULE"));
     }
 
     #[test]
@@ -1408,6 +1443,7 @@ END:VCALENDAR"#;
             all_day: false,
             location: None,
             notes: Some("New agenda".to_string()),
+            recurrence: None,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();

@@ -9,6 +9,7 @@ mod event_dialog;
 mod google;
 mod icloud;
 mod omarchy;
+mod recurrence;
 mod store;
 mod style;
 mod sync;

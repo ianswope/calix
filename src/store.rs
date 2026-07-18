@@ -1,3 +1,4 @@
+use crate::recurrence::Frequency;
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
@@ -32,6 +33,10 @@ pub struct Event {
     /// CalDAV server base URL for a generic `caldav` event's account; `None`
     /// for google, icloud, and local events.
     pub account_server_url: Option<String>,
+    /// How the event repeats; `None` for a one-off. Synced events arrive
+    /// server-expanded (each occurrence a separate one-off row), so this is set
+    /// only on locally-authored recurring events.
+    pub recurrence: Option<Frequency>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -45,6 +50,7 @@ pub struct EventDraft {
     pub all_day: bool,
     pub location: Option<String>,
     pub notes: Option<String>,
+    pub recurrence: Option<Frequency>,
 }
 
 #[derive(Clone)]
@@ -155,6 +161,9 @@ impl Store {
         // columns and are told apart by `accounts.provider`.
         ensure_column(&conn, "calendars", "icloud_calendar_id", "TEXT")?;
         ensure_column(&conn, "events", "icloud_event_id", "TEXT")?;
+        // Stores an event's recurrence as its iCalendar RRULE value (e.g.
+        // "FREQ=WEEKLY"); NULL for one-off events. See `crate::recurrence`.
+        ensure_column(&conn, "events", "recurrence", "TEXT")?;
         // Base URL for a generic CalDAV account's server; NULL for google and
         // icloud (iCloud uses a fixed well-known root).
         ensure_column(&conn, "accounts", "server_url", "TEXT")?;
@@ -449,7 +458,7 @@ impl Store {
                     events.title, events.start_at,
                     events.end_at, events.all_day, events.location, events.notes,
                     events.google_event_id, events.icloud_event_id,
-                    accounts.server_url
+                    accounts.server_url, events.recurrence
              FROM events
              JOIN calendars ON calendars.id = events.calendar_id
              LEFT JOIN accounts ON accounts.id = calendars.account_id
@@ -466,8 +475,8 @@ impl Store {
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 calendar_id,
                 draft.title,
@@ -476,6 +485,7 @@ impl Store {
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
+                draft.recurrence.map(Frequency::to_rrule),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -484,7 +494,7 @@ impl Store {
     pub fn update_event(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE events SET title = ?1, start_at = ?2, end_at = ?3, all_day = ?4,
-             location = ?5, notes = ?6 WHERE id = ?7",
+             location = ?5, notes = ?6, recurrence = ?7 WHERE id = ?8",
             params![
                 draft.title,
                 stored_timestamp(&draft.start),
@@ -492,6 +502,7 @@ impl Store {
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
+                draft.recurrence.map(Frequency::to_rrule),
                 id,
             ],
         )?;
@@ -791,6 +802,10 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         google_event_id: row.get(14)?,
         icloud_event_id: row.get(15)?,
         account_server_url: row.get(16)?,
+        recurrence: row
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .and_then(Frequency::from_rrule),
     })
 }
 
@@ -871,6 +886,7 @@ fn data_file_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recurrence::Frequency;
     use chrono::{Duration, TimeZone};
 
     fn draft(title: &str, start: DateTime<Local>, end: DateTime<Local>) -> EventDraft {
@@ -881,7 +897,47 @@ mod tests {
             all_day: false,
             location: None,
             notes: None,
+            recurrence: None,
         }
+    }
+
+    #[test]
+    fn create_event_persists_and_reads_back_a_recurrence() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 6, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", start, start + Duration::hours(1));
+        weekly.recurrence = Some(Frequency::Weekly);
+        store
+            .create_event(store.default_calendar_id(), &weekly)
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), start + Duration::hours(2))
+            .unwrap();
+        assert_eq!(events[0].recurrence, Some(Frequency::Weekly));
+    }
+
+    #[test]
+    fn a_one_off_event_reads_back_with_no_recurrence() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 6, 9, 0, 0)
+            .single()
+            .unwrap();
+        store
+            .create_event(
+                store.default_calendar_id(),
+                &draft("Once", start, start + Duration::hours(1)),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), start + Duration::hours(2))
+            .unwrap();
+        assert_eq!(events[0].recurrence, None);
     }
 
     #[test]

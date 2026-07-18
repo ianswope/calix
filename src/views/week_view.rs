@@ -671,6 +671,7 @@ mod tests {
             google_event_id: None,
             icloud_event_id: None,
             account_server_url: None,
+            recurrence: None,
         }
     }
 
