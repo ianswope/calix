@@ -241,8 +241,14 @@ fn put_event(
 }
 
 pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), String> {
-    if event_href.contains('#') {
-        return Err("Deleting expanded recurring instances is not supported yet".to_string());
+    // Deleting one occurrence of a series excludes it from the master rather
+    // than removing the whole resource, mirroring the single-instance edit path.
+    if let Some((resource_href, recurrence_id)) = event_href.split_once('#') {
+        let url = absolute_url(&credentials.base_url, resource_href)?;
+        let (existing_ics, etag) = fetch_event(credentials, &url)?;
+        let ics = exclude_recurrence_instance(&existing_ics, recurrence_id)?;
+        put_event(credentials, &url, &ics, etag.as_deref())?;
+        return Ok(());
     }
     let url = absolute_url(&credentials.base_url, event_href)?;
     let (_, etag) = fetch_event(credentials, &url)?;
@@ -882,24 +888,80 @@ fn replace_recurrence_instance(
     Ok(result.join("\r\n") + "\r\n")
 }
 
+/// Excludes one occurrence of a series from its resource: adds an `EXDATE` for
+/// `recurrence_id` to the master `VEVENT` and drops any override `VEVENT` that
+/// redefined that same instance, so the occurrence disappears entirely.
+fn exclude_recurrence_instance(ics: &str, recurrence_id: &str) -> Result<String, String> {
+    let (_, recurrence_value) = split_recurrence_id(recurrence_id);
+    let lines = unfold_ics(ics);
+
+    let mut result = Vec::new();
+    let mut component: Vec<String> = Vec::new();
+    let mut in_event = false;
+    let mut excluded = false;
+    for line in lines {
+        if is_component_boundary(&line, "BEGIN", "VEVENT") {
+            in_event = true;
+            component.clear();
+        }
+        if in_event {
+            component.push(line.clone());
+        } else {
+            result.push(line.clone());
+        }
+        if is_component_boundary(&line, "END", "VEVENT") {
+            in_event = false;
+            let this_recurrence_id = component.iter().find_map(|component_line| {
+                property_name(component_line)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
+                    .then(|| component_line.split_once(':').map(|(_, value)| value))
+                    .flatten()
+            });
+            match this_recurrence_id {
+                // An override that redefined the cancelled instance — drop it.
+                Some(value) if value == recurrence_value => {
+                    excluded = true;
+                    component.clear();
+                }
+                // An override for some other instance — leave it untouched.
+                Some(_) => result.append(&mut component),
+                // The series master — record the exclusion on it.
+                None => {
+                    excluded = true;
+                    let end = component.len() - 1;
+                    component.insert(end, recurrence_property_line("EXDATE", recurrence_id));
+                    result.append(&mut component);
+                }
+            }
+        }
+    }
+
+    if !excluded {
+        return Err("Could not find the recurring event to exclude".to_string());
+    }
+    Ok(result.join("\r\n") + "\r\n")
+}
+
+/// Formats `recurrence_id` as the value of property `keyword` (`RECURRENCE-ID`
+/// or `EXDATE`), preserving the TZID / `VALUE=DATE` / bare-UTC form of the
+/// series' `DTSTART` so it names the same instant.
+fn recurrence_property_line(keyword: &str, recurrence_id: &str) -> String {
+    let (tzid, value) = split_recurrence_id(recurrence_id);
+    match tzid {
+        Some(tzid) => format!("{keyword};TZID={tzid}:{value}"),
+        None if value.len() == 8 && value.chars().all(|character| character.is_ascii_digit()) => {
+            format!("{keyword};VALUE=DATE:{value}")
+        }
+        None => format!("{keyword}:{value}"),
+    }
+}
+
 fn recurrence_exception_lines(uid: &str, recurrence_id: &str, draft: &EventDraft) -> Vec<String> {
     let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
-    let (tzid, recurrence_value) = split_recurrence_id(recurrence_id);
-    let recurrence_line = match tzid {
-        Some(tzid) => format!("RECURRENCE-ID;TZID={tzid}:{recurrence_value}"),
-        None if recurrence_value.len() == 8
-            && recurrence_value
-                .chars()
-                .all(|character| character.is_ascii_digit()) =>
-        {
-            format!("RECURRENCE-ID;VALUE=DATE:{recurrence_value}")
-        }
-        None => format!("RECURRENCE-ID:{recurrence_value}"),
-    };
     let mut lines = vec![
         "BEGIN:VEVENT".to_string(),
         format!("UID:{uid}"),
-        recurrence_line,
+        recurrence_property_line("RECURRENCE-ID", recurrence_id),
         format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
         format!("SUMMARY:{}", escape_ics_text(&draft.title)),
         format!("{start_key}:{start_value}"),
@@ -1420,6 +1482,50 @@ END:VCALENDAR"#;
         draft.recurrence = None;
         let ics = new_event_ics("uid-1", &draft);
         assert!(!ics.contains("RRULE"));
+    }
+
+    #[test]
+    fn excluding_an_instance_adds_an_exdate_and_keeps_the_series() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = exclude_recurrence_instance(ics, "20260709T140000Z").unwrap();
+
+        assert!(updated.contains("EXDATE:20260709T140000Z"));
+        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert!(updated.contains("UID:weekly-standup"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 1);
+    }
+
+    #[test]
+    fn excluding_a_tzid_instance_writes_a_tzid_exdate() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated =
+            exclude_recurrence_instance(ics, "TZID=America/New_York:20260709T090000").unwrap();
+
+        assert!(updated.contains("EXDATE;TZID=America/New_York:20260709T090000"));
+    }
+
+    #[test]
+    fn excluding_an_all_day_instance_writes_a_value_date_exdate() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:holiday\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260701\r\nDTEND;VALUE=DATE:20260702\r\nRRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = exclude_recurrence_instance(ics, "20260701").unwrap();
+
+        assert!(updated.contains("EXDATE;VALUE=DATE:20260701"));
+    }
+
+    #[test]
+    fn excluding_an_instance_that_was_modified_drops_its_override_too() {
+        // A series whose 2026-07-16 occurrence was already moved to a later time.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nRECURRENCE-ID:20260716T140000Z\r\nSUMMARY:Moved standup\r\nDTSTART:20260716T150000Z\r\nDTEND:20260716T153000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = exclude_recurrence_instance(ics, "20260716T140000Z").unwrap();
+
+        // The override is gone and the master carries the exclusion.
+        assert!(!updated.contains("Moved standup"));
+        assert!(updated.contains("EXDATE:20260716T140000Z"));
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 1);
     }
 
     #[test]
