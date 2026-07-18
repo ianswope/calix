@@ -28,16 +28,17 @@ cargo run
 
 ## Homebrew
 
-Until the first tagged release is published, install the current development
-build from this repository's tap:
+The tap currently ships the development build straight from master:
 
 ```sh
 brew tap ianswope/calix https://github.com/ianswope/calix
 brew install --HEAD ianswope/calix/calix
 ```
 
-This installs the `calix` binary and the desktop entry/icon. A tagged release
-will replace the `--HEAD` formula with a checksum-pinned stable package.
+This installs the `calix` binary and the desktop entry/icon. Tagged releases
+are published as prebuilt tarballs on the
+[releases page](https://github.com/ianswope/calix/releases); a checksum-pinned
+stable formula is still to come.
 
 ## Flatpak and AUR
 
@@ -93,7 +94,7 @@ iCloud uses CalDAV with an Apple app-specific password:
 4. Enter your Apple Account email and the app-specific password. The password is saved to your system keyring, not to a file.
 5. Use **Sync iCloud** to refresh connected iCloud accounts.
 
-Synced iCloud events can be edited or deleted when they are simple `.ics` resources. Expanded recurring iCloud instances are still read-only until recurrence exceptions are implemented.
+Synced iCloud events can be edited or deleted, including recurring ones: opening an occurrence of a series offers a **This event / All events** choice for both edits and deletes, written back as standard iCalendar overrides and exclusions.
 
 ## Connecting other CalDAV calendars
 
@@ -105,7 +106,7 @@ Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, 
    - **Username / Password** — most providers want an app-specific password rather than your login password. Generate one in your provider's security settings.
 3. The password is saved to your system keyring, not to a file. Use **Sync CalDAV** to refresh all connected CalDAV accounts.
 
-Editing and deleting synced CalDAV events works for simple `.ics` resources, the same as iCloud; expanded recurring instances are read-only for now.
+Editing and deleting synced CalDAV events works the same as iCloud, including the **This event / All events** choice on recurring series.
 
 ## Connecting Google Calendar
 
@@ -175,7 +176,8 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - [x] Match the active Omarchy theme's colors automatically
 - [x] Recurring event creation (daily/weekly/monthly/yearly), expanded on the grid
 - [x] Automatic background sync (on launch and every 15 minutes)
-- [ ] Recurrence editing (change or add exceptions to an existing series)
+- [x] Recurrence editing for synced CalDAV/iCloud series — edit or delete one occurrence or the whole series
+- [ ] Per-occurrence editing for local recurring events; whole-series edits for Google recurring events
 - [ ] Event alerts / desktop notifications
 - [ ] Event search
 - [ ] Packaging (AUR, Flatpak)
