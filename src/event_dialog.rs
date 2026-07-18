@@ -222,6 +222,27 @@ impl RemoteEvent {
             }
         }
     }
+
+    /// Deletes an entire series (an "all events" delete) rather than excluding
+    /// the one occurrence [`Self::delete`] would drop for a CalDAV instance.
+    fn delete_all_events(&self) -> Result<(), String> {
+        match self {
+            Self::Caldav {
+                base_url,
+                username,
+                token_key,
+                event_href,
+            } => {
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                // The bare resource href removes the whole series in one delete.
+                let resource_href = event_href
+                    .split_once('#')
+                    .map_or(event_href.as_str(), |(href, _)| href);
+                caldav::delete_event(&credentials, resource_href)
+            }
+            _ => self.delete(),
+        }
+    }
 }
 
 /// Opens a create/edit dialog for an event. Remote changes are completed in a
@@ -286,10 +307,11 @@ pub fn open(
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
-    // Shown only when editing one occurrence of a series: apply the change to
-    // just this occurrence or the whole series. Index 0 = this, 1 = all.
+    // Shown only when editing one occurrence of a series: governs whether Save
+    // and Delete affect just this occurrence or the whole series (0 = this, 1
+    // = all).
     let scope_row = adw::ComboRow::builder()
-        .title("Change")
+        .title("Apply to")
         .model(&gtk::StringList::new(&["This event", "All events"]))
         .build();
     let editing_series_instance = remote_event
@@ -440,14 +462,24 @@ pub fn open(
             remote_event,
             #[strong]
             delete_button,
+            #[strong]
+            scope_row,
             #[weak]
             error_label,
             move |_| {
                 if let Some(remote_event) = remote_event.clone() {
                     delete_button.set_sensitive(false);
+                    // "All events" removes the whole series; otherwise just this
+                    // occurrence (the picker only shows for a series instance).
+                    let all_events = scope_row.selected() == 1;
                     let (tx, rx) = mpsc::channel();
                     std::thread::spawn(move || {
-                        let _ = tx.send(remote_event.delete());
+                        let result = if all_events {
+                            remote_event.delete_all_events()
+                        } else {
+                            remote_event.delete()
+                        };
+                        let _ = tx.send(result);
                     });
                     glib::timeout_add_local(
                         Duration::from_millis(100),
@@ -548,6 +580,8 @@ pub fn open(
         picker_expanded,
         #[strong]
         save_button,
+        #[strong]
+        scope_row,
         #[weak]
         error_label,
         move |_| {
