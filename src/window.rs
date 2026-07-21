@@ -75,6 +75,39 @@ fn clamp_hour_row_height(height: i32) -> i32 {
     )
 }
 
+/// Index of the "current" page among the three (prev, current, next) pages a
+/// rebuild appends to the carousel.
+const MIDDLE_PAGE: f64 = 1.0;
+
+/// What one frame-clock step of recentering a rebuilt carousel should do.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SettleAction {
+    /// A newer rebuild detached this page — stop without touching state.
+    Abandon,
+    /// The carousel has no real geometry yet (allocation pending, or the
+    /// frame clock is stalled while the screen is blanked/locked) — a scroll
+    /// issued now would silently stay on page 0, so keep waiting.
+    Wait,
+    /// Not verifiably parked on the middle page yet — issue a scroll and
+    /// check again next frame.
+    Scroll,
+    /// Parked on the middle page — the rebuild is finished and `page-changed`
+    /// can be trusted again.
+    Done,
+}
+
+fn reset_settle_action(page_attached: bool, width: i32, position: f64) -> SettleAction {
+    if !page_attached {
+        SettleAction::Abandon
+    } else if width <= 0 {
+        SettleAction::Wait
+    } else if (position - MIDDLE_PAGE).abs() > 1e-6 {
+        SettleAction::Scroll
+    } else {
+        SettleAction::Done
+    }
+}
+
 struct State {
     view_mode: ViewMode,
     current_date: NaiveDate,
@@ -185,14 +218,33 @@ impl Ui {
 
         self.title_label.set_label(&title);
 
+        // Recenter on the frame clock, not wall-clock delays: while the
+        // screen is blanked, the session is locked, or the machine is
+        // mid-resume, the compositor sends no frames, layout never runs, and
+        // a scroll_to() issued on a timer silently stays on page 0 — the
+        // previous period (the same zero-geometry failure the startup gate in
+        // `build` works around). A tick callback only runs once frames flow
+        // again, so retry until the carousel verifiably sits on the middle
+        // page and only then trust `page-changed` (and swipes) again.
         let ui = self.clone();
-        glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            ui.carousel.scroll_to(&current_page, false);
-            let ui = ui.clone();
-            glib::timeout_add_local_once(Duration::from_millis(50), move || {
-                ui.carousel.scroll_to(&current_page, false);
-                ui.rebuilding.set(false);
-            });
+        self.carousel.add_tick_callback(move |carousel, _clock| {
+            let attached = current_page.parent().as_ref() == Some(carousel.upcast_ref());
+            match reset_settle_action(attached, carousel.width(), carousel.position()) {
+                SettleAction::Abandon => glib::ControlFlow::Break,
+                SettleAction::Wait => glib::ControlFlow::Continue,
+                SettleAction::Scroll => {
+                    carousel.scroll_to(&current_page, false);
+                    glib::ControlFlow::Continue
+                }
+                SettleAction::Done => {
+                    ui.rebuilding.set(false);
+                    // A date rollover noticed while this rebuild was pending
+                    // was deferred (tick_clock skips rollovers mid-rebuild);
+                    // apply it now instead of waiting out the 30s timer.
+                    ui.tick_clock();
+                    glib::ControlFlow::Break
+                }
+            }
         });
     }
 
@@ -2504,5 +2556,27 @@ mod tests {
 
         assert_eq!(draft.start.date_naive(), target);
         assert_eq!(draft.end - draft.start, ChronoDuration::minutes(45));
+    }
+
+    #[test]
+    fn rebuild_settle_waits_while_the_carousel_has_no_geometry() {
+        // Screen blanked/locked or allocation pending: scrolling now would
+        // silently park the carousel on page 0, the previous period.
+        assert_eq!(reset_settle_action(true, 0, 0.0), SettleAction::Wait);
+    }
+
+    #[test]
+    fn rebuild_settle_scrolls_until_parked_on_the_middle_page() {
+        assert_eq!(reset_settle_action(true, 800, 0.0), SettleAction::Scroll);
+    }
+
+    #[test]
+    fn rebuild_settle_finishes_once_parked_on_the_middle_page() {
+        assert_eq!(reset_settle_action(true, 800, 1.0), SettleAction::Done);
+    }
+
+    #[test]
+    fn rebuild_settle_abandons_a_page_replaced_by_a_newer_rebuild() {
+        assert_eq!(reset_settle_action(false, 800, 1.0), SettleAction::Abandon);
     }
 }
