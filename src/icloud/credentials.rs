@@ -22,6 +22,27 @@ fn keyring_entry(token_key: &str) -> Result<keyring::Entry, CredentialError> {
     keyring::Entry::new(KEYRING_SERVICE, token_key).map_err(CredentialError::Keyring)
 }
 
+/// Register the process-wide keyring store from the calling thread.
+///
+/// `keyring` 4.1.4's `v1` layer sets up the global credential store lazily on
+/// the first `Entry::new`, but it flips its "initialized" flag *before* the
+/// store is actually registered. Our launch/resume sync spawns the Google,
+/// iCloud, and CalDAV workers at once, so a thread that loses that race sees the
+/// flag already set, skips initialization, and fails with `NoDefaultStore`
+/// ("no default store has been set, so cannot search or create entries").
+///
+/// Calling this once on the main thread at startup — before any sync thread
+/// spawns — wins the race deterministically, so every later `Entry::new` on any
+/// thread finds the store ready. The store is global, so this also covers
+/// Google's entries, not just CalDAV's.
+pub fn prime_keyring_store() {
+    // Any `Entry::new` triggers the one-time store registration; the username
+    // need not exist, since we never read it — only the init side effect matters.
+    if let Err(e) = keyring::Entry::new(KEYRING_SERVICE, "store-warmup") {
+        eprintln!("calix: keyring store did not initialize at startup: {e}");
+    }
+}
+
 pub fn token_key(apple_id: &str) -> String {
     format!(
         "{KEYRING_USERNAME_PREFIX}:{}",
