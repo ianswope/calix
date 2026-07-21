@@ -266,8 +266,10 @@ impl Ui {
     /// Slides the "now" line to the current time, and when the calendar date
     /// has rolled over re-anchors "today": the highlighting always follows the
     /// real day, and if the user is still parked on today the visible page
-    /// follows too. Because GLib timeouts fire promptly once the machine wakes,
-    /// this also recovers from a day boundary crossed during suspend.
+    /// follows too. Also invoked directly on resume from suspend (see the
+    /// logind listener in `build_ui`), which is what recovers a day boundary
+    /// crossed while asleep — GLib's monotonic timer is frozen during suspend,
+    /// so it can't be relied on to fire at wake.
     fn tick_clock(self: &Rc<Self>) {
         let now_date = Local::now().date_naive();
         let previous = self.today.get();
@@ -536,8 +538,9 @@ pub fn build(app: &adw::Application) {
 
     // Keep the display anchored to real time: slide the "now" line and, on a
     // date rollover, re-anchor "today". A half-minute cadence keeps the line
-    // reasonably fresh and bounds how long a suspend/resume rollover can linger
-    // — GLib's monotonic timeout fires promptly once the machine wakes.
+    // reasonably fresh while the app is awake. This timer is frozen during
+    // suspend (GLib's monotonic clock stops), so recovery from an overnight
+    // sleep comes from the logind resume listener below, not from this tick.
     glib::timeout_add_seconds_local(
         30,
         clone!(
@@ -793,6 +796,61 @@ pub fn build(app: &adw::Application) {
             }
         ),
     );
+
+    // The periodic timers above run on GLib's monotonic clock, which is frozen
+    // while the machine is suspended — so after an overnight sleep they don't
+    // fire at wake, they only resume counting down the remainder of their
+    // interval. That leaves the grid parked on yesterday and unsynced until up
+    // to a full interval of use later. Recover deterministically instead:
+    // logind broadcasts `PrepareForSleep(b)` — true just before sleep, false
+    // right after resume — so on the resume edge re-anchor "today"/now and kick
+    // a background sync. gio speaks D-Bus, so this needs no new dependency; the
+    // shared system-bus connection is kept alive by gio for the process's life,
+    // which keeps the subscription live.
+    if let Ok(system_bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
+        let subscription = system_bus.subscribe_to_signal(
+            Some("org.freedesktop.login1"),
+            Some("org.freedesktop.login1.Manager"),
+            Some("PrepareForSleep"),
+            Some("/org/freedesktop/login1"),
+            None,
+            gio::DBusSignalFlags::NONE,
+            clone!(
+                #[weak]
+                ui,
+                #[weak]
+                google_sync_button,
+                #[weak]
+                icloud_sync_button,
+                #[weak]
+                caldav_sync_button,
+                move |signal| {
+                    // PrepareForSleep(b): `true` just before sleep, `false`
+                    // right after resume. Only the resume edge matters; treat an
+                    // unreadable payload as "going to sleep" so a malformed
+                    // signal can't trigger a spurious sync.
+                    if signal
+                        .parameters
+                        .child_value(0)
+                        .get::<bool>()
+                        .unwrap_or(true)
+                    {
+                        return;
+                    }
+                    ui.tick_clock();
+                    sync_connected_accounts(
+                        &ui,
+                        &google_sync_button,
+                        &icloud_sync_button,
+                        &caldav_sync_button,
+                    );
+                }
+            ),
+        );
+        // The subscription unsubscribes when dropped; there is exactly one, for
+        // the whole process, so leak it to keep the resume listener alive.
+        std::mem::forget(subscription);
+    }
 
     let calendars_button = gtk::ToggleButton::new();
     calendars_button.set_child(Some(&gtk::Image::from_icon_name(
