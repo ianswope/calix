@@ -494,6 +494,11 @@ impl Ui {
 }
 
 pub fn build(app: &adw::Application) {
+    // Register the keyring store on the main thread before any sync worker
+    // spawns, so the concurrent launch/resync threads don't race its lazy
+    // initialization. See `icloud::credentials::prime_keyring_store`.
+    icloud::credentials::prime_keyring_store();
+
     let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
     let initial_view_mode =
         ViewMode::from_setting(store.setting(ViewMode::SETTING_KEY).unwrap_or_default());
@@ -2095,6 +2100,7 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
+                    eprintln!("calix: iCloud sync failed: {error}");
                     ui.toast_overlay
                         .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
                             "iCloud sync failed: {}",
@@ -2400,6 +2406,7 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                     glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
+                    eprintln!("calix: CalDAV sync failed: {error}");
                     ui.toast_overlay
                         .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
                             "CalDAV sync failed: {}",
