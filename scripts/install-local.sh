@@ -12,6 +12,9 @@ fi
 
 install -Dm755 "$ROOT_DIR/target/release/calix" "$BIN_DIR/calix"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.desktop" "$DATA_DIR/applications/$APP_ID.desktop"
+# dist ships `Exec=calix` for distro packages that install to /usr/bin. A graphical
+# session rarely has $BIN_DIR on PATH, so point the entry at the binary we installed.
+sed -i "s|^Exec=calix\$|Exec=$BIN_DIR/calix|" "$DATA_DIR/applications/$APP_ID.desktop"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.svg" "$DATA_DIR/icons/hicolor/scalable/apps/$APP_ID.svg"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.metainfo.xml" "$DATA_DIR/metainfo/$APP_ID.metainfo.xml"
 
