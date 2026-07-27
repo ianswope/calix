@@ -84,6 +84,16 @@ impl SyncOutcome {
     }
 }
 
+/// Toast text for an account that connected and was saved, but whose first
+/// sync failed.
+///
+/// The account row and its secret are already written by this point, so
+/// reporting a bare "connect failed" would hide a real account the user can
+/// see in the sidebar and sync by hand.
+pub fn added_but_not_synced(display_name: &str, error: &str) -> String {
+    format!("Added {display_name}, but the first sync failed: {error}")
+}
+
 /// Syncs every account, isolating failures to the account that caused them.
 ///
 /// A missing credential or an account-level network error must not abandon the
@@ -129,6 +139,14 @@ mod tests {
                 Ok(outcome)
             },
         )
+    }
+
+    #[test]
+    fn a_failed_first_sync_still_reports_the_account_as_added() {
+        assert_eq!(
+            added_but_not_synced("Work", "the server took too long to respond"),
+            "Added Work, but the first sync failed: the server took too long to respond"
+        );
     }
 
     #[test]

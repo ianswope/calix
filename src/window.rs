@@ -1711,6 +1711,16 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }
 
+/// Toast text for a completed Add. The account is stored before its first sync
+/// runs, so a sync failure reports as an added account whose calendars are
+/// still empty — not as a failed connection.
+fn add_summary(outcome: &Result<SyncOutcome, String>, display_name: &str, noun: &str) -> String {
+    match outcome {
+        Ok(outcome) => outcome.added_summary(display_name, noun),
+        Err(error) => sync::added_but_not_synced(display_name, first_line(error)),
+    }
+}
+
 fn update_google_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
     let account_count = ui
         .store
@@ -1739,9 +1749,13 @@ fn update_icloud_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
     });
 }
 
+/// A completed Add. The account row and its secret are written before the
+/// initial sync runs, so `outcome` carries that sync's failure separately: the
+/// account exists either way, and reporting the whole Add as failed would hide
+/// it.
 struct GoogleAddResult {
     display_name: String,
-    outcome: SyncOutcome,
+    outcome: Result<SyncOutcome, String>,
 }
 
 /// Runs the interactive OAuth flow for a new Google account, identifies the
@@ -1766,12 +1780,15 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                 google::sync::account_identity(&tokens.access_token)?;
             let token_key = google::oauth::token_key(&provider_account_id);
             let store = Store::open().map_err(|e| e.to_string())?;
+            // Secret first: a row whose credential failed to save is an account
+            // that can never sync, while an unreferenced secret is inert and is
+            // overwritten by the next attempt.
+            google::oauth::save_refresh_token(&token_key, &tokens.refresh_token)
+                .map_err(|e| e.to_string())?;
             let account_id = store
                 .upsert_google_account(&provider_account_id, &display_name, &token_key)
                 .map_err(|e| e.to_string())?;
-            google::oauth::save_refresh_token(&token_key, &tokens.refresh_token)
-                .map_err(|e| e.to_string())?;
-            let outcome = google::sync::sync_account(&tokens.access_token, &store, account_id)?;
+            let outcome = google::sync::sync_account(&tokens.access_token, &store, account_id);
             Ok(GoogleAddResult {
                 display_name,
                 outcome,
@@ -1791,11 +1808,12 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(
-                        &result
-                            .outcome
-                            .added_summary(&result.display_name, "calendar"),
-                    ));
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "calendar",
+                        ))));
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
                     update_google_sync_button(&ui, &sync_button);
@@ -1826,9 +1844,11 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
     );
 }
 
+/// A completed Add — see [`GoogleAddResult`] for why the initial sync's
+/// failure travels separately from the Add's.
 struct CaldavAddResult {
     display_name: String,
-    outcome: SyncOutcome,
+    outcome: Result<SyncOutcome, String>,
 }
 
 /// Human-readable provider name for the account list.
@@ -2102,12 +2122,13 @@ fn add_icloud_account(
 
             let token_key = icloud::credentials::token_key(&apple_id);
             let store = Store::open().map_err(|e| e.to_string())?;
+            // Secret before row — see the Google flow.
+            icloud::credentials::save_app_password(&token_key, &credentials.password)
+                .map_err(|e| e.to_string())?;
             let account_id = store
                 .upsert_icloud_account(&apple_id, &apple_id, &token_key)
                 .map_err(|e| e.to_string())?;
-            icloud::credentials::save_app_password(&token_key, &credentials.password)
-                .map_err(|e| e.to_string())?;
-            let outcome = caldav::sync_account(&credentials, &store, account_id)?;
+            let outcome = caldav::sync_account(&credentials, &store, account_id);
             Ok(CaldavAddResult {
                 display_name: apple_id,
                 outcome,
@@ -2127,11 +2148,12 @@ fn add_icloud_account(
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(
-                        &result
-                            .outcome
-                            .added_summary(&result.display_name, "iCloud calendar"),
-                    ));
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "iCloud calendar",
+                        ))));
                     add_button.set_label("Add iCloud");
                     add_button.set_sensitive(true);
                     update_icloud_sync_button(&ui, &sync_button);
@@ -2541,12 +2563,13 @@ fn add_caldav_account(
             let token_key = icloud::credentials::caldav_token_key(&server_url, &username);
             let store = Store::open().map_err(|e| e.to_string())?;
             let display_name = format!("{username} ({})", host_label(&server_url));
+            // Secret before row — see the Google flow.
+            icloud::credentials::save_app_password(&token_key, &credentials.password)
+                .map_err(|e| e.to_string())?;
             let account_id = store
                 .upsert_caldav_account(&username, &server_url, &display_name, &token_key)
                 .map_err(|e| e.to_string())?;
-            icloud::credentials::save_app_password(&token_key, &credentials.password)
-                .map_err(|e| e.to_string())?;
-            let outcome = caldav::sync_account(&credentials, &store, account_id)?;
+            let outcome = caldav::sync_account(&credentials, &store, account_id);
             Ok(CaldavAddResult {
                 display_name,
                 outcome,
@@ -2566,11 +2589,12 @@ fn add_caldav_account(
             sync_button,
             move || match rx.try_recv() {
                 Ok(Ok(result)) => {
-                    ui.toast_overlay.add_toast(adw::Toast::new(
-                        &result
-                            .outcome
-                            .added_summary(&result.display_name, "calendar"),
-                    ));
+                    ui.toast_overlay
+                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "calendar",
+                        ))));
                     add_button.set_label("Add CalDAV");
                     add_button.set_sensitive(true);
                     update_caldav_sync_button(&ui, &sync_button);
