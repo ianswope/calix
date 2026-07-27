@@ -674,8 +674,10 @@ pub fn open(
                                     glib::ControlFlow::Break
                                 }
                                 Err(error) => {
-                                    error_label.set_label(&format!("Couldn't save event: {error}"));
-                                    save_button.set_sensitive(true);
+                                    let (message, retryable) =
+                                        save_failure(&error.to_string(), false);
+                                    error_label.set_label(&message);
+                                    save_button.set_sensitive(retryable);
                                     glib::ControlFlow::Break
                                 }
                             },
@@ -694,8 +696,10 @@ pub fn open(
                                         glib::ControlFlow::Break
                                     }
                                     Err(error) => {
-                                        error_label.set_label(&format!("Remote event created, but the local cache could not be updated: {error}"));
-                                        save_button.set_sensitive(true);
+                                        let (message, retryable) =
+                                            save_failure(&error.to_string(), true);
+                                        error_label.set_label(&message);
+                                        save_button.set_sensitive(retryable);
                                         glib::ControlFlow::Break
                                     }
                                 }
@@ -977,6 +981,26 @@ fn attendee_status_label(status: &str) -> &str {
     }
 }
 
+/// The message to show for a failed save, and whether Save may be pressed
+/// again.
+///
+/// Once the provider has created the event, a retry is not a retry: creation
+/// isn't idempotent and there is no key to repeat it under, so pressing Save
+/// again produces a second event on the server. The remote copy is already
+/// what the user asked for, so the local cache catches up at the next sync.
+fn save_failure(error: &str, created_remotely: bool) -> (String, bool) {
+    if created_remotely {
+        return (
+            format!(
+                "Created on the server, but this device's copy couldn't be updated: {error}. \
+                 It will appear here after the next sync."
+            ),
+            false,
+        );
+    }
+    (format!("Couldn't save event: {error}"), true)
+}
+
 fn meeting_link_label(link: &str) -> String {
     Url::parse(link)
         .ok()
@@ -987,6 +1011,25 @@ fn meeting_link_label(link: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_save_failure_can_be_retried() {
+        let (message, retryable) = save_failure("database is locked", false);
+        assert!(retryable);
+        assert_eq!(message, "Couldn't save event: database is locked");
+    }
+
+    #[test]
+    fn a_cache_failure_after_a_remote_create_must_not_offer_a_retry() {
+        // Save is the only control that creates the event, and the provider
+        // already has it — pressing Save again would make a second one.
+        let (message, retryable) = save_failure("database is locked", true);
+        assert!(!retryable, "{message}");
+        assert!(
+            message.contains("Created on the server"),
+            "the message must say the event exists remotely: {message}"
+        );
+    }
 
     #[test]
     fn all_day_values_use_date_only_input() {
