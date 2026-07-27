@@ -1539,8 +1539,7 @@ fn move_handler(
                         move || match rx.try_recv() {
                             Ok(Ok(())) => glib::ControlFlow::Break,
                             Ok(Err(error)) => {
-                                let _ = ui.store.update_event(event.id, &original);
-                                ui.reset();
+                                undo_failed_drag(&ui, event.id, &draft, &original);
                                 ui.toast_overlay.add_toast(adw::Toast::new(&format!(
                                     "Couldn't move event: {error}"
                                 )));
@@ -1548,8 +1547,7 @@ fn move_handler(
                             }
                             Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                             Err(mpsc::TryRecvError::Disconnected) => {
-                                let _ = ui.store.update_event(event.id, &original);
-                                ui.reset();
+                                undo_failed_drag(&ui, event.id, &draft, &original);
                                 ui.toast_overlay
                                     .add_toast(adw::Toast::new("Event move stopped unexpectedly"));
                                 glib::ControlFlow::Break
@@ -1567,6 +1565,48 @@ fn move_handler(
                 }
             }
         }
+    })
+}
+
+/// Puts back the local write a failed drag made, unless the event has changed
+/// since — see [`undo_drag`].
+fn undo_failed_drag(ui: &Rc<Ui>, event_id: i64, optimistic: &EventDraft, original: &EventDraft) {
+    let Ok(Some(current)) = ui.store.event_by_id(event_id) else {
+        return;
+    };
+    let Some(undo) = undo_drag(&current, optimistic, original) else {
+        return;
+    };
+    if ui.store.update_event(event_id, &undo).is_ok() {
+        ui.reset();
+    }
+}
+
+/// The write that undoes a failed drag, or `None` when the event has moved on.
+///
+/// A drag writes its new time to SQLite immediately and only learns the remote
+/// move failed later, by which point the user may have dragged the same event
+/// again. Undoing then would restore the state from before *both* moves and
+/// throw away the newer one — which, being remote, has already succeeded. So
+/// the undo only applies while the row still holds what this drag wrote, and
+/// it puts back just the times: anything else edited since belongs to whoever
+/// edited it.
+fn undo_drag(
+    current: &Event,
+    optimistic: &EventDraft,
+    original: &EventDraft,
+) -> Option<EventDraft> {
+    let unchanged = current.start == optimistic.start
+        && current.end == optimistic.end
+        && current.all_day == optimistic.all_day;
+    if !unchanged {
+        return None;
+    }
+    Some(EventDraft {
+        start: original.start,
+        end: original.end,
+        all_day: original.all_day,
+        ..event_to_draft(current)
     })
 }
 
@@ -2728,6 +2768,13 @@ mod tests {
             .expect("unambiguous local midnight")
     }
 
+    fn local_at(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, 0, 0)
+            .single()
+            .expect("unambiguous local time")
+    }
+
     fn test_event(start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -> Event {
         Event {
             id: 1,
@@ -2751,6 +2798,56 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
         }
+    }
+
+    /// A drag from 09:00 to 11:00, with the row as it stands afterwards.
+    fn drag_fixture() -> (EventDraft, EventDraft, Event) {
+        let original = event_to_draft(&test_event(
+            local_at(2026, 7, 9, 9),
+            local_at(2026, 7, 9, 10),
+            false,
+        ));
+        let optimistic = event_to_draft(&test_event(
+            local_at(2026, 7, 9, 11),
+            local_at(2026, 7, 9, 12),
+            false,
+        ));
+        let current = test_event(local_at(2026, 7, 9, 11), local_at(2026, 7, 9, 12), false);
+        (original, optimistic, current)
+    }
+
+    #[test]
+    fn a_failed_drag_undoes_the_move_it_wrote() {
+        let (original, optimistic, current) = drag_fixture();
+
+        let undo = undo_drag(&current, &optimistic, &original)
+            .expect("the row is still what this drag wrote, so it must be put back");
+
+        assert_eq!(undo.start, original.start);
+        assert_eq!(undo.end, original.end);
+    }
+
+    #[test]
+    fn a_failed_drag_leaves_a_newer_move_alone() {
+        // The user dragged the same event again and that move stuck. This
+        // drag's stale failure must not restore the state from before both.
+        let (original, optimistic, _) = drag_fixture();
+        let newer = test_event(local_at(2026, 7, 9, 15), local_at(2026, 7, 9, 16), false);
+
+        assert!(undo_drag(&newer, &optimistic, &original).is_none());
+    }
+
+    #[test]
+    fn undoing_a_drag_keeps_edits_made_to_the_rest_of_the_event() {
+        // Only the times are this drag's to put back; a title typed in the
+        // meantime belongs to whoever typed it.
+        let (original, optimistic, mut current) = drag_fixture();
+        current.title = "Renamed".to_string();
+
+        let undo = undo_drag(&current, &optimistic, &original).expect("the times are untouched");
+
+        assert_eq!(undo.title, "Renamed");
+        assert_eq!(undo.start, original.start);
     }
 
     #[test]
