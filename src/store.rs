@@ -102,6 +102,25 @@ pub struct Account {
     pub server_url: Option<String>,
 }
 
+impl Account {
+    /// How to name this account to the user. Appends the provider's own id only
+    /// when it says something the display name doesn't. Google names an account
+    /// after its primary calendar, whose summary is normally the same address as
+    /// its id, and CalDAV names one "<username> (<host>)" around the id, so in
+    /// both cases the parenthetical would only repeat what's already there.
+    pub fn label(&self) -> String {
+        let name = self.display_name.trim();
+        let id = self.provider_account_id.trim();
+        if name.is_empty() {
+            return id.to_string();
+        }
+        if id.is_empty() || name.to_lowercase().contains(&id.to_lowercase()) {
+            return name.to_string();
+        }
+        format!("{name} ({id})")
+    }
+}
+
 #[derive(Clone)]
 pub struct Calendar {
     pub id: i64,
@@ -1087,6 +1106,56 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
         }
+    }
+
+    fn test_account(display_name: &str, provider_account_id: &str) -> Account {
+        Account {
+            id: 1,
+            provider: "google".to_string(),
+            provider_account_id: provider_account_id.to_string(),
+            display_name: display_name.to_string(),
+            token_key: "token:test".to_string(),
+            server_url: None,
+        }
+    }
+
+    #[test]
+    fn an_accounts_label_drops_the_provider_id_when_it_repeats_the_name() {
+        // Google names an account after its primary calendar, whose summary is
+        // usually the address that is also its id — "a@b.com (a@b.com)" tells
+        // the user nothing twice.
+        let account = test_account("ian@example.com", "ian@example.com");
+        assert_eq!(account.label(), "ian@example.com");
+    }
+
+    #[test]
+    fn an_accounts_label_keeps_a_provider_id_that_adds_information() {
+        let account = test_account("Work", "work-calendar@group.calendar.google.com");
+        assert_eq!(
+            account.label(),
+            "Work (work-calendar@group.calendar.google.com)"
+        );
+    }
+
+    #[test]
+    fn an_accounts_label_ignores_case_and_padding_when_comparing() {
+        let account = test_account(" Ian@Example.com ", "ian@example.com");
+        assert_eq!(account.label(), "Ian@Example.com");
+    }
+
+    #[test]
+    fn an_accounts_label_does_not_repeat_a_provider_id_the_name_already_contains() {
+        // CalDAV accounts are named "<username> (<host>)", and the username is
+        // the provider id — appending it again would read "ian (example.com) (ian)".
+        let mut account = test_account("ian (example.com)", "ian");
+        account.provider = "caldav".to_string();
+        assert_eq!(account.label(), "ian (example.com)");
+    }
+
+    #[test]
+    fn an_accounts_label_falls_back_to_the_provider_id_when_unnamed() {
+        let account = test_account("", "ian@example.com");
+        assert_eq!(account.label(), "ian@example.com");
     }
 
     #[test]

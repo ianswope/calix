@@ -2247,12 +2247,7 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             for account in accounts {
                 let token = google::oauth::get_access_token(&google_config, &account.token_key)
                     .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "missing saved token for {} ({})",
-                            account.display_name, account.provider_account_id
-                        )
-                    })?;
+                    .ok_or_else(|| format!("missing saved token for {}", account.label()))?;
                 outcome.merge(google::sync::sync_account(&token, &store, account.id)?);
             }
 
