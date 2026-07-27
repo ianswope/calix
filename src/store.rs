@@ -721,11 +721,7 @@ impl Store {
             return Ok(());
         }
 
-        let placeholders = keep_google_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(keep_google_ids.len());
         let sql = format!(
             "DELETE FROM events
              WHERE calendar_id = ? AND google_event_id IS NOT NULL
@@ -740,42 +736,52 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes cached CalDAV events in the sync window that the server no
+    /// longer lists.
+    ///
+    /// `keep_icloud_ids` are the ids read back in full. `keep_resource_hrefs`
+    /// are resources the sync couldn't read completely: every cached event
+    /// under one of those survives, whatever its `href#instance` id, because
+    /// the sync can't name the instance that went missing.
     pub fn prune_caldav_events(
         &self,
         calendar_id: i64,
         keep_icloud_ids: &[String],
+        keep_resource_hrefs: &[String],
         range_start: DateTime<Local>,
         range_end: DateTime<Local>,
     ) -> rusqlite::Result<()> {
-        if keep_icloud_ids.is_empty() {
-            self.conn.execute(
-                "DELETE FROM events
-                 WHERE calendar_id = ?1 AND icloud_event_id IS NOT NULL
-                   AND start_at < ?2 AND end_at > ?3",
-                params![
-                    calendar_id,
-                    stored_timestamp(&range_end),
-                    stored_timestamp(&range_start)
-                ],
-            )?;
-            return Ok(());
-        }
-
-        let placeholders = keep_icloud_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
+        let mut sql = String::from(
             "DELETE FROM events
              WHERE calendar_id = ? AND icloud_event_id IS NOT NULL
-               AND start_at < ? AND end_at > ?
-               AND icloud_event_id NOT IN ({placeholders})"
+               AND start_at < ? AND end_at > ?",
         );
         let range_end = stored_timestamp(&range_end);
         let range_start = stored_timestamp(&range_start);
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id, &range_end, &range_start];
-        params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+
+        if !keep_icloud_ids.is_empty() {
+            sql.push_str(&format!(
+                " AND icloud_event_id NOT IN ({})",
+                placeholders(keep_icloud_ids.len())
+            ));
+            params.extend(keep_icloud_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+        }
+        if !keep_resource_hrefs.is_empty() {
+            // The resource href is the id up to its first '#'; appending one
+            // makes instr() find a separator even for a plain, un-suffixed id.
+            sql.push_str(&format!(
+                " AND substr(icloud_event_id, 1, instr(icloud_event_id || '#', '#') - 1) \
+                  NOT IN ({})",
+                placeholders(keep_resource_hrefs.len())
+            ));
+            params.extend(
+                keep_resource_hrefs
+                    .iter()
+                    .map(|href| href as &dyn rusqlite::ToSql),
+            );
+        }
+
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
     }
@@ -802,11 +808,7 @@ impl Store {
             return Ok(());
         }
 
-        let placeholders = keep_icloud_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(keep_icloud_ids.len());
         let event_sql = format!(
             "DELETE FROM events
              WHERE calendar_id IN (
@@ -853,11 +855,7 @@ impl Store {
             return Ok(());
         }
 
-        let placeholders = keep_google_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = placeholders(keep_google_ids.len());
         let event_sql = format!(
             "DELETE FROM events
              WHERE calendar_id IN (
@@ -1030,6 +1028,12 @@ fn parse_rfc3339(s: &str) -> DateTime<Local> {
     DateTime::parse_from_rfc3339(s)
         .expect("dates stored by this app are always valid RFC3339")
         .with_timezone(&Local)
+}
+
+/// A comma-separated run of `n` SQL parameter placeholders, for the `IN (…)`
+/// clauses whose length is only known at runtime.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
 /// Serializes an instant for storage: UTC, whole seconds, `Z` suffix. The
@@ -2084,6 +2088,101 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "Local one");
         assert!(events[0].google_event_id.is_none());
+    }
+
+    #[test]
+    fn pruning_spares_every_instance_under_a_resource_that_could_not_be_read() {
+        // The sync couldn't read one instance of series.ics, so it can't say
+        // which of the cached instances the server dropped — all of them stay.
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account("person@example.com", "person@example.com", "token")
+            .unwrap();
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+        for id in [
+            "/calendars/work/series.ics#20260709T183000Z",
+            "/calendars/work/series.ics#20260716T183000Z",
+            "/calendars/work/gone.ics",
+        ] {
+            store
+                .upsert_caldav_event(calendar_id, id, &draft("Series", start, end), &[])
+                .unwrap();
+        }
+
+        store
+            .prune_caldav_events(
+                calendar_id,
+                &[],
+                &["/calendars/work/series.ics".to_string()],
+                start - Duration::minutes(1),
+                end + Duration::minutes(1),
+            )
+            .unwrap();
+
+        let mut ids = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.icloud_event_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "/calendars/work/series.ics#20260709T183000Z".to_string(),
+                "/calendars/work/series.ics#20260716T183000Z".to_string(),
+            ],
+            "the protected resource's instances stay; the absent one goes"
+        );
+    }
+
+    #[test]
+    fn pruning_still_removes_an_event_the_server_no_longer_lists() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account("person@example.com", "person@example.com", "token")
+            .unwrap();
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/calendars/work/kept.ics",
+                &draft("Kept", start, end),
+                &[],
+            )
+            .unwrap();
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/calendars/work/gone.ics",
+                &draft("Gone", start, end),
+                &[],
+            )
+            .unwrap();
+
+        store
+            .prune_caldav_events(
+                calendar_id,
+                &["/calendars/work/kept.ics".to_string()],
+                &[],
+                start - Duration::minutes(1),
+                end + Duration::minutes(1),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Kept");
     }
 
     #[test]

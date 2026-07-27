@@ -139,8 +139,8 @@ pub fn sync_account(
             )
             .map_err(|e| e.to_string())?;
 
-        let events = match calendar_events(credentials, &calendar.href, time_min, time_max) {
-            Ok(events) => events,
+        let synced = match calendar_events(credentials, &calendar.href, time_min, time_max) {
+            Ok(synced) => synced,
             Err(error) => {
                 eprintln!(
                     "calix: failed to sync CalDAV calendar {} ({}): {}",
@@ -150,8 +150,14 @@ pub fn sync_account(
                 continue;
             }
         };
-        let mut synced_ids = Vec::with_capacity(events.len());
-        for event in events {
+        for href in &synced.unreadable {
+            eprintln!(
+                "calix: keeping cached CalDAV events under {href} on {} — unreadable start/end",
+                calendar.name
+            );
+        }
+        let mut synced_ids = Vec::with_capacity(synced.events.len());
+        for event in synced.events {
             store
                 .upsert_caldav_event(
                     local_calendar_id,
@@ -162,8 +168,22 @@ pub fn sync_account(
                 .map_err(|e| e.to_string())?;
             synced_ids.push(event.href);
         }
+        if !synced.prunable {
+            eprintln!(
+                "calix: not pruning {} — the server sent a response with no href",
+                calendar.name
+            );
+            outcome.record_failure(calendar.name.clone());
+            continue;
+        }
         store
-            .prune_caldav_events(local_calendar_id, &synced_ids, time_min, time_max)
+            .prune_caldav_events(
+                local_calendar_id,
+                &synced_ids,
+                &synced.unreadable,
+                time_min,
+                time_max,
+            )
             .map_err(|e| e.to_string())?;
         outcome.record_success();
     }
@@ -171,12 +191,32 @@ pub fn sync_account(
     Ok(outcome)
 }
 
+/// One calendar-query's worth of events, split into what is safe to write and
+/// what must not be deleted.
+///
+/// An event the parser can't read is still an event the server has. Deriving
+/// the prune list from the parsed events alone deletes it from the cache — and
+/// permanently, since the next sync won't parse it either — so the resources
+/// the server accounted for are tracked apart from the events we can store.
+pub struct CalendarSync {
+    /// Events read in full — safe to upsert.
+    pub events: Vec<RemoteEvent>,
+    /// Resource hrefs the server returned but that we could not read in full.
+    /// Every cached event under one of these survives pruning, whatever its
+    /// instance id.
+    pub unreadable: Vec<String>,
+    /// False when some response could not be attributed to an href at all,
+    /// which leaves us unable to say what the server still holds. The caller
+    /// must then skip pruning rather than guess.
+    pub prunable: bool,
+}
+
 pub fn calendar_events(
     credentials: &Credentials,
     calendar_href: &str,
     start: DateTime<Local>,
     end: DateTime<Local>,
-) -> Result<Vec<RemoteEvent>, String> {
+) -> Result<CalendarSync, String> {
     let body = format!(
         r#"<?xml version="1.0" encoding="utf-8" ?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -208,15 +248,37 @@ pub fn calendar_events(
         body,
     )?;
 
-    Ok(multistatus_responses(&response)
-        .into_iter()
-        .flat_map(|response| {
-            let href = child_text(&response, "href")?;
-            let ics = child_text(&response, "calendar-data")?;
-            Some(parse_events(&href, &ics))
-        })
-        .flatten()
-        .collect())
+    Ok(reconcile_calendar_query(&response))
+}
+
+/// Splits a multistatus calendar-query response into the events to upsert and
+/// the resources that must survive pruning.
+fn reconcile_calendar_query(xml: &str) -> CalendarSync {
+    let mut events = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut prunable = true;
+    for response in multistatus_responses(xml) {
+        let Some(href) = child_text(&response, "href") else {
+            // Nothing ties this response to a resource, so the server's list of
+            // what it still holds is incomplete in a way we can't localize.
+            prunable = false;
+            continue;
+        };
+        let Some(ics) = child_text(&response, "calendar-data") else {
+            unreadable.push(href);
+            continue;
+        };
+        let (parsed, complete) = parse_resource(&href, &ics);
+        if !complete {
+            unreadable.push(href);
+        }
+        events.extend(parsed);
+    }
+    CalendarSync {
+        events,
+        unreadable,
+        prunable,
+    }
 }
 
 pub fn update_event(
@@ -660,13 +722,21 @@ fn xml_unescape(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
-fn parse_events(href: &str, ics: &str) -> Vec<RemoteEvent> {
+/// Parses every `VEVENT` in one resource, reporting whether any was dropped.
+///
+/// A dropped instance has to protect its whole resource rather than just
+/// itself: the id a cached instance is stored under is derived from the very
+/// `DTSTART`/`RECURRENCE-ID` that failed to parse, so there is no way to name
+/// the instance that went missing.
+fn parse_resource(href: &str, ics: &str) -> (Vec<RemoteEvent>, bool) {
     let components = ics_event_properties(ics);
     let total = components.len();
-    components
+    let events = components
         .into_iter()
         .filter_map(|component| parse_event(href, component, total))
-        .collect()
+        .collect::<Vec<_>>();
+    let complete = events.len() == total;
+    (events, complete)
 }
 
 fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Option<RemoteEvent> {
@@ -1501,7 +1571,7 @@ ATTENDEE;CN=Ada L;PARTSTAT=DECLINED:mailto:ADA@example.com\r\n\
 BEGIN:VALARM\r\nTRIGGER:-PT10M\r\nATTENDEE:mailto:alarm@example.com\r\nEND:VALARM\r\n\
 END:VEVENT\r\nEND:VCALENDAR\r\n";
 
-        let events = parse_events("/calendars/work/x.ics", ics);
+        let events = parse_resource("/calendars/work/x.ics", ics).0;
         assert_eq!(events.len(), 1);
         let attendees = &events[0].attendees;
         assert_eq!(attendees.len(), 2, "{attendees:?}");
@@ -1539,12 +1609,120 @@ RECURRENCE-ID:20260716T183000Z
 END:VEVENT
 END:VCALENDAR"#;
 
-        let events = parse_events("/99509935/calendars/farren/event.ics", ics);
+        let events = parse_resource("/99509935/calendars/farren/event.ics", ics).0;
 
         assert_eq!(events.len(), 2);
         assert_ne!(events[0].href, events[1].href);
         assert!(events[0].href.contains("20260709T183000Z"));
         assert!(events[1].href.contains("20260716T183000Z"));
+    }
+
+    /// A multistatus body holding one response per `(href, ics)` pair.
+    fn multistatus(resources: &[(&str, &str)]) -> String {
+        let responses = resources
+            .iter()
+            .map(|(href, ics)| {
+                format!(
+                    "<D:response><D:href>{href}</D:href><D:propstat><D:prop>\
+                     <C:calendar-data>{}</C:calendar-data>\
+                     </D:prop></D:propstat></D:response>",
+                    ics.replace('&', "&amp;").replace('<', "&lt;")
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">{responses}</D:multistatus>"
+        )
+    }
+
+    fn readable_ics(uid: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Readable\r\n\
+             DTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\n\
+             END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    /// A `VEVENT` whose `DTSTART` the parser cannot read.
+    fn unreadable_ics(uid: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:Unreadable\r\n\
+             DTSTART;VALUE=PERIOD:nonsense\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    }
+
+    #[test]
+    fn an_unreadable_resource_is_still_reported_as_present_on_the_server() {
+        // Pruning derived from the parsed events alone would delete this event
+        // from the cache, and every later sync would delete it again.
+        let xml = multistatus(&[
+            ("/calendars/work/good.ics", &readable_ics("good")),
+            ("/calendars/work/bad.ics", &unreadable_ics("bad")),
+        ]);
+
+        let synced = reconcile_calendar_query(&xml);
+
+        assert_eq!(
+            synced.events.iter().map(|e| &e.href).collect::<Vec<_>>(),
+            vec!["/calendars/work/good.ics"]
+        );
+        assert_eq!(synced.unreadable, vec!["/calendars/work/bad.ics"]);
+        assert!(synced.prunable);
+    }
+
+    #[test]
+    fn one_unreadable_instance_protects_every_instance_of_its_resource() {
+        // The id of a cached instance comes from the DTSTART that just failed
+        // to parse, so the whole resource has to be spared.
+        let ics = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\nSUMMARY:Series\r\nDTSTART:20260709T183000Z\r\nDTEND:20260709T193000Z\r\n\
+RECURRENCE-ID:20260709T183000Z\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nSUMMARY:Series\r\nDTSTART;VALUE=PERIOD:nonsense\r\n\
+RECURRENCE-ID:20260716T183000Z\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let xml = multistatus(&[("/calendars/work/series.ics", ics)]);
+
+        let synced = reconcile_calendar_query(&xml);
+
+        assert_eq!(synced.events.len(), 1);
+        assert_eq!(synced.unreadable, vec!["/calendars/work/series.ics"]);
+    }
+
+    #[test]
+    fn a_fully_read_resource_needs_no_protection() {
+        let xml = multistatus(&[("/calendars/work/good.ics", &readable_ics("good"))]);
+
+        let synced = reconcile_calendar_query(&xml);
+
+        assert_eq!(synced.events.len(), 1);
+        assert!(synced.unreadable.is_empty());
+        assert!(synced.prunable);
+    }
+
+    #[test]
+    fn a_resource_the_server_sent_no_calendar_data_for_is_protected() {
+        let xml = "<D:multistatus xmlns:D=\"DAV:\"><D:response>\
+                   <D:href>/calendars/work/opaque.ics</D:href>\
+                   <D:status>HTTP/1.1 403 Forbidden</D:status>\
+                   </D:response></D:multistatus>";
+
+        let synced = reconcile_calendar_query(xml);
+
+        assert!(synced.events.is_empty());
+        assert_eq!(synced.unreadable, vec!["/calendars/work/opaque.ics"]);
+    }
+
+    #[test]
+    fn a_response_without_an_href_makes_the_whole_query_unsafe_to_prune_from() {
+        // Nothing ties this response to a resource, so we cannot say what the
+        // server still has — deleting anything on that basis is a guess.
+        let xml = "<D:multistatus xmlns:D=\"DAV:\"><D:response>\
+                   <D:propstat><D:prop><C:calendar-data/></D:prop></D:propstat>\
+                   </D:response></D:multistatus>";
+
+        let synced = reconcile_calendar_query(xml);
+
+        assert!(!synced.prunable);
     }
 
     #[test]
@@ -1634,7 +1812,7 @@ RECURRENCE-ID;TZID=America/New_York:20260716T090000
 END:VEVENT
 END:VCALENDAR"#;
 
-        let events = parse_events("/cal/standup.ics", ics);
+        let events = parse_resource("/cal/standup.ics", ics).0;
 
         assert_eq!(events.len(), 2);
         assert_eq!(
@@ -1864,7 +2042,7 @@ END:VCALENDAR"#;
     fn nested_alarm_description_does_not_overwrite_the_event_description() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:evt-1\r\nSUMMARY:Standup\r\nDTSTART:20260110T090000Z\r\nDTEND:20260110T093000Z\r\nDESCRIPTION:Real agenda\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
-        let events = parse_events("/cal/1.ics", ics);
+        let events = parse_resource("/cal/1.ics", ics).0;
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].draft.notes.as_deref(), Some("Real agenda"));
@@ -1901,7 +2079,7 @@ END:VCALENDAR"#;
     fn parses_lowercase_component_and_property_names() {
         let ics = "begin:vcalendar\r\nbegin:vevent\r\nuid:evt-2\r\nsummary:Lunch\r\ndtstart:20260110T120000Z\r\ndtend:20260110T130000Z\r\nend:vevent\r\nend:vcalendar\r\n";
 
-        let events = parse_events("/cal/2.ics", ics);
+        let events = parse_resource("/cal/2.ics", ics).0;
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].draft.title, "Lunch");
