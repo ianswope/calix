@@ -308,9 +308,27 @@ impl Ui {
         // it at position zero. Recenter before GTK can paint that transient
         // page, otherwise the swipe flashes the wrong week for one frame.
         self.carousel.scroll_to(&current_page, false);
+        // Then confirm on the frame clock, for the same reason `reset_with`
+        // does: an idle callback runs even while the compositor sends no
+        // frames, but `scroll_to` in that state silently leaves the carousel
+        // on a neighbour page. Clearing `rebuilding` there let the
+        // `page-changed` emitted once frames resumed be misread as a fresh
+        // swipe, shifting the period a second time.
         let ui = self.clone();
-        glib::idle_add_local_once(move || {
-            ui.rebuilding.set(false);
+        self.carousel.add_tick_callback(move |carousel, _clock| {
+            let attached = current_page.parent().as_ref() == Some(carousel.upcast_ref());
+            match reset_settle_action(attached, carousel.width(), carousel.position()) {
+                SettleAction::Abandon => glib::ControlFlow::Break,
+                SettleAction::Wait => glib::ControlFlow::Continue,
+                SettleAction::Scroll => {
+                    carousel.scroll_to(&current_page, false);
+                    glib::ControlFlow::Continue
+                }
+                SettleAction::Done => {
+                    ui.rebuilding.set(false);
+                    glib::ControlFlow::Break
+                }
+            }
         });
     }
 
