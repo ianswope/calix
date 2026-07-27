@@ -1,5 +1,5 @@
 use crate::google::calendar_api;
-use crate::store::{EventDraft, Store};
+use crate::store::{Attendee, EventDraft, Store};
 use crate::sync::SyncOutcome;
 use chrono::{Duration, Local};
 
@@ -80,9 +80,14 @@ pub fn sync_account(
                 calendar.summary
             );
         }
-        for (event_id, draft) in &reconciliation.upserts {
+        for pending in &reconciliation.upserts {
             store
-                .upsert_google_event(local_calendar_id, event_id, draft)
+                .upsert_google_event(
+                    local_calendar_id,
+                    pending.event_id,
+                    &pending.draft,
+                    &pending.attendees,
+                )
                 .map_err(|e| e.to_string())?;
         }
         store
@@ -100,9 +105,18 @@ pub fn sync_account(
 }
 
 struct Reconciliation<'a> {
-    upserts: Vec<(&'a str, EventDraft)>,
+    upserts: Vec<PendingUpsert<'a>>,
     keep_ids: Vec<String>,
     skipped: Vec<&'a str>,
+}
+
+/// One event ready to write: its Google id, the draft, and the invitee list.
+/// Attendees ride alongside the draft rather than inside it, so the local edit
+/// path (which builds drafts by hand) can't blank them.
+struct PendingUpsert<'a> {
+    event_id: &'a str,
+    draft: EventDraft,
+    attendees: Vec<Attendee>,
 }
 
 /// Splits fetched events into the drafts to upsert and the full set of ids to
@@ -116,7 +130,11 @@ fn reconcile_events(events: &[calendar_api::EventItem]) -> Reconciliation<'_> {
     for event in events {
         keep_ids.push(event.id.clone());
         match event_draft(event) {
-            Some(draft) => upserts.push((event.id.as_str(), draft)),
+            Some(draft) => upserts.push(PendingUpsert {
+                event_id: event.id.as_str(),
+                draft,
+                attendees: event.invitees(),
+            }),
             None => skipped.push(event.id.as_str()),
         }
     }
@@ -205,6 +223,7 @@ mod tests {
             status: String::new(),
             event_type: String::new(),
             conference_data: None,
+            attendees: Vec::new(),
             start,
             end,
         }
@@ -227,7 +246,7 @@ mod tests {
         assert!(reconciliation.keep_ids.contains(&"good".to_string()));
         assert!(reconciliation.keep_ids.contains(&"bad".to_string()));
         assert_eq!(reconciliation.upserts.len(), 1);
-        assert_eq!(reconciliation.upserts[0].0, "good");
+        assert_eq!(reconciliation.upserts[0].event_id, "good");
         assert_eq!(reconciliation.skipped, vec!["bad"]);
     }
 

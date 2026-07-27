@@ -1,3 +1,4 @@
+use crate::store::Attendee;
 use chrono::Datelike;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use oauth2::reqwest;
@@ -71,8 +72,38 @@ pub struct EventItem {
     pub event_type: String,
     #[serde(rename = "conferenceData")]
     pub conference_data: Option<ConferenceData>,
+    #[serde(default)]
+    pub attendees: Vec<EventAttendee>,
     pub start: EventDateTime,
     pub end: EventDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventAttendee {
+    /// Absent for resources like meeting rooms that Google identifies only by
+    /// `displayName`; those are skipped rather than listed without an address.
+    pub email: Option<String>,
+    #[serde(rename = "displayName")]
+    pub display_name: Option<String>,
+    #[serde(rename = "responseStatus")]
+    pub response_status: Option<String>,
+    /// Meeting rooms and equipment, which aren't people and don't belong in an
+    /// invitee list.
+    #[serde(default)]
+    pub resource: bool,
+}
+
+/// Maps Google's `responseStatus` onto the vocabulary [`Attendee`] stores, so
+/// the UI renders one set of words for both providers. `needsAction` becomes
+/// `pending`; anything unrecognized is dropped rather than shown raw.
+fn normalize_response_status(status: Option<&str>) -> Option<String> {
+    match status? {
+        "accepted" => Some("accepted".to_string()),
+        "declined" => Some("declined".to_string()),
+        "tentative" => Some("tentative".to_string()),
+        "needsAction" => Some("pending".to_string()),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +136,28 @@ pub struct ConferenceEntryPoint {
 impl EventItem {
     pub fn is_displayable_calendar_event(&self) -> bool {
         self.event_type.is_empty() || self.event_type == "default"
+    }
+
+    /// The event's human invitees, normalized for storage. Resources (rooms,
+    /// equipment) and entries without an address are dropped.
+    pub fn invitees(&self) -> Vec<Attendee> {
+        self.attendees
+            .iter()
+            .filter(|attendee| !attendee.resource)
+            .filter_map(|attendee| {
+                let email = attendee.email.as_deref()?.trim();
+                (!email.is_empty()).then(|| Attendee {
+                    email: email.to_string(),
+                    name: attendee
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned),
+                    status: normalize_response_status(attendee.response_status.as_deref()),
+                })
+            })
+            .collect()
     }
 }
 
@@ -378,6 +431,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn invitees_normalize_statuses_and_drop_non_people() {
+        // Deserializing real API-shaped JSON also covers the serde renames.
+        let event: EventItem = serde_json::from_str(
+            r#"{
+                "id": "evt-1",
+                "status": "confirmed",
+                "attendees": [
+                    {"email": "ada@example.com", "displayName": "Ada Lovelace",
+                     "responseStatus": "accepted"},
+                    {"email": "bob@example.com", "responseStatus": "needsAction"},
+                    {"email": "carol@example.com", "responseStatus": "wat"},
+                    {"email": "room-a@resource.calendar.google.com",
+                     "displayName": "Room A", "resource": true,
+                     "responseStatus": "accepted"},
+                    {"displayName": "No Address", "responseStatus": "accepted"}
+                ],
+                "start": {"dateTime": "2026-07-09T10:00:00-05:00"},
+                "end": {"dateTime": "2026-07-09T11:00:00-05:00"}
+            }"#,
+        )
+        .expect("event JSON deserializes");
+
+        let invitees = event.invitees();
+        assert_eq!(invitees.len(), 3, "{invitees:?}");
+        assert_eq!(invitees[0].email, "ada@example.com");
+        assert_eq!(invitees[0].name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(invitees[0].status.as_deref(), Some("accepted"));
+        // needsAction is Google's wording for "hasn't replied".
+        assert_eq!(invitees[1].status.as_deref(), Some("pending"));
+        // An unrecognized status is dropped rather than surfaced raw.
+        assert_eq!(invitees[2].status, None);
+    }
+
+    #[test]
+    fn events_without_an_attendees_field_have_no_invitees() {
+        let event: EventItem = serde_json::from_str(
+            r#"{
+                "id": "evt-2",
+                "status": "confirmed",
+                "start": {"date": "2026-07-09"},
+                "end": {"date": "2026-07-10"}
+            }"#,
+        )
+        .expect("event JSON deserializes");
+        assert!(event.invitees().is_empty());
+    }
+
+    #[test]
     fn google_event_type_filter_skips_working_location_events() {
         let event = EventItem {
             id: "evt-1".to_string(),
@@ -392,6 +493,7 @@ mod tests {
                 time_zone: None,
             },
             conference_data: None,
+            attendees: Vec::new(),
             end: EventDateTime {
                 date: Some("2026-07-10".to_string()),
                 date_time: None,
@@ -422,6 +524,7 @@ mod tests {
                 time_zone: None,
             },
             conference_data: None,
+            attendees: Vec::new(),
         };
 
         assert!(event.is_displayable_calendar_event());

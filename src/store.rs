@@ -1,7 +1,34 @@
 use crate::recurrence::Frequency;
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+/// Someone invited to an event. Attendee lists are read-only here: they come
+/// from the remote provider, so they live outside [`EventDraft`] and a local
+/// edit leaves them untouched.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Attendee {
+    pub email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Invitation response, normalized across providers to one of `accepted`,
+    /// `declined`, `tentative`, or `pending`. `None` when the provider didn't
+    /// say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl Attendee {
+    /// The name to show, falling back to the email when the provider sent no
+    /// display name.
+    pub fn label(&self) -> &str {
+        match self.name.as_deref() {
+            Some(name) if !name.trim().is_empty() => name,
+            _ => &self.email,
+        }
+    }
+}
 
 /// The first instant of `date` in the local timezone, for turning a
 /// `NaiveDate` range (as used by the calendar grids) into the `DateTime` range
@@ -41,6 +68,9 @@ pub struct Event {
     /// alert. Local to this machine — never pushed to Google/CalDAV, and the
     /// sync upserts leave it alone so it survives re-syncs.
     pub reminder_minutes: Option<i64>,
+    /// Everyone invited, as last seen on the provider. Empty for local events
+    /// and for remote events with no invitees.
+    pub attendees: Vec<Attendee>,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -175,6 +205,9 @@ impl Store {
         // Base URL for a generic CalDAV account's server; NULL for google and
         // icloud (iCloud uses a fixed well-known root).
         ensure_column(&conn, "accounts", "server_url", "TEXT")?;
+        // JSON array of `Attendee`, written only by sync. `update_event` never
+        // touches it, so editing an event locally keeps the provider's list.
+        ensure_column(&conn, "events", "attendees", "TEXT")?;
 
         conn.execute_batch(
             "
@@ -555,12 +588,13 @@ impl Store {
         calendar_id: i64,
         google_event_id: &str,
         draft: &EventDraft,
+        attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id, attendees)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(calendar_id, google_event_id) WHERE google_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7",
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
             params![
                 calendar_id,
                 draft.title,
@@ -570,6 +604,7 @@ impl Store {
                 draft.location,
                 draft.notes,
                 google_event_id,
+                attendees_to_json(attendees),
             ],
         )?;
         Ok(())
@@ -580,12 +615,13 @@ impl Store {
         calendar_id: i64,
         icloud_event_id: &str,
         draft: &EventDraft,
+        attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id, attendees)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7",
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
             params![
                 calendar_id,
                 draft.title,
@@ -595,6 +631,7 @@ impl Store {
                 draft.location,
                 draft.notes,
                 icloud_event_id,
+                attendees_to_json(attendees),
             ],
         )?;
         Ok(())
@@ -823,7 +860,8 @@ const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name
             events.title, events.start_at,
             events.end_at, events.all_day, events.location, events.notes,
             events.google_event_id, events.icloud_event_id,
-            accounts.server_url, events.recurrence, events.reminder_minutes
+            accounts.server_url, events.recurrence, events.reminder_minutes,
+            events.attendees
      FROM events
      JOIN calendars ON calendars.id = events.calendar_id
      LEFT JOIN accounts ON accounts.id = calendars.account_id";
@@ -886,7 +924,24 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
             .as_deref()
             .and_then(Frequency::from_rrule),
         reminder_minutes: row.get(18)?,
+        attendees: attendees_from_json(row.get(19)?),
     })
+}
+
+/// Serializes an attendee list for storage. An empty list is stored as SQL NULL
+/// rather than `"[]"`, so purely local events keep a NULL column.
+fn attendees_to_json(attendees: &[Attendee]) -> Option<String> {
+    (!attendees.is_empty()).then(|| {
+        serde_json::to_string(attendees)
+            .expect("attendee lists are plain strings and always encode")
+    })
+}
+
+/// Parses a stored attendee list. Anything unreadable degrades to an empty
+/// list — a malformed column shouldn't stop the event itself from loading.
+fn attendees_from_json(raw: Option<String>) -> Vec<Attendee> {
+    raw.and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 fn row_to_calendar(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
@@ -980,6 +1035,67 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
         }
+    }
+
+    #[test]
+    fn synced_attendees_round_trip_and_survive_a_local_edit() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account(
+                "person@example.com",
+                "person@example.com",
+                "google-refresh-token:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+        let invitees = vec![
+            Attendee {
+                email: "ada@example.com".to_string(),
+                name: Some("Ada Lovelace".to_string()),
+                status: Some("accepted".to_string()),
+            },
+            Attendee {
+                email: "bob@example.com".to_string(),
+                name: None,
+                status: None,
+            },
+        ];
+
+        store
+            .upsert_google_event(calendar_id, "evt-1", &draft("Sync", start, end), &invitees)
+            .unwrap();
+
+        let window = (start - Duration::minutes(1), end + Duration::minutes(1));
+        let events = store.events_between(window.0, window.1).unwrap();
+        assert_eq!(events[0].attendees, invitees);
+
+        // A local edit goes through `update_event`, which never touches the
+        // attendees column — the provider's invitee list must survive it.
+        store
+            .update_event(events[0].id, &draft("Sync (renamed)", start, end))
+            .unwrap();
+        let events = store.events_between(window.0, window.1).unwrap();
+        assert_eq!(events[0].title, "Sync (renamed)");
+        assert_eq!(events[0].attendees, invitees);
+    }
+
+    #[test]
+    fn events_without_attendees_read_back_as_an_empty_list() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+        store
+            .create_event(store.default_calendar_id(), &draft("Solo", start, end))
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap();
+        assert!(events[0].attendees.is_empty());
     }
 
     #[test]
@@ -1385,10 +1501,15 @@ mod tests {
         let end = start + Duration::hours(1);
 
         store
-            .upsert_google_event(calendar_id, "evt-1", &draft("Standup", start, end))
+            .upsert_google_event(calendar_id, "evt-1", &draft("Standup", start, end), &[])
             .unwrap();
         store
-            .upsert_google_event(calendar_id, "evt-1", &draft("Standup (moved)", start, end))
+            .upsert_google_event(
+                calendar_id,
+                "evt-1",
+                &draft("Standup (moved)", start, end),
+                &[],
+            )
             .unwrap();
 
         let events = store
@@ -1422,6 +1543,7 @@ mod tests {
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch", start, end),
+                &[],
             )
             .unwrap();
         store
@@ -1429,6 +1551,7 @@ mod tests {
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch (moved)", start, end),
+                &[],
             )
             .unwrap();
 
@@ -1486,6 +1609,7 @@ mod tests {
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch", start, end),
+                &[],
             )
             .unwrap();
 
@@ -1503,6 +1627,7 @@ mod tests {
                 calendar_id,
                 "/calendars/work/evt-1.ics",
                 &draft("Lunch (moved)", start, end),
+                &[],
             )
             .unwrap();
 
@@ -1573,6 +1698,7 @@ mod tests {
                 calendar_id,
                 "/dav/calendars/me/work/evt.ics",
                 &draft("Standup", start, end),
+                &[],
             )
             .unwrap();
 
@@ -1668,6 +1794,7 @@ mod tests {
                 work_calendar_id,
                 "shared-id",
                 &draft("Work event", start, end),
+                &[],
             )
             .unwrap();
         store
@@ -1675,6 +1802,7 @@ mod tests {
                 home_calendar_id,
                 "shared-id",
                 &draft("Home event", start, end),
+                &[],
             )
             .unwrap();
 
@@ -1704,10 +1832,10 @@ mod tests {
         let end = start + Duration::hours(1);
 
         store
-            .upsert_google_event(calendar_id, "keep", &draft("Keep", start, end))
+            .upsert_google_event(calendar_id, "keep", &draft("Keep", start, end), &[])
             .unwrap();
         store
-            .upsert_google_event(calendar_id, "gone", &draft("Gone", start, end))
+            .upsert_google_event(calendar_id, "gone", &draft("Gone", start, end), &[])
             .unwrap();
         store
             .create_event(calendar_id, &draft("Local one", start, end))
@@ -1748,10 +1876,10 @@ mod tests {
         let end = start + Duration::hours(1);
 
         store
-            .upsert_google_event(calendar_id, "gone-1", &draft("Gone 1", start, end))
+            .upsert_google_event(calendar_id, "gone-1", &draft("Gone 1", start, end), &[])
             .unwrap();
         store
-            .upsert_google_event(calendar_id, "gone-2", &draft("Gone 2", start, end))
+            .upsert_google_event(calendar_id, "gone-2", &draft("Gone 2", start, end), &[])
             .unwrap();
         store
             .create_event(calendar_id, &draft("Local one", start, end))
@@ -1791,6 +1919,7 @@ mod tests {
                 calendar_id,
                 "old-event",
                 &draft("Old", old_start, old_start + Duration::hours(1)),
+                &[],
             )
             .unwrap();
         store
@@ -1798,6 +1927,7 @@ mod tests {
                 calendar_id,
                 "stale-current-event",
                 &draft("Stale", now, now + Duration::hours(1)),
+                &[],
             )
             .unwrap();
 

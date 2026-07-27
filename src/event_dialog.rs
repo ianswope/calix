@@ -450,10 +450,14 @@ pub fn open(
     content.set_margin_bottom(18);
     content.set_margin_start(18);
     content.set_margin_end(18);
-    // Meeting links go first, so they're in view the moment the event opens
-    // instead of being pushed below the fields (and off the bottom).
+    // Meeting links and invitees go first, so they're in view the moment the
+    // event opens instead of being pushed below the fields (and off the
+    // bottom). Both are read-only provider data rather than editable fields.
     if let Some(links_group) = editing.as_ref().and_then(meeting_links_group) {
         content.append(&links_group);
+    }
+    if let Some(invitees_group) = editing.as_ref().and_then(attendees_group) {
+        content.append(&invitees_group);
     }
     content.append(&group);
     content.append(&error_label);
@@ -676,10 +680,12 @@ pub fn open(
                                 }
                             },
                             Ok(Ok(Some((is_google, remote_id)))) => {
+                                // A just-created event has no invitees — Calix
+                                // has no flow for sending invites.
                                 let result = if is_google {
-                                    store.upsert_google_event(target.calendar_id(), &remote_id, &draft)
+                                    store.upsert_google_event(target.calendar_id(), &remote_id, &draft, &[])
                                 } else {
-                                    store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft)
+                                    store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
                                 };
                                 match result {
                                     Ok(()) => {
@@ -928,6 +934,47 @@ fn meeting_links_group(event: &Event) -> Option<adw::PreferencesGroup> {
         group.add(&button);
     }
     Some(group)
+}
+
+/// An "Invitees" group listing everyone on the event, or `None` when it has no
+/// attendees. Read-only: attendee lists come from the provider and Calix has no
+/// invite-editing flow.
+fn attendees_group(event: &Event) -> Option<adw::PreferencesGroup> {
+    if event.attendees.is_empty() {
+        return None;
+    }
+    let group = adw::PreferencesGroup::builder()
+        .title(format!("Invitees ({})", event.attendees.len()))
+        .build();
+    for attendee in &event.attendees {
+        let row = adw::ActionRow::builder()
+            .title(gtk::glib::markup_escape_text(attendee.label()))
+            .build();
+        row.set_title_lines(1);
+        // Only worth a subtitle when it isn't just repeating the title.
+        if attendee.label() != attendee.email {
+            row.set_subtitle(&gtk::glib::markup_escape_text(&attendee.email));
+            row.set_subtitle_lines(1);
+        }
+        if let Some(status) = attendee.status.as_deref().map(attendee_status_label) {
+            let label = gtk::Label::new(Some(status));
+            label.add_css_class("dim-label");
+            row.add_suffix(&label);
+        }
+        group.add(&row);
+    }
+    Some(group)
+}
+
+/// Human-readable form of the normalized response status the syncs store.
+fn attendee_status_label(status: &str) -> &str {
+    match status {
+        "accepted" => "Accepted",
+        "declined" => "Declined",
+        "tentative" => "Maybe",
+        "pending" => "No reply",
+        other => other,
+    }
 }
 
 fn meeting_link_label(link: &str) -> String {

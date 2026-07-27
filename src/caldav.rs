@@ -1,4 +1,4 @@
-use crate::store::{EventDraft, Store};
+use crate::store::{Attendee, EventDraft, Store};
 use crate::sync::SyncOutcome;
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use chrono_tz::Tz;
@@ -30,6 +30,65 @@ pub struct RemoteCalendar {
 pub struct RemoteEvent {
     pub href: String,
     pub draft: EventDraft,
+    pub attendees: Vec<Attendee>,
+}
+
+/// One `VEVENT`. Attendees are kept apart from `props` because `ATTENDEE`
+/// repeats once per invitee, and a single-valued map would keep only the last.
+struct IcsEvent {
+    props: HashMap<String, IcsProperty>,
+    attendees: Vec<Attendee>,
+}
+
+/// Parses one `ATTENDEE` line. The value is a CAL-ADDRESS, in practice always
+/// `mailto:someone@example.com`; entries without a usable address are dropped
+/// rather than listed blank.
+fn parse_ics_attendee(parameters: &str, value: &str) -> Option<Attendee> {
+    let raw = value.trim();
+    let email = match raw.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("mailto:") => &raw[7..],
+        _ => raw,
+    }
+    .trim();
+    if !email.contains('@') {
+        return None;
+    }
+
+    let mut name = None;
+    let mut status = None;
+    // `parameters` still carries the property name, so skip that first segment.
+    for parameter in parameters.split(';').skip(1) {
+        let Some((key, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        let raw_value = raw_value.trim_matches('"').trim();
+        if raw_value.is_empty() {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("CN") {
+            name = Some(raw_value.to_string());
+        } else if key.eq_ignore_ascii_case("PARTSTAT") {
+            status = normalize_partstat(raw_value);
+        }
+    }
+
+    Some(Attendee {
+        email: email.to_string(),
+        name,
+        status,
+    })
+}
+
+/// Maps an iCalendar `PARTSTAT` onto the vocabulary the Google sync also uses,
+/// so the UI renders one set of words. Unknown values are dropped.
+fn normalize_partstat(partstat: &str) -> Option<String> {
+    match partstat.to_ascii_uppercase().as_str() {
+        "ACCEPTED" => Some("accepted".to_string()),
+        "DECLINED" => Some("declined".to_string()),
+        "TENTATIVE" => Some("tentative".to_string()),
+        "NEEDS-ACTION" => Some("pending".to_string()),
+        _ => None,
+    }
 }
 
 pub fn discover_calendars(credentials: &Credentials) -> Result<Vec<RemoteCalendar>, String> {
@@ -94,7 +153,12 @@ pub fn sync_account(
         let mut synced_ids = Vec::with_capacity(events.len());
         for event in events {
             store
-                .upsert_caldav_event(local_calendar_id, &event.href, &event.draft)
+                .upsert_caldav_event(
+                    local_calendar_id,
+                    &event.href,
+                    &event.draft,
+                    &event.attendees,
+                )
                 .map_err(|e| e.to_string())?;
             synced_ids.push(event.href);
         }
@@ -597,19 +661,16 @@ fn xml_unescape(s: &str) -> String {
 }
 
 fn parse_events(href: &str, ics: &str) -> Vec<RemoteEvent> {
-    let event_props = ics_event_properties(ics);
-    let total = event_props.len();
-    event_props
+    let components = ics_event_properties(ics);
+    let total = components.len();
+    components
         .into_iter()
-        .filter_map(|props| parse_event(href, props, total))
+        .filter_map(|component| parse_event(href, component, total))
         .collect()
 }
 
-fn parse_event(
-    href: &str,
-    props: HashMap<String, IcsProperty>,
-    component_count: usize,
-) -> Option<RemoteEvent> {
+fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Option<RemoteEvent> {
+    let IcsEvent { props, attendees } = component;
     let summary = props
         .get("SUMMARY")
         .map(|property| property.value.clone())
@@ -652,6 +713,7 @@ fn parse_event(
             recurrence: None,
             reminder_minutes: None,
         },
+        attendees,
     })
 }
 
@@ -660,9 +722,10 @@ struct IcsProperty {
     tzid: Option<String>,
 }
 
-fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
+fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
     let mut events = Vec::new();
     let mut props = HashMap::new();
+    let mut attendees: Vec<Attendee> = Vec::new();
     let mut in_event = false;
     // Depth of nested components (e.g. VALARM) below the VEVENT. Only the
     // VEVENT's own properties — depth 0 — are the event's; an alarm's
@@ -673,11 +736,15 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
             in_event = true;
             nested_depth = 0;
             props = HashMap::new();
+            attendees = Vec::new();
             continue;
         }
         if is_component_boundary(&line, "END", "VEVENT") {
             if in_event {
-                events.push(std::mem::take(&mut props));
+                events.push(IcsEvent {
+                    props: std::mem::take(&mut props),
+                    attendees: std::mem::take(&mut attendees),
+                });
             }
             in_event = false;
             continue;
@@ -701,6 +768,19 @@ fn ics_event_properties(ics: &str) -> Vec<HashMap<String, IcsProperty>> {
         };
         let mut parts = name.split(';');
         let key = parts.next().unwrap_or(name).to_ascii_uppercase();
+        if key == "ATTENDEE" {
+            if let Some(attendee) = parse_ics_attendee(name, value) {
+                // Servers sometimes repeat an invitee across CUTYPE/ROLE
+                // variants; keep the first mention of each address.
+                if !attendees
+                    .iter()
+                    .any(|existing| existing.email.eq_ignore_ascii_case(&attendee.email))
+                {
+                    attendees.push(attendee);
+                }
+            }
+            continue;
+        }
         let tzid = parts.find_map(|parameter| {
             parameter
                 .split_once('=')
@@ -1405,6 +1485,41 @@ mod tests {
             "https://p42-caldav.icloud.com/99509935/calendars/",
             "/99509935/calendars/"
         ));
+    }
+
+    #[test]
+    fn parse_events_collects_every_attendee_with_name_and_status() {
+        // Covers in one fixture: repeated ATTENDEE lines (which the
+        // single-valued property map would otherwise collapse to the last), a
+        // CN display name, PARTSTAT mapping, an uppercase MAILTO:, a duplicate
+        // address, and an ATTENDEE belonging to a VALARM rather than the event.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nSUMMARY:Sync\r\n\
+DTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\n\
+ATTENDEE;CN=Ada Lovelace;PARTSTAT=ACCEPTED:mailto:ada@example.com\r\n\
+ATTENDEE;PARTSTAT=NEEDS-ACTION:MAILTO:bob@example.com\r\n\
+ATTENDEE;CN=Ada L;PARTSTAT=DECLINED:mailto:ADA@example.com\r\n\
+BEGIN:VALARM\r\nTRIGGER:-PT10M\r\nATTENDEE:mailto:alarm@example.com\r\nEND:VALARM\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let events = parse_events("/calendars/work/x.ics", ics);
+        assert_eq!(events.len(), 1);
+        let attendees = &events[0].attendees;
+        assert_eq!(attendees.len(), 2, "{attendees:?}");
+        assert_eq!(attendees[0].email, "ada@example.com");
+        assert_eq!(attendees[0].name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(attendees[0].status.as_deref(), Some("accepted"));
+        assert_eq!(attendees[1].email, "bob@example.com");
+        assert_eq!(attendees[1].name, None);
+        assert_eq!(attendees[1].status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn attendees_without_a_usable_address_are_dropped() {
+        assert!(parse_ics_attendee("ATTENDEE", "urn:uuid:not-an-address").is_none());
+        assert!(parse_ics_attendee("ATTENDEE", "mailto:").is_none());
+        let bare = parse_ics_attendee("ATTENDEE", "someone@example.com")
+            .expect("a bare address without the mailto: scheme is still usable");
+        assert_eq!(bare.email, "someone@example.com");
     }
 
     #[test]
