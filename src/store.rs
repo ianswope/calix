@@ -91,6 +91,9 @@ pub struct EventDraft {
 #[derive(Clone)]
 pub struct Account {
     pub id: i64,
+    /// `google`, `icloud`, or `caldav` — which sync path and keyring key
+    /// scheme this account uses.
+    pub provider: String,
     pub provider_account_id: String,
     pub display_name: String,
     pub token_key: String,
@@ -357,21 +360,59 @@ impl Store {
 
     fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider_account_id, display_name, token_key, server_url
+            "SELECT id, provider, provider_account_id, display_name, token_key, server_url
              FROM accounts
              WHERE provider = ?1
              ORDER BY display_name",
         )?;
-        let rows = stmt.query_map(params![provider], |row| {
-            Ok(Account {
-                id: row.get(0)?,
-                provider_account_id: row.get(1)?,
-                display_name: row.get(2)?,
-                token_key: row.get(3)?,
-                server_url: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![provider], row_to_account)?;
         rows.collect()
+    }
+
+    /// Every connected account across all providers, for the account-management
+    /// UI. Ordered by provider then display name so the list is stable.
+    pub fn all_accounts(&self) -> rusqlite::Result<Vec<Account>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, provider, provider_account_id, display_name, token_key, server_url
+             FROM accounts
+             ORDER BY provider, display_name",
+        )?;
+        let rows = stmt.query_map([], row_to_account)?;
+        rows.collect()
+    }
+
+    /// Forgets an account and everything cached under it: its events, then its
+    /// calendars, then the row itself, in one transaction so a failure can't
+    /// leave calendars orphaned from their account.
+    ///
+    /// Local only. Nothing is deleted on the provider, and the keyring entry is
+    /// the caller's to remove — see the credential helpers.
+    pub fn delete_account(&self, account_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute("BEGIN", [])?;
+        let result = (|| -> rusqlite::Result<()> {
+            self.conn.execute(
+                "DELETE FROM events WHERE calendar_id IN
+                     (SELECT id FROM calendars WHERE account_id = ?1)",
+                params![account_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM calendars WHERE account_id = ?1",
+                params![account_id],
+            )?;
+            self.conn
+                .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
     }
 
     /// Creates or updates a Google account row. `token_key` names the
@@ -944,6 +985,17 @@ fn attendees_from_json(raw: Option<String>) -> Vec<Attendee> {
         .unwrap_or_default()
 }
 
+fn row_to_account(row: &rusqlite::Row) -> rusqlite::Result<Account> {
+    Ok(Account {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        provider_account_id: row.get(2)?,
+        display_name: row.get(3)?,
+        token_key: row.get(4)?,
+        server_url: row.get(5)?,
+    })
+}
+
 fn row_to_calendar(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
     Ok(Calendar {
         id: row.get(0)?,
@@ -1035,6 +1087,69 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
         }
+    }
+
+    #[test]
+    fn deleting_an_account_removes_only_its_own_calendars_and_events() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local::now();
+        let end = start + Duration::hours(1);
+
+        let doomed = store
+            .upsert_google_account("a@example.com", "a@example.com", "token:a")
+            .unwrap();
+        let doomed_calendar = store
+            .upsert_google_calendar(doomed, "cal-a", "A", "#ff0000", true)
+            .unwrap();
+        store
+            .upsert_google_event(doomed_calendar, "evt-a", &draft("A", start, end), &[])
+            .unwrap();
+
+        let keeper = store
+            .upsert_google_account("b@example.com", "b@example.com", "token:b")
+            .unwrap();
+        let keeper_calendar = store
+            .upsert_google_calendar(keeper, "cal-b", "B", "#00ff00", true)
+            .unwrap();
+        store
+            .upsert_google_event(keeper_calendar, "evt-b", &draft("B", start, end), &[])
+            .unwrap();
+
+        // A purely local event lives on the default calendar, which has no
+        // account at all; disconnecting must not reach it.
+        store
+            .create_event(store.default_calendar_id(), &draft("Local", start, end))
+            .unwrap();
+
+        store.delete_account(doomed).unwrap();
+
+        let remaining: Vec<String> = store
+            .events_between(start - Duration::minutes(1), end + Duration::minutes(1))
+            .unwrap()
+            .into_iter()
+            .map(|event| event.title)
+            .collect();
+        assert!(!remaining.contains(&"A".to_string()), "{remaining:?}");
+        assert!(remaining.contains(&"B".to_string()), "{remaining:?}");
+        assert!(remaining.contains(&"Local".to_string()), "{remaining:?}");
+
+        let accounts = store.all_accounts().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, keeper);
+        assert_eq!(accounts[0].provider, "google");
+    }
+
+    #[test]
+    fn deleting_an_account_twice_is_harmless() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .upsert_google_account("a@example.com", "a@example.com", "token:a")
+            .unwrap();
+        store.delete_account(id).unwrap();
+        // Disconnecting an already-removed account must not error — the UI can
+        // race itself if the dialog is reopened.
+        store.delete_account(id).unwrap();
+        assert!(store.all_accounts().unwrap().is_empty());
     }
 
     #[test]

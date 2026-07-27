@@ -67,6 +67,20 @@ pub fn save_app_password(token_key: &str, app_password: &str) -> Result<(), Cred
         .map_err(CredentialError::Keyring)
 }
 
+/// Removes the saved secret for `token_key` from this machine's keyring.
+/// Already-absent counts as success, so disconnecting an account whose
+/// credential was lost still succeeds.
+///
+/// Local only: this does not revoke anything with the provider. An
+/// app-specific password stays valid at Apple until revoked there, which is
+/// deliberate — a stale one costs nothing, and revoking is irreversible.
+pub fn delete_password(token_key: &str) -> Result<(), CredentialError> {
+    match keyring_entry(token_key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CredentialError::Keyring(e)),
+    }
+}
+
 pub fn app_password(token_key: &str) -> Result<Option<String>, CredentialError> {
     match keyring_entry(token_key)?.get_password() {
         Ok(password) => Ok(Some(password)),

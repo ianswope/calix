@@ -809,6 +809,18 @@ pub fn build(app: &adw::Application) {
         move |_| open_caldav_account_dialog(&ui, &caldav_add_button, &caldav_sync_button)
     ));
 
+    let manage_accounts_button = gtk::Button::builder()
+        .label("Manage")
+        .css_classes(["header-small", "flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    manage_accounts_button.set_tooltip_text(Some("View and remove connected accounts"));
+    manage_accounts_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        move |_| open_manage_accounts_dialog(&ui)
+    ));
+
     calendar_sidebar.append(&sidebar_actions(
         &google_add_button,
         &google_sync_button,
@@ -816,6 +828,7 @@ pub fn build(app: &adw::Application) {
         &icloud_sync_button,
         &caldav_add_button,
         &caldav_sync_button,
+        &manage_accounts_button,
     ));
     calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
@@ -1081,6 +1094,7 @@ fn sidebar_actions(
     icloud_sync_button: &gtk::Button,
     caldav_add_button: &gtk::Button,
     caldav_sync_button: &gtk::Button,
+    manage_button: &gtk::Button,
 ) -> gtk::Widget {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
     section.add_css_class("sidebar-actions");
@@ -1093,7 +1107,13 @@ fn sidebar_actions(
     title.add_css_class("caption-heading");
     title.add_css_class("dim-label");
     title.set_xalign(0.0);
-    section.append(&title);
+    title.set_hexpand(true);
+    // The heading doubles as the row carrying "Manage", which is where
+    // connected accounts are listed and removed.
+    let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    title_row.append(&title);
+    title_row.append(manage_button);
+    section.append(&title_row);
 
     let google_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     google_row.append(google_add_button);
@@ -1809,6 +1829,177 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
 struct CaldavAddResult {
     display_name: String,
     outcome: SyncOutcome,
+}
+
+/// Human-readable provider name for the account list.
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "google" => "Google",
+        "icloud" => "iCloud",
+        "caldav" => "CalDAV",
+        other => other,
+    }
+}
+
+/// Forgets `account`: its keyring credential, then its events, calendars, and
+/// row. Local only — nothing is deleted or revoked with the provider, so
+/// re-adding the same account later re-syncs it.
+fn disconnect_account(store: &Store, account: &store::Account) -> Result<(), String> {
+    // Clear the credential first. If this fails the account stays listed, which
+    // is the recoverable order: a leftover row can be removed again, whereas a
+    // secret orphaned by a deleted row has no UI left to reach it.
+    match account.provider.as_str() {
+        "google" => google::oauth::delete_refresh_token(&account.token_key)
+            .map_err(|e| format!("couldn't remove the saved sign-in: {e}"))?,
+        _ => icloud::credentials::delete_password(&account.token_key)
+            .map_err(|e| format!("couldn't remove the saved password: {e}"))?,
+    }
+    store
+        .delete_account(account.id)
+        .map_err(|e| format!("couldn't remove the account: {e}"))
+}
+
+/// Lists every connected account with a Remove button. Removal asks for
+/// confirmation first, since it drops the account's cached events.
+fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
+    let dialog = adw::Dialog::builder()
+        .title("Accounts")
+        .content_width(460)
+        .build();
+
+    let close_button = gtk::Button::with_label("Close");
+    let header = adw::HeaderBar::new();
+    header.pack_start(&close_button);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let accounts = ui.store.all_accounts().unwrap_or_default();
+    if accounts.is_empty() {
+        let empty = gtk::Label::new(Some(
+            "No accounts connected yet. Use Add Google, Add iCloud, or Add CalDAV.",
+        ));
+        empty.set_wrap(true);
+        empty.set_xalign(0.0);
+        empty.add_css_class("dim-label");
+        content.append(&empty);
+    } else {
+        let group = adw::PreferencesGroup::new();
+        for account in accounts {
+            let subtitle = match &account.server_url {
+                Some(url) => format!("{} · {url}", provider_label(&account.provider)),
+                None => provider_label(&account.provider).to_string(),
+            };
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&account.display_name))
+                .subtitle(glib::markup_escape_text(&subtitle))
+                .build();
+            row.set_title_lines(1);
+            row.set_subtitle_lines(1);
+
+            let remove_button = gtk::Button::builder()
+                .label("Remove")
+                .valign(gtk::Align::Center)
+                .css_classes(["destructive-action"])
+                .build();
+            remove_button.connect_clicked(clone!(
+                #[strong]
+                ui,
+                #[weak]
+                dialog,
+                move |_| {
+                    confirm_disconnect_account(&ui, &dialog, &account);
+                }
+            ));
+            row.add_suffix(&remove_button);
+            group.add(&row);
+        }
+        content.append(&group);
+    }
+
+    let note = gtk::Label::new(Some(
+        "Removing an account deletes its saved credential and cached events from \
+         this computer only. Nothing is changed or revoked on the provider, so you \
+         can add it back at any time.",
+    ));
+    note.set_wrap(true);
+    note.set_xalign(0.0);
+    note.add_css_class("dim-label");
+    content.append(&note);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar_view));
+
+    close_button.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+
+    dialog.present(Some(&ui.carousel));
+}
+
+/// Confirms before disconnecting, naming what is and isn't affected.
+fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store::Account) {
+    let alert = adw::AlertDialog::builder()
+        .heading(format!("Remove {}?", account.display_name))
+        .body(format!(
+            "Calix will forget this {} account's saved credential and delete its \
+             cached calendars and events from this computer.\n\nYour calendars and \
+             events are not touched on the provider, and no password or token is \
+             revoked there.",
+            provider_label(&account.provider)
+        ))
+        .build();
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("remove", "Remove");
+    alert.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+
+    alert.connect_response(
+        None,
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            account,
+            #[weak]
+            parent,
+            move |_, response| {
+                if response != "remove" {
+                    return;
+                }
+                match disconnect_account(&ui.store, &account) {
+                    Ok(()) => {
+                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                            "Removed {}",
+                            account.display_name
+                        )));
+                        ui.reset_calendar_sidebar();
+                        ui.reset();
+                        parent.close();
+                        // Reopen so the list reflects the removal and more
+                        // accounts can be removed without re-navigating.
+                        open_manage_accounts_dialog(&ui);
+                    }
+                    Err(error) => {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&error)));
+                    }
+                }
+            }
+        ),
+    );
+
+    alert.present(Some(parent));
 }
 
 fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {

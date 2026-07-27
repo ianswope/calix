@@ -81,6 +81,19 @@ pub fn legacy_token_key() -> &'static str {
     LEGACY_KEYRING_USERNAME
 }
 
+/// Removes the saved refresh token for `token_key` from this machine's keyring.
+/// Already-absent counts as success, so disconnecting an account whose token was
+/// lost still succeeds.
+///
+/// Local only: the token is not revoked with Google, and the app keeps its
+/// authorization until the user removes it in their Google account settings.
+pub fn delete_refresh_token(token_key: &str) -> Result<(), AuthError> {
+    match keyring_entry(token_key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(AuthError::Keyring(e)),
+    }
+}
+
 pub fn copy_refresh_token(from_token_key: &str, to_token_key: &str) -> Result<bool, AuthError> {
     let from_entry = keyring_entry(from_token_key)?;
     let refresh_token = match from_entry.get_password() {
