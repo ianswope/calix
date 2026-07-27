@@ -746,16 +746,7 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
         .map(|property| property.value.clone())
         .unwrap_or_else(|| "(No title)".to_string());
     let (start, all_day) = parse_ics_datetime(props.get("DTSTART")?)?;
-    let (end, _) = props
-        .get("DTEND")
-        .and_then(parse_ics_datetime)
-        .unwrap_or_else(|| {
-            if all_day {
-                (start + chrono::Duration::days(1), true)
-            } else {
-                (start + chrono::Duration::hours(1), false)
-            }
-        });
+    let end = event_end(&props, start, all_day)?;
     let remote_id = if component_count == 1 && !props.contains_key("RECURRENCE-ID") {
         href.to_string()
     } else {
@@ -903,6 +894,128 @@ fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)>
         return Some((datetime.with_timezone(&Local), false));
     }
     Some((Local.from_local_datetime(&naive).single()?, false))
+}
+
+/// An RFC 5545 `DURATION`, keeping nominal days apart from the exact time
+/// span. The spec makes day and week durations nominal: "one day later" means
+/// the same clock time on the next civil date, which is 23 or 25 elapsed hours
+/// across a DST transition, not 24.
+struct IcsDuration {
+    days: i64,
+    time: chrono::Duration,
+}
+
+/// Parses a `DURATION` value such as `P1D`, `PT1H30M`, `P2W`, or `P1DT12H`.
+fn parse_ics_duration(value: &str) -> Option<IcsDuration> {
+    let (sign, rest) = match value.strip_prefix('-') {
+        Some(rest) => (-1, rest),
+        None => (1, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let (date_part, time_part) = match rest.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    if date_part.is_empty() && time_part.is_none_or(str::is_empty) {
+        return None;
+    }
+
+    let mut days = 0i64;
+    for (count, unit) in measures(date_part)? {
+        match unit {
+            'W' => days += count * 7,
+            'D' => days += count,
+            _ => return None,
+        }
+    }
+    let mut seconds = 0i64;
+    for (count, unit) in measures(time_part.unwrap_or_default())? {
+        match unit {
+            'H' => seconds += count * 3600,
+            'M' => seconds += count * 60,
+            'S' => seconds += count,
+            _ => return None,
+        }
+    }
+
+    Some(IcsDuration {
+        days: sign * days,
+        time: chrono::Duration::seconds(sign * seconds),
+    })
+}
+
+/// Splits a duration part into its `(count, unit)` measures, rejecting a
+/// trailing count with no unit — `P1D5` must not read as one day.
+fn measures(part: &str) -> Option<Vec<(i64, char)>> {
+    let mut measures = Vec::new();
+    let mut digits = String::new();
+    for character in part.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+            continue;
+        }
+        measures.push((digits.parse().ok()?, character));
+        digits.clear();
+    }
+    digits.is_empty().then_some(measures)
+}
+
+/// The instant `duration` after `start`.
+///
+/// An all-day event advances by whole civil days, so its end lands on the next
+/// date's first instant however the offset moved in between.
+fn end_from_duration<Tz: TimeZone>(
+    start: &DateTime<Tz>,
+    all_day: bool,
+    duration: &IcsDuration,
+) -> DateTime<Tz> {
+    let days = chrono::Duration::days(duration.days);
+    let shifted = if all_day {
+        // Land on the next date's first instant, whatever the offset did in
+        // between. RFC 5545 only allows day and week durations on a DATE start,
+        // so there is no time-of-day to carry across.
+        crate::date_util::day_start_in(&start.timezone(), start.date_naive() + days)
+    } else {
+        start.clone() + days
+    };
+    shifted + duration.time
+}
+
+/// The event's end: `DTEND` if it has one, otherwise `DURATION`, otherwise a
+/// fallback.
+///
+/// A `DTEND` or `DURATION` that is present but unreadable yields `None` rather
+/// than a fallback. Inventing an end for a property the server did send — and
+/// that a later edit would write back — is worse than declining to read the
+/// event, which leaves the cached copy in place.
+fn event_end(
+    props: &HashMap<String, IcsProperty>,
+    start: DateTime<Local>,
+    all_day: bool,
+) -> Option<DateTime<Local>> {
+    if let Some(dtend) = props.get("DTEND") {
+        return parse_ics_datetime(dtend).map(|(end, _)| end);
+    }
+    if let Some(duration) = props.get("DURATION") {
+        let duration = parse_ics_duration(&duration.value)?;
+        return Some(end_from_duration(&start, all_day, &duration));
+    }
+    // Neither property: RFC 5545 gives a DATE start a one-day duration, and a
+    // DATE-TIME start a zero-length one. A zero-length event would be invisible
+    // in the grids, so a timed event without an end gets a nominal hour — the
+    // one invented end that is a display decision rather than a parse failure.
+    Some(if all_day {
+        end_from_duration(
+            &start,
+            true,
+            &IcsDuration {
+                days: 1,
+                time: chrono::Duration::zero(),
+            },
+        )
+    } else {
+        start + chrono::Duration::hours(1)
+    })
 }
 
 fn caldav_timestamp(dt: DateTime<Local>) -> String {
@@ -1723,6 +1836,141 @@ END:VCALENDAR\r\n";
         let synced = reconcile_calendar_query(xml);
 
         assert!(!synced.prunable);
+    }
+
+    #[test]
+    fn ics_durations_parse_days_weeks_and_time_parts() {
+        let cases = [
+            ("P1D", 1, 0),
+            ("P2W", 14, 0),
+            ("PT1H30M", 0, 5400),
+            ("PT45S", 0, 45),
+            ("P1DT12H", 1, 43200),
+            ("+P3D", 3, 0),
+            ("-PT15M", 0, -900),
+        ];
+        for (value, days, seconds) in cases {
+            let duration =
+                parse_ics_duration(value).unwrap_or_else(|| panic!("{value} should parse"));
+            assert_eq!(duration.days, days, "{value} days");
+            assert_eq!(duration.time.num_seconds(), seconds, "{value} time");
+        }
+    }
+
+    #[test]
+    fn a_malformed_duration_is_not_read_as_zero() {
+        for value in ["", "P", "PT", "1D", "PX", "P1D5", "PT1Q"] {
+            assert!(
+                parse_ics_duration(value).is_none(),
+                "{value} should not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_event_uses_its_duration_instead_of_an_invented_hour() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Standup\r\n\
+DTSTART:20260709T140000Z\r\nDURATION:PT30M\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let events = parse_resource("/cal/duration.ics", ics).0;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].draft.end.with_timezone(&chrono::Utc),
+            chrono::Utc.with_ymd_and_hms(2026, 7, 9, 14, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_all_day_event_uses_its_duration_in_whole_days() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Conference\r\n\
+DTSTART;VALUE=DATE:20260709\r\nDURATION:P3D\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let events = parse_resource("/cal/allday.ics", ics).0;
+
+        assert_eq!(events.len(), 1);
+        assert!(events[0].draft.all_day);
+        assert_eq!(
+            events[0].draft.end,
+            crate::date_util::local_day_start(NaiveDate::from_ymd_opt(2026, 7, 12).unwrap())
+        );
+    }
+
+    #[test]
+    fn an_all_day_event_ends_on_the_next_civil_date_across_a_dst_jump() {
+        // US clocks spring forward at 02:00 on 2026-03-08, so that civil day is
+        // 23 hours long. Adding 24 elapsed hours would end the event at 01:00
+        // on the 9th instead of at its midnight.
+        let tz = chrono_tz::America::New_York;
+        let start =
+            crate::date_util::day_start_in(&tz, NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
+        let one_day = IcsDuration {
+            days: 1,
+            time: chrono::Duration::zero(),
+        };
+
+        let end = end_from_duration(&start, true, &one_day);
+
+        assert_eq!(
+            end.naive_local(),
+            NaiveDate::from_ymd_opt(2026, 3, 9)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+        assert_eq!((end - start).num_hours(), 23);
+    }
+
+    #[test]
+    fn a_timed_events_duration_stays_exact() {
+        let tz = chrono_tz::America::New_York;
+        let start = tz.with_ymd_and_hms(2026, 7, 9, 9, 0, 0).unwrap();
+        let ninety_minutes = IcsDuration {
+            days: 0,
+            time: chrono::Duration::minutes(90),
+        };
+
+        let end = end_from_duration(&start, false, &ninety_minutes);
+
+        assert_eq!(end, tz.with_ymd_and_hms(2026, 7, 9, 10, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_dtend_is_not_replaced_with_an_invented_one() {
+        // The server did send an end; failing to read it must drop the event
+        // into the unreadable set rather than silently inventing an hour.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Broken\r\n\
+DTSTART:20260709T140000Z\r\nDTEND;VALUE=PERIOD:nonsense\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let (events, complete) = parse_resource("/cal/broken.ics", ics);
+
+        assert!(events.is_empty());
+        assert!(!complete);
+    }
+
+    #[test]
+    fn an_unreadable_duration_is_not_replaced_with_an_invented_one() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Broken\r\n\
+DTSTART:20260709T140000Z\r\nDURATION:sometime\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let (events, complete) = parse_resource("/cal/broken.ics", ics);
+
+        assert!(events.is_empty());
+        assert!(!complete);
+    }
+
+    #[test]
+    fn an_all_day_event_with_no_end_at_all_still_spans_one_civil_day() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nSUMMARY:Holiday\r\n\
+DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let events = parse_resource("/cal/holiday.ics", ics).0;
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].draft.end,
+            crate::date_util::local_day_start(NaiveDate::from_ymd_opt(2026, 7, 10).unwrap())
+        );
     }
 
     #[test]
