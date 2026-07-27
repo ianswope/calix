@@ -252,7 +252,7 @@ pub fn list_events(
 }
 
 fn get(access_token: &str, url: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let response = client
         .get(url)
         .bearer_auth(access_token)
@@ -294,7 +294,7 @@ pub fn create_event(
         .map_err(|_| "invalid calendar API base URL".to_string())?
         .push(calendar_id)
         .push("events");
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let body =
         serde_json::to_string(&GoogleEventPatch::from_draft(draft)).map_err(|e| e.to_string())?;
     let response = client
@@ -339,7 +339,7 @@ fn request_json<T: Serialize>(
     url: &str,
     body: Option<&T>,
 ) -> Result<(), String> {
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let mut request = client.request(method, url).bearer_auth(access_token);
     if let Some(body) = body {
         request = request

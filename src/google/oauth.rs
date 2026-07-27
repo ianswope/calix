@@ -219,11 +219,8 @@ where
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, AuthError> {
-    reqwest::blocking::ClientBuilder::new()
-        // Following redirects here would open the client up to SSRF.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| AuthError::Oauth(e.to_string()))
+    // Following redirects here would open the client up to SSRF.
+    crate::http::no_redirect_client().map_err(AuthError::Oauth)
 }
 
 fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfToken), AuthError> {

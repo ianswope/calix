@@ -280,7 +280,7 @@ pub fn create_event(
 }
 
 fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<String>), String> {
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let response = client
         .get(url)
         .basic_auth(&credentials.username, Some(&credentials.password))
@@ -305,7 +305,7 @@ fn put_event(
     ics: &str,
     etag: Option<&str>,
 ) -> Result<(), String> {
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let mut request = client
         .put(url)
         .basic_auth(&credentials.username, Some(&credentials.password))
@@ -335,7 +335,7 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
     }
     let url = absolute_url(&credentials.base_url, event_href)?;
     let (_, etag) = fetch_event(credentials, &url)?;
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let mut request = client
         .delete(&url)
         .basic_auth(&credentials.username, Some(&credentials.password));
@@ -519,7 +519,7 @@ fn request(
     content_type: &str,
     body: String,
 ) -> Result<String, String> {
-    let client = reqwest::blocking::Client::new();
+    let client = crate::http::client()?;
     let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
     let response = client
         .request(method, url)

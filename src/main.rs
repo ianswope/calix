@@ -7,6 +7,7 @@ mod config;
 mod date_util;
 mod event_dialog;
 mod google;
+mod http;
 mod icloud;
 mod notify;
 mod omarchy;
