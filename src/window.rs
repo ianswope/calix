@@ -9,7 +9,7 @@ use crate::event_dialog;
 use crate::google;
 use crate::icloud;
 use crate::store::{self, Event, EventDraft, Store};
-use crate::sync::SyncOutcome;
+use crate::sync::{self, SyncOutcome};
 use crate::views::{drag::DragKind, month_view, week_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
@@ -2242,14 +2242,16 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
                 return Err("No Google accounts connected. Use Add Google first.".to_string());
             }
             let account_count = accounts.len();
-            let mut outcome = SyncOutcome::default();
-
-            for account in accounts {
-                let token = google::oauth::get_access_token(&google_config, &account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| format!("missing saved token for {}", account.label()))?;
-                outcome.merge(google::sync::sync_account(&token, &store, account.id)?);
-            }
+            let outcome = sync::sync_accounts(
+                &accounts,
+                |account| account.label(),
+                |account| {
+                    let token = google::oauth::get_access_token(&google_config, &account.token_key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("no saved token — reconnect the account")?;
+                    google::sync::sync_account(&token, &store, account.id)
+                },
+            );
 
             Ok((account_count, outcome))
         })();
@@ -2312,23 +2314,21 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             }
 
             let account_count = accounts.len();
-            let mut outcome = SyncOutcome::default();
-            for account in accounts {
-                let app_password = icloud::credentials::app_password(&account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!(
-                            "missing saved app-specific password for {}",
-                            account.display_name
-                        )
-                    })?;
-                let credentials = caldav::Credentials {
-                    base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
-                    username: account.provider_account_id.clone(),
-                    password: app_password,
-                };
-                outcome.merge(caldav::sync_account(&credentials, &store, account.id)?);
-            }
+            let outcome = sync::sync_accounts(
+                &accounts,
+                |account| account.label(),
+                |account| {
+                    let app_password = icloud::credentials::app_password(&account.token_key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("no saved app-specific password — reconnect the account")?;
+                    let credentials = caldav::Credentials {
+                        base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
+                        username: account.provider_account_id.clone(),
+                        password: app_password,
+                    };
+                    caldav::sync_account(&credentials, &store, account.id)
+                },
+            );
 
             Ok((account_count, outcome))
         })();
@@ -2615,26 +2615,25 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             }
 
             let account_count = accounts.len();
-            let mut outcome = SyncOutcome::default();
-            for account in accounts {
-                let Some(base_url) = account.server_url.clone() else {
-                    return Err(format!(
-                        "{} is missing its server address; remove and re-add it.",
-                        account.display_name
-                    ));
-                };
-                let password = icloud::credentials::app_password(&account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| {
-                        format!("missing saved password for {}", account.display_name)
-                    })?;
-                let credentials = caldav::Credentials {
-                    base_url,
-                    username: account.provider_account_id.clone(),
-                    password,
-                };
-                outcome.merge(caldav::sync_account(&credentials, &store, account.id)?);
-            }
+            let outcome = sync::sync_accounts(
+                &accounts,
+                |account| account.label(),
+                |account| {
+                    let base_url = account
+                        .server_url
+                        .clone()
+                        .ok_or("no server address — remove and re-add the account")?;
+                    let password = icloud::credentials::app_password(&account.token_key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("no saved password — reconnect the account")?;
+                    let credentials = caldav::Credentials {
+                        base_url,
+                        username: account.provider_account_id.clone(),
+                        password,
+                    };
+                    caldav::sync_account(&credentials, &store, account.id)
+                },
+            );
 
             Ok((account_count, outcome))
         })();

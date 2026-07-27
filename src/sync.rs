@@ -10,6 +10,11 @@
 pub struct SyncOutcome {
     pub synced: usize,
     pub failed: Vec<String>,
+    /// Accounts that failed as a whole — a missing credential, a rejected
+    /// authorization, a discovery error — already rendered as
+    /// `"<account>: <reason>"`. Separate from `failed` so the summary can say
+    /// which accounts never ran at all, not just which calendars went stale.
+    pub failed_accounts: Vec<String>,
 }
 
 impl SyncOutcome {
@@ -21,24 +26,35 @@ impl SyncOutcome {
         self.failed.push(calendar.into());
     }
 
+    pub fn record_account_failure(&mut self, account: impl Into<String>, error: impl Into<String>) {
+        self.failed_accounts
+            .push(format!("{}: {}", account.into(), error.into()));
+    }
+
     /// Folds another account's outcome into this one, for the multi-account
     /// sync loops.
     pub fn merge(&mut self, other: SyncOutcome) {
         self.synced += other.synced;
         self.failed.extend(other.failed);
+        self.failed_accounts.extend(other.failed_accounts);
     }
 
     /// A trailing clause naming the calendars that failed, or `None` when
     /// everything synced. Callers append it to their success message so a
     /// partial failure never reads as a clean success.
     pub fn failure_note(&self) -> Option<String> {
-        (!self.failed.is_empty()).then(|| {
-            format!(
+        let mut notes = Vec::new();
+        for account in &self.failed_accounts {
+            notes.push(format!("couldn't sync {account}"));
+        }
+        if !self.failed.is_empty() {
+            notes.push(format!(
                 "couldn't sync {}: {}",
                 self.failed.len(),
                 self.failed.join(", ")
-            )
-        })
+            ));
+        }
+        (!notes.is_empty()).then(|| notes.join(" — "))
     }
 
     fn with_failure_note(&self, base: String) -> String {
@@ -61,15 +77,99 @@ impl SyncOutcome {
     /// e.g. `Synced 3 calendar(s) from 1 account(s)`.
     pub fn synced_summary(&self, noun: &str, account_count: usize) -> String {
         self.with_failure_note(format!(
-            "Synced {} {noun}(s) from {account_count} account(s)",
-            self.synced
+            "Synced {} {noun}(s) from {} account(s)",
+            self.synced,
+            account_count.saturating_sub(self.failed_accounts.len())
         ))
     }
+}
+
+/// Syncs every account, isolating failures to the account that caused them.
+///
+/// A missing credential or an account-level network error must not abandon the
+/// accounts after it: the account lists are ordered by display name, so an
+/// early failure would otherwise starve the same accounts on every automatic
+/// pass. `name` supplies the user-facing account name for the report — the
+/// per-account errors themselves must not repeat it.
+pub fn sync_accounts<A>(
+    accounts: &[A],
+    name: impl Fn(&A) -> String,
+    sync_one: impl Fn(&A) -> Result<SyncOutcome, String>,
+) -> SyncOutcome {
+    let mut outcome = SyncOutcome::default();
+    for account in accounts {
+        let name = name(account);
+        match sync_one(account) {
+            Ok(account_outcome) => outcome.merge(account_outcome),
+            Err(error) => {
+                eprintln!("calix: failed to sync account {name}: {error}");
+                outcome.record_account_failure(name, error);
+            }
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two accounts, the first of which fails outright.
+    fn sync_two_accounts() -> SyncOutcome {
+        sync_accounts(
+            &["Broken", "Working"],
+            |account| (*account).to_string(),
+            |account| {
+                if *account == "Broken" {
+                    return Err("missing saved password".to_string());
+                }
+                let mut outcome = SyncOutcome::default();
+                outcome.record_success();
+                outcome.record_success();
+                Ok(outcome)
+            },
+        )
+    }
+
+    #[test]
+    fn a_broken_account_does_not_stop_the_accounts_after_it() {
+        let outcome = sync_two_accounts();
+        assert_eq!(outcome.synced, 2);
+    }
+
+    #[test]
+    fn a_broken_account_is_recorded_with_its_reason() {
+        let outcome = sync_two_accounts();
+        assert_eq!(
+            outcome.failed_accounts,
+            vec!["Broken: missing saved password".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_failed_account_is_named_in_the_summary_and_left_out_of_the_count() {
+        let outcome = sync_two_accounts();
+        assert_eq!(
+            outcome.synced_summary("calendar", 2),
+            "Synced 2 calendar(s) from 1 account(s) \
+             — couldn't sync Broken: missing saved password"
+        );
+    }
+
+    #[test]
+    fn account_and_calendar_failures_are_reported_side_by_side() {
+        let mut outcome = SyncOutcome::default();
+        outcome.record_success();
+        outcome.record_failure("Birthdays");
+        outcome.record_account_failure("Personal", "the server took too long to respond");
+        assert_eq!(
+            outcome.failure_note().as_deref(),
+            Some(
+                "couldn't sync Personal: the server took too long to respond \
+                 — couldn't sync 1: Birthdays"
+            )
+        );
+    }
 
     #[test]
     fn a_clean_sync_has_no_failure_note() {
