@@ -186,6 +186,34 @@ fn settle_action(frame: SettleFrame) -> SettleAction {
     }
 }
 
+/// Which end of the carousel a one-period step swaps out.
+///
+/// A swipe leaves the page the user is now looking at attached at the near end.
+/// Only the far page — two periods stale, and offscreen — may be replaced;
+/// destroying and rebuilding the visible page mid-animation is what makes the
+/// whole view flicker.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct RecyclePlan {
+    /// Remove the carousel's first child rather than its last.
+    drop_first: bool,
+    /// Insert the replacement at the front rather than appending it.
+    insert_first: bool,
+}
+
+fn recycle_plan(delta: i32) -> RecyclePlan {
+    if delta > 0 {
+        RecyclePlan {
+            drop_first: true,
+            insert_first: false,
+        }
+    } else {
+        RecyclePlan {
+            drop_first: false,
+            insert_first: true,
+        }
+    }
+}
+
 /// Which way a landed `page-changed` index moves the period, if at all.
 /// Index 1 is the middle page — where every rebuild parks the carousel — so
 /// landing there is our own centering, never a swipe.
@@ -325,12 +353,19 @@ impl Ui {
         // the frame-clock loop below is for.
         self.carousel.scroll_to(&current_page, false);
 
-        // Then confirm on the frame clock, never on a wall-clock delay: while
-        // the screen is blanked, the session is locked, or the machine is
-        // mid-resume, the compositor sends no frames, layout never runs, and
-        // scroll_to() silently stays on page 0 — the previous period. A timer
-        // fires anyway and would clear the guard over a carousel sitting on
-        // the wrong page; a tick callback only runs once frames flow again.
+        self.confirm_centered(generation, current_page);
+    }
+
+    /// Retries the scroll onto `current_page` each frame until the carousel is
+    /// verifiably parked there, then marks `generation` settled.
+    ///
+    /// On the frame clock, never on a wall-clock delay: while the screen is
+    /// blanked, the session is locked, or the machine is mid-resume, the
+    /// compositor sends no frames, layout never runs, and `scroll_to` silently
+    /// stays on page 0 — the previous period. A timer fires anyway and would
+    /// clear the guard over a carousel sitting on the wrong page; a tick
+    /// callback only runs once frames flow again.
+    fn confirm_centered(self: &Rc<Self>, generation: u64, current_page: gtk::Widget) {
         let ui = self.clone();
         // Tick callbacks are `Fn`, so this loop's own progress lives in a Cell.
         let scrolled = Cell::new(false);
@@ -374,10 +409,18 @@ impl Ui {
         self.tick_clock();
     }
 
-    /// Moves the display by `delta` periods and rebuilds around the new date.
-    /// Every navigation — swipe, arrow button, date rollover — goes through
-    /// here, so there is exactly one path that changes which period is shown
-    /// and exactly one place that recenters the carousel.
+    /// Claims the carousel for an imminent rebuild, so `page-changed` stops
+    /// being trusted before any delay this navigation needs to wait out.
+    fn begin_rebuild(&self) -> u64 {
+        let mut sync = self.sync.get();
+        let generation = sync.begin_rebuild();
+        self.sync.set(sync);
+        generation
+    }
+
+    /// Moves the display by `delta` periods with a full rebuild of all three
+    /// pages. Used where there's no page worth keeping — arrow buttons, view
+    /// mode changes, a date rollover.
     fn navigate(self: &Rc<Self>, delta: i32) {
         // A pinch re-zoomed only the visible page, so the rebuild would
         // otherwise drop the user back at "now". Read the hour they're
@@ -395,6 +438,78 @@ impl Ui {
         drop(state);
 
         self.reset_with(scroll);
+    }
+
+    /// Completes a swipe: the user has already animated onto a neighbor page,
+    /// so adopt it as the current one and replace only the far, offscreen page.
+    ///
+    /// This is why `reset_with` isn't used here. A full rebuild destroys and
+    /// re-creates the page the user is looking at, in the middle of the swipe
+    /// animation, and the whole view flickers. Correctness doesn't depend on
+    /// having one rebuild path — it comes from `CarouselSync` and the settle
+    /// loop, which this path uses exactly as `reset_with` does.
+    fn advance(self: &Rc<Self>, delta: i32) {
+        let generation = self.begin_rebuild();
+
+        let mut state = self.state.borrow_mut();
+        state.current_date = state.shift(delta);
+        drop(state);
+
+        // A zoom left the neighbor pages at the old hour height, so the page
+        // just swiped to is stale and can't be adopted. Rebuild all three,
+        // keeping the time the user was looking at; `reset_with` supersedes
+        // this generation, which its own settle loop then owns.
+        if self.zoom_dirty.get() {
+            let scroll = self
+                .visible_scroll_hours()
+                .map(week_view::InitialScroll::AtHour)
+                .unwrap_or(week_view::InitialScroll::NowOrMorning);
+            self.reset_with(scroll);
+            return;
+        }
+
+        let state = self.state.borrow();
+        let view_mode = state.view_mode;
+        let replacement_date = state.shift_from(state.current_date, delta);
+        let title = state.title();
+        drop(state);
+
+        let replacement = self.build_page(
+            view_mode,
+            replacement_date,
+            week_view::InitialScroll::NowOrMorning,
+        );
+        let plan = recycle_plan(delta);
+        let stale = if plan.drop_first {
+            self.carousel.first_child()
+        } else {
+            self.carousel.last_child()
+        };
+        if let Some(stale) = stale {
+            self.carousel.remove(&stale);
+        }
+        if plan.insert_first {
+            self.carousel.insert(&replacement, 0);
+        } else {
+            self.carousel.append(&replacement);
+        }
+        self.title_label.set_label(&title);
+
+        let Some(current_page) = self
+            .carousel
+            .first_child()
+            .and_then(|page| page.next_sibling())
+        else {
+            // Nothing to center on; leave the carousel unsettled rather than
+            // vouch for a page that doesn't exist, and let the next full
+            // rebuild recover.
+            return;
+        };
+        // Inserting the new previous page briefly puts it at position zero.
+        // Recenter before GTK can paint it, or the swipe shows the wrong
+        // period for a frame.
+        self.carousel.scroll_to(&current_page, false);
+        self.confirm_centered(generation, current_page);
     }
 
     /// Runs on a periodic timer to keep the display anchored to real time.
@@ -1248,9 +1363,22 @@ fn connect_handlers(
             let Some(delta) = swipe_delta(index) else {
                 return;
             };
-            // `navigate` claims the carousel synchronously, so the rest of
-            // this swipe's signals land unsettled and are ignored.
-            ui.navigate(delta);
+            // Claim the carousel before anything else, so the rest of this
+            // swipe's signals land unsettled and are ignored — including
+            // across the deferral below, which `advance` would otherwise
+            // spend with the guard still down.
+            ui.begin_rebuild();
+            if delta > 0 {
+                ui.advance(delta);
+            } else {
+                // `page-changed` is emitted while the swipe animation is still
+                // running. Inserting a page ahead of the current one races
+                // that animation, so let it finish first.
+                let ui = ui.clone();
+                glib::timeout_add_local_once(Duration::from_millis(180), move || {
+                    ui.advance(delta);
+                });
+            }
         }
     ));
 
@@ -3166,6 +3294,36 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_backward_swipe_holds_the_guard_across_the_delay() {
+        // A backward swipe waits ~180ms for the animation to finish before
+        // recycling pages. The guard has to be claimed at `page-changed`, not
+        // when the deferred work runs — otherwise the carousel counts as
+        // settled for that whole window and a second `page-changed` from the
+        // same swipe moves the period again.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        run_healthy_rebuild(&sync);
+        assert!(sync.get().is_settled());
+
+        // page-changed(0) — handler claims the carousel, then defers.
+        let mut claimed = sync.get();
+        claimed.begin_rebuild();
+        sync.set(claimed);
+
+        assert!(
+            !sync.get().is_settled(),
+            "a page-changed arriving during the defer must be ignored"
+        );
+
+        // The deferred advance claims again, recycles, and centers.
+        let mut deferred = SettleLoop::begin(&sync);
+        deferred.tick(true, 800, 0.0);
+        deferred.tick(true, 800, MIDDLE_PAGE);
+
+        assert!(sync.get().is_settled());
+        assert_eq!(deferred.scrolls, 1);
+    }
+
+    #[test]
     fn a_late_settle_from_an_old_generation_is_ignored() {
         let mut sync = CarouselSync::default();
         let stale = sync.begin_rebuild();
@@ -3191,6 +3349,31 @@ mod tests {
         sync.set(state);
 
         assert!(!sync.get().is_settled());
+    }
+
+    #[test]
+    fn a_forward_step_drops_the_stale_previous_page() {
+        // Swiping forward leaves [prev, cur, next] showing `next`. Only the now
+        // two-periods-stale `prev` may be touched: rebuilding the page the user
+        // is looking at is what makes a swipe flicker.
+        assert_eq!(
+            recycle_plan(1),
+            RecyclePlan {
+                drop_first: true,
+                insert_first: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_backward_step_drops_the_stale_next_page() {
+        assert_eq!(
+            recycle_plan(-1),
+            RecyclePlan {
+                drop_first: false,
+                insert_first: true
+            }
+        );
     }
 
     #[test]
