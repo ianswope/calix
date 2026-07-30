@@ -68,6 +68,20 @@ This builds `target/release/calix` and installs:
 - `~/.local/share/applications/com.ianswope.Calix.desktop`
 - `~/.local/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg`
 
+The installed binary is a **copy**, not a symlink, so committing a fix does not
+change what you launch until you run `install-local.sh` again. Each build is
+stamped with the commit it came from:
+
+```sh
+calix --version                 # calix 0.4.0 (v0.4.0-25-gb1c3f07 2026-07-30)
+scripts/check-installed.sh      # compares that against the current checkout
+```
+
+`check-installed.sh` exits 0 in sync, 1 drifted (listing the commits you have
+committed but not installed), 2 if it can't tell. `install-local.sh` refuses a
+dirty tree, so a stamped commit always matches what was installed; override with
+`CALIX_ALLOW_DIRTY=1` if you really want an experimental build on your desktop.
+
 Uninstall with:
 
 ```sh
