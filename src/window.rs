@@ -24,6 +24,8 @@ use std::time::Duration;
 type CreateFn = Rc<dyn Fn(DateTime<Local>)>;
 type EditFn = Rc<dyn Fn(Event)>;
 type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
+/// Work parked until a rebuild verifiably centers the carousel, run once.
+type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -79,32 +81,119 @@ fn clamp_hour_row_height(height: i32) -> i32 {
 /// rebuild appends to the carousel.
 const MIDDLE_PAGE: f64 = 1.0;
 
+/// How close `AdwCarousel:position` must sit to a page index to count as
+/// parked on it. The property is a float that animates, so an exact compare
+/// would never match.
+const POSITION_EPSILON: f64 = 1e-6;
+
+/// Tracks which rebuild owns the carousel and whether that rebuild has been
+/// confirmed to sit on its middle page.
+///
+/// A single "rebuilding" boolean can't do this job. It records *that* a
+/// rebuild is in flight but not *which*, so whichever settle loop happened to
+/// finish last cleared the guard for everybody — including a loop belonging to
+/// a rebuild that had already been superseded. With the guard down and the
+/// carousel still parked somewhere else, the next `page-changed` read as a
+/// user swipe and moved the period a second time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CarouselSync {
+    /// Bumped by every rebuild. The current value names the only rebuild
+    /// whose settle loop is still allowed to speak for the carousel.
+    generation: u64,
+    /// The generation whose recentering was actually confirmed on screen.
+    settled: Option<u64>,
+}
+
+impl CarouselSync {
+    /// Claims the carousel for a new rebuild, invalidating any in-flight one,
+    /// and returns the generation that rebuild should identify itself by.
+    fn begin_rebuild(&mut self) -> u64 {
+        self.generation += 1;
+        self.settled = None;
+        self.generation
+    }
+
+    /// Records that `generation` verified itself parked on the middle page. A
+    /// superseded generation is ignored, so a late loop can never vouch for a
+    /// newer rebuild it knows nothing about.
+    fn mark_settled(&mut self, generation: u64) {
+        if self.owns(generation) {
+            self.settled = Some(generation);
+        }
+    }
+
+    /// Whether a settle loop running as `generation` is still authoritative.
+    fn owns(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    /// Whether the carousel is verifiably parked where the model says it is.
+    /// This is the only state in which `page-changed` means "the user
+    /// swiped" — at any other moment it's fallout from our own scrolling,
+    /// or from a rebuild that hasn't landed yet.
+    fn is_settled(&self) -> bool {
+        self.settled == Some(self.generation)
+    }
+}
+
+/// Everything one frame of the recentering loop can observe.
+#[derive(Debug, Clone, Copy)]
+struct SettleFrame {
+    /// This loop's generation is still the current one.
+    owns_carousel: bool,
+    /// The page this loop is centering on is still in the carousel.
+    page_attached: bool,
+    /// Carousel width. Zero means no allocation yet, or a frame clock stalled
+    /// while the screen is blanked/locked, and `scroll_to` would silently
+    /// no-op because it resolves its jump as `position * width`.
+    width: i32,
+    /// `AdwCarousel:position`, in pages.
+    position: f64,
+    /// This loop has already issued a `scroll_to` of its own, with real
+    /// geometry, for its own rebuild.
+    scrolled: bool,
+}
+
 /// What one frame-clock step of recentering a rebuilt carousel should do.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum SettleAction {
-    /// A newer rebuild detached this page — stop without touching state.
+    /// Superseded by a newer rebuild — stop without touching shared state.
     Abandon,
-    /// The carousel has no real geometry yet (allocation pending, or the
-    /// frame clock is stalled while the screen is blanked/locked) — a scroll
-    /// issued now would silently stay on page 0, so keep waiting.
+    /// No real geometry yet — a scroll issued now would silently stay on
+    /// page 0, so keep waiting for frames.
     Wait,
-    /// Not verifiably parked on the middle page yet — issue a scroll and
+    /// Not verifiably centered by *this* rebuild yet — issue a scroll and
     /// check again next frame.
     Scroll,
-    /// Parked on the middle page — the rebuild is finished and `page-changed`
-    /// can be trusted again.
+    /// Centered by this rebuild and parked there — `page-changed` can be
+    /// trusted again.
     Done,
 }
 
-fn reset_settle_action(page_attached: bool, width: i32, position: f64) -> SettleAction {
-    if !page_attached {
+fn settle_action(frame: SettleFrame) -> SettleAction {
+    if !frame.owns_carousel || !frame.page_attached {
         SettleAction::Abandon
-    } else if width <= 0 {
+    } else if frame.width <= 0 {
         SettleAction::Wait
-    } else if (position - MIDDLE_PAGE).abs() > 1e-6 {
+    } else if !frame.scrolled || (frame.position - MIDDLE_PAGE).abs() > POSITION_EPSILON {
+        // `scrolled` is what makes a position reading trustworthy. A rebuild
+        // that inherits a stale 1.0 from the rebuild it replaced would
+        // otherwise declare itself centered without ever having scrolled,
+        // leaving whatever page was already showing on screen.
         SettleAction::Scroll
     } else {
         SettleAction::Done
+    }
+}
+
+/// Which way a landed `page-changed` index moves the period, if at all.
+/// Index 1 is the middle page — where every rebuild parks the carousel — so
+/// landing there is our own centering, never a swipe.
+fn swipe_delta(index: u32) -> Option<i32> {
+    match index {
+        0 => Some(-1),
+        2 => Some(1),
+        _ => None,
     }
 }
 
@@ -167,10 +256,16 @@ struct Ui {
     // overnight, or crossed while the machine was suspended) can be noticed and
     // the "today" highlighting re-anchored.
     today: Rc<Cell<NaiveDate>>,
-    rebuilding: Rc<Cell<bool>>,
+    // Which rebuild owns the carousel, and whether it has landed. Everything
+    // that must not act on a half-rebuilt carousel consults this.
+    sync: Rc<Cell<CarouselSync>>,
+    // Run once by the next rebuild that verifiably lands. Startup uses it to
+    // connect the interactive handlers on the same clock that centers the
+    // first page, instead of guessing at a delay.
+    on_settled: SettledFn,
     // Set when a zoom updated only the visible page in place, leaving the
-    // offscreen neighbor pages at the old height. The next swipe rebuilds
-    // everything (via `reset`) instead of recycling a stale neighbor.
+    // offscreen neighbor pages at the old height. Navigation then preserves
+    // the hour the user was looking at across the rebuild.
     zoom_dirty: Rc<Cell<bool>>,
 }
 
@@ -185,7 +280,12 @@ impl Ui {
     /// time in view when a full rebuild happens for reasons other than
     /// navigation (e.g. the first swipe after an in-place zoom).
     fn reset_with(self: &Rc<Self>, scroll: week_view::InitialScroll) {
-        self.rebuilding.set(true);
+        let generation = {
+            let mut sync = self.sync.get();
+            let generation = sync.begin_rebuild();
+            self.sync.set(sync);
+            generation
+        };
         // A full rebuild makes every page current again.
         self.zoom_dirty.set(false);
 
@@ -218,118 +318,83 @@ impl Ui {
 
         self.title_label.set_label(&title);
 
-        // Recenter on the frame clock, not wall-clock delays: while the
-        // screen is blanked, the session is locked, or the machine is
+        // Center synchronously first. When the carousel already has geometry
+        // — every rebuild after startup — this lands before GTK paints, so a
+        // swipe doesn't flash the neighbor page that appending leaves at
+        // position 0. It silently no-ops when width is still 0, which is what
+        // the frame-clock loop below is for.
+        self.carousel.scroll_to(&current_page, false);
+
+        // Then confirm on the frame clock, never on a wall-clock delay: while
+        // the screen is blanked, the session is locked, or the machine is
         // mid-resume, the compositor sends no frames, layout never runs, and
-        // a scroll_to() issued on a timer silently stays on page 0 — the
-        // previous period (the same zero-geometry failure the startup gate in
-        // `build` works around). A tick callback only runs once frames flow
-        // again, so retry until the carousel verifiably sits on the middle
-        // page and only then trust `page-changed` (and swipes) again.
+        // scroll_to() silently stays on page 0 — the previous period. A timer
+        // fires anyway and would clear the guard over a carousel sitting on
+        // the wrong page; a tick callback only runs once frames flow again.
         let ui = self.clone();
+        // Tick callbacks are `Fn`, so this loop's own progress lives in a Cell.
+        let scrolled = Cell::new(false);
         self.carousel.add_tick_callback(move |carousel, _clock| {
-            let attached = current_page.parent().as_ref() == Some(carousel.upcast_ref());
-            match reset_settle_action(attached, carousel.width(), carousel.position()) {
+            let frame = SettleFrame {
+                owns_carousel: ui.sync.get().owns(generation),
+                page_attached: current_page.parent().as_ref() == Some(carousel.upcast_ref()),
+                width: carousel.width(),
+                position: carousel.position(),
+                scrolled: scrolled.get(),
+            };
+            match settle_action(frame) {
                 SettleAction::Abandon => glib::ControlFlow::Break,
                 SettleAction::Wait => glib::ControlFlow::Continue,
                 SettleAction::Scroll => {
                     carousel.scroll_to(&current_page, false);
+                    scrolled.set(true);
                     glib::ControlFlow::Continue
                 }
                 SettleAction::Done => {
-                    ui.rebuilding.set(false);
-                    // A date rollover noticed while this rebuild was pending
-                    // was deferred (tick_clock skips rollovers mid-rebuild);
-                    // apply it now instead of waiting out the 30s timer.
-                    ui.tick_clock();
+                    ui.settled(generation);
                     glib::ControlFlow::Break
                 }
             }
         });
     }
 
-    /// Advances the carousel by one period without rebuilding the page that
-    /// is currently visible. Keeping that page attached prevents the flash
-    /// caused by clearing the entire carousel at the end of every swipe.
-    fn advance(self: &Rc<Self>, delta: i32) {
-        self.rebuilding.set(true);
+    /// Marks `generation`'s rebuild as landed and runs the work that was
+    /// waiting on a carousel whose position can be trusted.
+    fn settled(self: &Rc<Self>, generation: u64) {
+        let mut sync = self.sync.get();
+        sync.mark_settled(generation);
+        self.sync.set(sync);
+
+        if let Some(action) = self.on_settled.borrow_mut().take() {
+            action();
+        }
+        // A date rollover noticed while this rebuild was pending was deferred
+        // (tick_clock skips rollovers mid-rebuild); apply it now instead of
+        // waiting out the 30s timer.
+        self.tick_clock();
+    }
+
+    /// Moves the display by `delta` periods and rebuilds around the new date.
+    /// Every navigation — swipe, arrow button, date rollover — goes through
+    /// here, so there is exactly one path that changes which period is shown
+    /// and exactly one place that recenters the carousel.
+    fn navigate(self: &Rc<Self>, delta: i32) {
+        // A pinch re-zoomed only the visible page, so the rebuild would
+        // otherwise drop the user back at "now". Read the hour they're
+        // looking at before the pages go away.
+        let scroll = if self.zoom_dirty.get() {
+            self.visible_scroll_hours()
+                .map(week_view::InitialScroll::AtHour)
+                .unwrap_or(week_view::InitialScroll::NowOrMorning)
+        } else {
+            week_view::InitialScroll::NowOrMorning
+        };
 
         let mut state = self.state.borrow_mut();
         state.current_date = state.shift(delta);
         drop(state);
 
-        // A zoom left the neighbor pages at the old height; recycling one as
-        // the new current page would show the wrong zoom. Rebuild all three
-        // instead, keeping the time the user was looking at (reset clears the
-        // flag).
-        if self.zoom_dirty.get() {
-            let scroll = self
-                .visible_scroll_hours()
-                .map(week_view::InitialScroll::AtHour)
-                .unwrap_or(week_view::InitialScroll::NowOrMorning);
-            self.reset_with(scroll);
-            return;
-        }
-
-        let state = self.state.borrow();
-        let view_mode = state.view_mode;
-        let current_date = state.current_date;
-        let replacement_date = state.shift_from(current_date, delta);
-        let title = state.title();
-        drop(state);
-
-        let replacement = self.build_page(
-            view_mode,
-            replacement_date,
-            week_view::InitialScroll::NowOrMorning,
-        );
-        if delta > 0 {
-            if let Some(old_prev) = self.carousel.first_child() {
-                self.carousel.remove(&old_prev);
-            }
-            self.carousel.append(&replacement);
-        } else {
-            if let Some(old_next) = self.carousel.last_child() {
-                self.carousel.remove(&old_next);
-            }
-            self.carousel.insert(&replacement, 0);
-        }
-        self.title_label.set_label(&title);
-
-        let Some(current_page) = self
-            .carousel
-            .first_child()
-            .and_then(|page| page.next_sibling())
-        else {
-            self.rebuilding.set(false);
-            return;
-        };
-        // When moving backward, inserting the new previous page briefly puts
-        // it at position zero. Recenter before GTK can paint that transient
-        // page, otherwise the swipe flashes the wrong week for one frame.
-        self.carousel.scroll_to(&current_page, false);
-        // Then confirm on the frame clock, for the same reason `reset_with`
-        // does: an idle callback runs even while the compositor sends no
-        // frames, but `scroll_to` in that state silently leaves the carousel
-        // on a neighbour page. Clearing `rebuilding` there let the
-        // `page-changed` emitted once frames resumed be misread as a fresh
-        // swipe, shifting the period a second time.
-        let ui = self.clone();
-        self.carousel.add_tick_callback(move |carousel, _clock| {
-            let attached = current_page.parent().as_ref() == Some(carousel.upcast_ref());
-            match reset_settle_action(attached, carousel.width(), carousel.position()) {
-                SettleAction::Abandon => glib::ControlFlow::Break,
-                SettleAction::Wait => glib::ControlFlow::Continue,
-                SettleAction::Scroll => {
-                    carousel.scroll_to(&current_page, false);
-                    glib::ControlFlow::Continue
-                }
-                SettleAction::Done => {
-                    ui.rebuilding.set(false);
-                    glib::ControlFlow::Break
-                }
-            }
-        });
+        self.reset_with(scroll);
     }
 
     /// Runs on a periodic timer to keep the display anchored to real time.
@@ -345,8 +410,9 @@ impl Ui {
         let previous = self.today.get();
 
         // Don't disturb an in-progress swipe/rebuild; the next tick retries
-        // (with `today` still unchanged, so the rollover isn't lost).
-        if now_date != previous && !self.rebuilding.get() {
+        // (with `today` still unchanged, so the rollover isn't lost), and the
+        // landing rebuild calls back in here as soon as it settles.
+        if now_date != previous && self.sync.get().is_settled() {
             let parked_on_today = self.state.borrow().current_date == previous;
             self.today.set(now_date);
             if parked_on_today {
@@ -605,9 +671,10 @@ pub fn build(app: &adw::Application) {
         store,
         config: Rc::new(Config::load()),
         today: Rc::new(Cell::new(Local::now().date_naive())),
-        // Guards against `page-changed`/`toggled` firing (and reentering
-        // `rebuild`) as a side effect of our own programmatic changes.
-        rebuilding: Rc::new(Cell::new(false)),
+        // Starts unsettled, so nothing treats the carousel as authoritative
+        // before the first rebuild has centered it.
+        sync: Rc::new(Cell::new(CarouselSync::default())),
+        on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
     });
 
@@ -1014,6 +1081,14 @@ pub fn build(app: &adw::Application) {
     // notify) fires a flurry of signals while the window first realizes;
     // connecting our handlers only after that settles keeps them from
     // being mistaken for real user input.
+    //
+    // The handlers are connected from the first rebuild's settle callback,
+    // not from a timer. Geometry and handler activation then share one clock:
+    // previously the rebuild centered itself on the frame clock while the
+    // handlers went live on a fixed 125ms wall-clock delay, and on a slow or
+    // frame-starved first paint that ordering inverted — `page-changed` was
+    // live over a carousel still sitting on page 0, so startup read its own
+    // uncentered position as a backward swipe and opened a week early.
     carousel.add_tick_callback(clone!(
         #[strong]
         ui,
@@ -1041,46 +1116,47 @@ pub fn build(app: &adw::Application) {
             }
 
             ui.state.borrow_mut().current_date = Local::now().date_naive();
+            // Installed before the rebuild so the settle loop can find it.
+            // If something supersedes this rebuild before it lands, the
+            // replacement inherits the pending action and connects instead —
+            // it lives on `Ui`, not on one loop.
+            ui.on_settled.replace(Some(Box::new(clone!(
+                #[strong]
+                ui,
+                #[strong]
+                today_button,
+                #[strong]
+                prev_button,
+                #[strong]
+                next_button,
+                #[strong]
+                month_toggle,
+                #[strong]
+                week_toggle,
+                #[strong]
+                day_toggle,
+                #[strong]
+                zoom_box,
+                #[strong]
+                zoom_out_button,
+                #[strong]
+                zoom_in_button,
+                move || {
+                    connect_handlers(
+                        &ui,
+                        &today_button,
+                        &prev_button,
+                        &next_button,
+                        &month_toggle,
+                        &week_toggle,
+                        &day_toggle,
+                        &zoom_box,
+                        &zoom_out_button,
+                        &zoom_in_button,
+                    );
+                }
+            ))));
             ui.reset();
-            glib::timeout_add_local_once(
-                Duration::from_millis(125),
-                clone!(
-                    #[strong]
-                    ui,
-                    #[strong]
-                    today_button,
-                    #[strong]
-                    prev_button,
-                    #[strong]
-                    next_button,
-                    #[strong]
-                    month_toggle,
-                    #[strong]
-                    week_toggle,
-                    #[strong]
-                    day_toggle,
-                    #[strong]
-                    zoom_box,
-                    #[strong]
-                    zoom_out_button,
-                    #[strong]
-                    zoom_in_button,
-                    move || {
-                        connect_handlers(
-                            &ui,
-                            &today_button,
-                            &prev_button,
-                            &next_button,
-                            &month_toggle,
-                            &week_toggle,
-                            &day_toggle,
-                            &zoom_box,
-                            &zoom_out_button,
-                            &zoom_in_button,
-                        );
-                    }
-                ),
-            );
             glib::ControlFlow::Break
         }
     ));
@@ -1163,22 +1239,18 @@ fn connect_handlers(
         #[strong]
         ui,
         move |_, index| {
-            if ui.rebuilding.get() || (index != 0 && index != 2) {
+            // Only a settled carousel can report a swipe. Unsettled, the
+            // signal is fallout from our own centering — or from a rebuild
+            // that hasn't landed — and acting on it moves the period twice.
+            if !ui.sync.get().is_settled() {
                 return;
             }
-            let delta = if index == 0 { -1 } else { 1 };
-            // `page-changed` is emitted while the swipe animation is still
-            // active. Recycling pages here races that animation, most
-            // visibly when a new page is inserted before the current one.
-            if delta > 0 {
-                ui.advance(delta);
-            } else {
-                ui.rebuilding.set(true);
-                let ui = ui.clone();
-                glib::timeout_add_local_once(Duration::from_millis(180), move || {
-                    ui.advance(delta);
-                });
-            }
+            let Some(delta) = swipe_delta(index) else {
+                return;
+            };
+            // `navigate` claims the carousel synchronously, so the rest of
+            // this swipe's signals land unsettled and are ignored.
+            ui.navigate(delta);
         }
     ));
 
@@ -1195,23 +1267,13 @@ fn connect_handlers(
     prev_button.connect_clicked(clone!(
         #[strong]
         ui,
-        move |_| {
-            let mut s = ui.state.borrow_mut();
-            s.current_date = s.shift(-1);
-            drop(s);
-            ui.reset();
-        }
+        move |_| ui.navigate(-1)
     ));
 
     next_button.connect_clicked(clone!(
         #[strong]
         ui,
-        move |_| {
-            let mut s = ui.state.borrow_mut();
-            s.current_date = s.shift(1);
-            drop(s);
-            ui.reset();
-        }
+        move |_| ui.navigate(1)
     ));
 
     for (toggle, mode) in [
@@ -2883,25 +2945,262 @@ mod tests {
         assert_eq!(draft.end - draft.start, ChronoDuration::minutes(45));
     }
 
+    /// One frame the carousel could present to the settle loop.
+    fn frame(width: i32, position: f64) -> SettleFrame {
+        SettleFrame {
+            owns_carousel: true,
+            page_attached: true,
+            width,
+            position,
+            scrolled: false,
+        }
+    }
+
     #[test]
     fn rebuild_settle_waits_while_the_carousel_has_no_geometry() {
         // Screen blanked/locked or allocation pending: scrolling now would
         // silently park the carousel on page 0, the previous period.
-        assert_eq!(reset_settle_action(true, 0, 0.0), SettleAction::Wait);
+        assert_eq!(settle_action(frame(0, 0.0)), SettleAction::Wait);
     }
 
     #[test]
     fn rebuild_settle_scrolls_until_parked_on_the_middle_page() {
-        assert_eq!(reset_settle_action(true, 800, 0.0), SettleAction::Scroll);
+        assert_eq!(settle_action(frame(800, 0.0)), SettleAction::Scroll);
     }
 
     #[test]
     fn rebuild_settle_finishes_once_parked_on_the_middle_page() {
-        assert_eq!(reset_settle_action(true, 800, 1.0), SettleAction::Done);
+        let landed = SettleFrame {
+            scrolled: true,
+            ..frame(800, 1.0)
+        };
+        assert_eq!(settle_action(landed), SettleAction::Done);
     }
 
     #[test]
     fn rebuild_settle_abandons_a_page_replaced_by_a_newer_rebuild() {
-        assert_eq!(reset_settle_action(false, 800, 1.0), SettleAction::Abandon);
+        let detached = SettleFrame {
+            page_attached: false,
+            scrolled: true,
+            ..frame(800, 1.0)
+        };
+        assert_eq!(settle_action(detached), SettleAction::Abandon);
+    }
+
+    #[test]
+    fn rebuild_settle_abandons_once_a_newer_rebuild_owns_the_carousel() {
+        // The page can still be attached when a newer rebuild takes over, so
+        // attachment alone isn't enough to notice being superseded.
+        let superseded = SettleFrame {
+            owns_carousel: false,
+            scrolled: true,
+            ..frame(800, 1.0)
+        };
+        assert_eq!(settle_action(superseded), SettleAction::Abandon);
+    }
+
+    #[test]
+    fn rebuild_settle_scrolls_before_it_trusts_a_middle_page_reading() {
+        // A rebuild that finds the carousel already reading 1.0 — a stale
+        // position left over from the rebuild it replaced — must still issue
+        // its own scroll. Trusting the reading is how a rebuild declared
+        // itself finished without ever centering, leaving the previous
+        // period on screen.
+        assert_eq!(settle_action(frame(800, 1.0)), SettleAction::Scroll);
+    }
+
+    /// Runs the settle state machine over a scripted sequence of frames the
+    /// way the tick callback does, so the *ordering* is testable without a
+    /// display. The bug this fix targets was never in one decision; it was in
+    /// which decision ran against which carousel state, and in whose rebuild
+    /// got to clear the guard.
+    struct SettleLoop {
+        sync: Rc<Cell<CarouselSync>>,
+        generation: u64,
+        scrolled: bool,
+        scrolls: usize,
+        actions: Vec<SettleAction>,
+    }
+
+    impl SettleLoop {
+        /// Begins a rebuild on `sync` and returns its settle loop.
+        fn begin(sync: &Rc<Cell<CarouselSync>>) -> Self {
+            let mut state = sync.get();
+            let generation = state.begin_rebuild();
+            sync.set(state);
+            Self {
+                sync: sync.clone(),
+                generation,
+                scrolled: false,
+                scrolls: 0,
+                actions: Vec::new(),
+            }
+        }
+
+        /// Feeds one frame in, mirroring the real callback's side effects.
+        /// Returns false once the loop has stopped.
+        fn tick(&mut self, page_attached: bool, width: i32, position: f64) -> bool {
+            let action = settle_action(SettleFrame {
+                owns_carousel: self.sync.get().owns(self.generation),
+                page_attached,
+                width,
+                position,
+                scrolled: self.scrolled,
+            });
+            self.actions.push(action);
+            match action {
+                SettleAction::Scroll => {
+                    self.scrolls += 1;
+                    self.scrolled = true;
+                    true
+                }
+                SettleAction::Wait => true,
+                SettleAction::Done => {
+                    let mut state = self.sync.get();
+                    state.mark_settled(self.generation);
+                    self.sync.set(state);
+                    false
+                }
+                SettleAction::Abandon => false,
+            }
+        }
+
+        /// Feeds `count` identical frames in, stopping early if the loop does.
+        fn tick_n(&mut self, count: usize, width: i32, position: f64) {
+            for _ in 0..count {
+                if !self.tick(true, width, position) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A carousel that centers on the frame after it's told to, which is how
+    /// a healthy one behaves: the scroll lands, then the next frame reads 1.0.
+    fn run_healthy_rebuild(sync: &Rc<Cell<CarouselSync>>) -> SettleLoop {
+        let mut loop_ = SettleLoop::begin(sync);
+        loop_.tick(true, 800, 0.0);
+        loop_.tick(true, 800, MIDDLE_PAGE);
+        loop_
+    }
+
+    #[test]
+    fn nothing_is_settled_before_the_first_rebuild_lands() {
+        // A fresh window must not read `page-changed` as a swipe: the
+        // carousel is sitting at position 0 with no rebuild behind it.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        assert!(!sync.get().is_settled());
+
+        let mut first = SettleLoop::begin(&sync);
+        assert!(!sync.get().is_settled());
+
+        // Frame clock stalled through startup — still not settled.
+        first.tick_n(10, 0, 0.0);
+        assert!(!sync.get().is_settled());
+        assert!(first.actions.iter().all(|a| *a == SettleAction::Wait));
+
+        // Frames start flowing: scroll, then confirm.
+        first.tick(true, 800, 0.0);
+        first.tick(true, 800, MIDDLE_PAGE);
+        assert!(sync.get().is_settled());
+        assert_eq!(first.scrolls, 1);
+    }
+
+    #[test]
+    fn a_stalled_frame_clock_never_settles_a_rebuild() {
+        // The blanked-screen / mid-resume case: a wall-clock timer would fire
+        // here and hand the guard to a carousel still parked a period back.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        let mut rebuild = SettleLoop::begin(&sync);
+
+        rebuild.tick_n(30, 0, 0.0);
+
+        assert!(!sync.get().is_settled());
+        assert_eq!(rebuild.scrolls, 0);
+    }
+
+    #[test]
+    fn a_rebuild_inheriting_a_centered_position_still_scrolls_before_settling() {
+        // Back-to-back navigation leaves position at 1.0 from the previous
+        // rebuild. The new one must prove it centered its *own* pages.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        run_healthy_rebuild(&sync);
+
+        let mut second = SettleLoop::begin(&sync);
+        assert!(!sync.get().is_settled());
+
+        assert!(second.tick(true, 800, MIDDLE_PAGE));
+        assert_eq!(second.actions, vec![SettleAction::Scroll]);
+        assert!(!sync.get().is_settled());
+
+        second.tick(true, 800, MIDDLE_PAGE);
+        assert!(sync.get().is_settled());
+        assert_eq!(second.scrolls, 1);
+    }
+
+    #[test]
+    fn a_superseded_rebuild_cannot_settle_the_carousel_for_a_newer_one() {
+        // Two swipes in quick succession. The first rebuild's loop is still
+        // running when the second claims the carousel; if the stale loop can
+        // clear the guard, the next `page-changed` is read as a fresh swipe
+        // and the period moves a second time. This is the bug a single
+        // "rebuilding" boolean could not express.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        let mut first = SettleLoop::begin(&sync);
+        first.tick(true, 800, 0.0);
+
+        let second = SettleLoop::begin(&sync);
+
+        // The first loop keeps running — its page is even still attached —
+        // but it must not vouch for the carousel.
+        assert!(
+            !first.tick(true, 800, MIDDLE_PAGE),
+            "a superseded loop must stop"
+        );
+        assert_eq!(first.actions.last(), Some(&SettleAction::Abandon));
+        assert!(
+            !sync.get().is_settled(),
+            "the newer rebuild has not landed, so nothing is settled"
+        );
+        assert!(sync.get().owns(second.generation));
+    }
+
+    #[test]
+    fn a_late_settle_from_an_old_generation_is_ignored() {
+        let mut sync = CarouselSync::default();
+        let stale = sync.begin_rebuild();
+        let current = sync.begin_rebuild();
+
+        sync.mark_settled(stale);
+        assert!(!sync.is_settled());
+
+        sync.mark_settled(current);
+        assert!(sync.is_settled());
+    }
+
+    #[test]
+    fn a_new_rebuild_unsettles_the_carousel() {
+        // Navigation must close the window in which `page-changed` is
+        // trusted, immediately and synchronously.
+        let sync = Rc::new(Cell::new(CarouselSync::default()));
+        run_healthy_rebuild(&sync);
+        assert!(sync.get().is_settled());
+
+        let mut state = sync.get();
+        state.begin_rebuild();
+        sync.set(state);
+
+        assert!(!sync.get().is_settled());
+    }
+
+    #[test]
+    fn only_the_outer_pages_are_read_as_swipes() {
+        assert_eq!(swipe_delta(0), Some(-1));
+        assert_eq!(swipe_delta(2), Some(1));
+    }
+
+    #[test]
+    fn landing_on_the_middle_page_is_our_own_centering_not_a_swipe() {
+        assert_eq!(swipe_delta(1), None);
     }
 }
