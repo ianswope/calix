@@ -14,6 +14,7 @@ mod icloud;
 mod notify;
 mod omarchy;
 mod recurrence;
+mod search;
 mod store;
 mod style;
 mod sync;

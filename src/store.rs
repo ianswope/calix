@@ -585,6 +585,40 @@ impl Store {
         Ok(events)
     }
 
+    /// Events whose title, location, or notes contain `query`, oldest first.
+    ///
+    /// Scoped to visible calendars, matching [`Self::events_between`]: a
+    /// calendar switched off in the sidebar is off everywhere, and search
+    /// turning up events from a calendar you deliberately hid would be its own
+    /// small betrayal.
+    ///
+    /// Recurring events match on their stored master, so a weekly series
+    /// surfaces once rather than as one hit per occurrence — the series is what
+    /// the user is looking for.
+    pub fn search_events(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Event>> {
+        let query = query.trim();
+        // Answered before it reaches SQL: the pattern for an empty query is
+        // `%%`, which matches every row in the database.
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", like_escape(query));
+        // LIKE is case-insensitive for ASCII in SQLite, which is the behavior
+        // wanted here; `location` and `notes` are nullable, and NULL LIKE
+        // anything is NULL rather than false, so they need a default.
+        let mut stmt = self.conn.prepare(&format!(
+            "{EVENT_SELECT}
+             WHERE calendars.visible != 0
+               AND (events.title LIKE ?1 ESCAPE '\\'
+                    OR IFNULL(events.location, '') LIKE ?1 ESCAPE '\\'
+                    OR IFNULL(events.notes, '') LIKE ?1 ESCAPE '\\')
+             ORDER BY events.start_at
+             LIMIT ?2"
+        ))?;
+        stmt.query_map(params![pattern, limit as i64], row_to_event)?
+            .collect()
+    }
+
     /// The stored event with `id`, if any. Unlike [`Self::events_between`] this
     /// returns the raw row — for a recurring event that's the series master, not
     /// an expanded occurrence.
@@ -912,6 +946,20 @@ fn ensure_column(
 
 /// The columns [`row_to_event`] reads, with the joins supplying the calendar
 /// and account fields. Callers append their own `WHERE` (and any `ORDER BY`).
+/// Escapes the characters SQL `LIKE` treats as wildcards, so a literal `%` or
+/// `_` typed into the search box matches itself.
+///
+/// Without this, searching for `%` matches every event in the database and
+/// `_` matches any single character — the two most likely ways for a search to
+/// look broken while behaving exactly as written. The backslash must be escaped
+/// first, or it would escape the escapes added after it.
+fn like_escape(query: &str) -> String {
+    query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name, calendars.color,
             accounts.provider, accounts.provider_account_id, accounts.token_key,
             calendars.google_calendar_id,
@@ -1110,6 +1158,108 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
         }
+    }
+
+    /// A store holding one event per (title, location, notes) triple given,
+    /// each an hour long and a day apart so ordering is unambiguous.
+    fn store_with(rows: &[(&str, Option<&str>, Option<&str>)]) -> Store {
+        let store = Store::open_in_memory().expect("an in-memory database");
+        let base = Local
+            .with_ymd_and_hms(2026, 3, 1, 9, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        for (index, (title, location, notes)) in rows.iter().enumerate() {
+            let start = base + Duration::days(index as i64);
+            let mut event = draft(title, start, start + Duration::hours(1));
+            event.location = location.map(str::to_string);
+            event.notes = notes.map(str::to_string);
+            store.create_event(1, &event).expect("the event to store");
+        }
+        store
+    }
+
+    fn titles(events: &[Event]) -> Vec<&str> {
+        events.iter().map(|event| event.title.as_str()).collect()
+    }
+
+    #[test]
+    fn search_matches_a_title_regardless_of_case() {
+        let store = store_with(&[("Dentist", None, None), ("Standup", None, None)]);
+        let found = store.search_events("dent", 20).expect("a search");
+        assert_eq!(titles(&found), vec!["Dentist"]);
+    }
+
+    #[test]
+    fn search_also_looks_in_location_and_notes() {
+        let store = store_with(&[
+            ("Lunch", Some("Blue Bottle"), None),
+            ("Review", None, Some("bring the blue folder")),
+            ("Standup", None, None),
+        ]);
+        let found = store.search_events("blue", 20).expect("a search");
+        assert_eq!(titles(&found), vec!["Lunch", "Review"]);
+    }
+
+    #[test]
+    fn a_literal_percent_does_not_match_every_event() {
+        // Unescaped, this is the LIKE wildcard for "anything", so the search
+        // would silently return the whole database.
+        let store = store_with(&[("Raise 5% budget", None, None), ("Standup", None, None)]);
+        let found = store.search_events("%", 20).expect("a search");
+        assert_eq!(titles(&found), vec!["Raise 5% budget"]);
+    }
+
+    #[test]
+    fn a_literal_underscore_does_not_match_any_character() {
+        let store = store_with(&[("snake_case rename", None, None), ("Standup", None, None)]);
+        let found = store.search_events("_", 20).expect("a search");
+        assert_eq!(titles(&found), vec!["snake_case rename"]);
+    }
+
+    #[test]
+    fn a_literal_backslash_is_found_rather_than_escaping_what_follows() {
+        let store = store_with(&[("path\\to\\file", None, None), ("Standup", None, None)]);
+        let found = store.search_events("\\", 20).expect("a search");
+        assert_eq!(titles(&found), vec!["path\\to\\file"]);
+    }
+
+    #[test]
+    fn an_empty_search_finds_nothing_rather_than_everything() {
+        // "%%" matches every row, so an empty box must be answered before it
+        // ever reaches SQL.
+        let store = store_with(&[("Dentist", None, None), ("Standup", None, None)]);
+        for query in ["", "   ", "\t\n"] {
+            assert!(
+                store.search_events(query, 20).expect("a search").is_empty(),
+                "{query:?} should find nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn search_returns_matches_oldest_first_and_honors_the_limit() {
+        let store = store_with(&[
+            ("Sync one", None, None),
+            ("Sync two", None, None),
+            ("Sync three", None, None),
+        ]);
+        let found = store.search_events("sync", 2).expect("a search");
+        assert_eq!(titles(&found), vec!["Sync one", "Sync two"]);
+    }
+
+    #[test]
+    fn search_skips_calendars_hidden_in_the_sidebar() {
+        let store = store_with(&[("Dentist", None, None)]);
+        store
+            .set_calendar_visible(1, false)
+            .expect("visibility to update");
+        assert!(
+            store
+                .search_events("dent", 20)
+                .expect("a search")
+                .is_empty(),
+            "a hidden calendar's events must stay hidden in search"
+        );
     }
 
     fn test_account(display_name: &str, provider_account_id: &str) -> Account {

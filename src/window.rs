@@ -9,6 +9,7 @@ use crate::event_dialog;
 use crate::event_popover;
 use crate::google;
 use crate::icloud;
+use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
 use crate::views::{drag::DragKind, month_view, week_view};
@@ -37,6 +38,7 @@ enum KeyCommand {
     ViewWeek,
     ViewDay,
     NewEvent,
+    Search,
 }
 
 /// Maps a keypress to the command it triggers, or `None` to let it through.
@@ -68,6 +70,7 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
         gdk::Key::_3 | gdk::Key::KP_3 => Some(KeyCommand::ViewDay),
         gdk::Key::t | gdk::Key::T => Some(KeyCommand::Today),
         gdk::Key::n | gdk::Key::N => Some(KeyCommand::NewEvent),
+        gdk::Key::f | gdk::Key::F => Some(KeyCommand::Search),
         gdk::Key::Left | gdk::Key::KP_Left => Some(KeyCommand::Previous),
         gdk::Key::Right | gdk::Key::KP_Right => Some(KeyCommand::Next),
         _ => None,
@@ -979,6 +982,27 @@ pub fn build(app: &adw::Application) {
     }
     refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
 
+    let search_button = gtk::Button::from_icon_name("system-search-symbolic");
+    search_button.set_tooltip_text(Some("Search events (Ctrl+F)"));
+    search_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        move |button| {
+            let ui_for_pick = ui.clone();
+            search::open(
+                button,
+                ui.store.clone(),
+                Rc::new(move |event: Event| {
+                    // Land on the event's day and let the normal render show
+                    // it, rather than inventing a selection state the grid
+                    // would then have to maintain.
+                    ui_for_pick.state.borrow_mut().current_date = event.start.date_naive();
+                    ui_for_pick.reset();
+                }),
+            );
+        }
+    ));
+
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
     new_event_button.set_tooltip_text(Some("New Event (Ctrl+N)"));
     new_event_button.connect_clicked(clone!(
@@ -1220,6 +1244,7 @@ pub fn build(app: &adw::Application) {
     header.pack_end(&view_toggle_box);
     header.pack_end(&zoom_box);
     header.pack_end(&new_event_button);
+    header.pack_end(&search_button);
     header.pack_end(&calendars_button);
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
@@ -1261,6 +1286,8 @@ pub fn build(app: &adw::Application) {
         #[strong]
         new_event_button,
         #[strong]
+        search_button,
+        #[strong]
         month_toggle,
         #[strong]
         week_toggle,
@@ -1275,6 +1302,7 @@ pub fn build(app: &adw::Application) {
                 KeyCommand::Previous => prev_button.emit_clicked(),
                 KeyCommand::Next => next_button.emit_clicked(),
                 KeyCommand::NewEvent => new_event_button.emit_clicked(),
+                KeyCommand::Search => search_button.emit_clicked(),
                 // Setting an already-active toggle emits nothing, which is
                 // exactly the wanted no-op.
                 KeyCommand::ViewMonth => month_toggle.set_active(true),
@@ -3236,6 +3264,11 @@ mod tests {
             Some(KeyCommand::ViewWeek)
         );
         assert_eq!(key_command(gdk::Key::KP_3, CTRL), Some(KeyCommand::ViewDay));
+    }
+
+    #[test]
+    fn ctrl_f_opens_search() {
+        assert_eq!(key_command(gdk::Key::f, CTRL), Some(KeyCommand::Search));
     }
 
     #[test]

@@ -156,6 +156,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
 - **Inspect**: click any event for a popover with its time, calendar, location, notes, and attendee replies. **Edit** opens the full dialog. Glancing at an event no longer costs a modal to dismiss.
+- **Search**: the magnifier in the header (`Ctrl+F`) matches event titles, locations, and notes across every visible calendar. Picking a result jumps the grid to that day. Results are capped, and the popover says so when the cap bites rather than passing a truncated list off as the whole answer.
 - **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts work on any event, including synced ones, but live only on this machine (they aren't written back to Google/CalDAV) and fire while Calix is running — pair them with autostarting Calix if you rely on them.
 
 ### Keyboard shortcuts
@@ -166,6 +167,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 | `Ctrl+←` / `Ctrl+→` | Previous / next period |
 | `Ctrl+T` | Jump to today |
 | `Ctrl+N` | New event |
+| `Ctrl+F` | Search events |
 
 The digits follow the view toggles left-to-right as they appear in the header. Every binding takes Ctrl on purpose: an unmodified key belongs to whatever has focus, so a shortcut can never swallow a character you meant to type into an event title.
 
@@ -212,7 +214,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - [x] Recurrence editing for synced CalDAV/iCloud series — edit or delete one occurrence or the whole series
 - [ ] Per-occurrence editing for local recurring events; whole-series edits for Google recurring events
 - [x] Event alerts / desktop notifications (local to the machine, while Calix runs)
-- [ ] Event search
+- [x] Event search
 - [ ] Packaging (AUR, Flatpak)
 
 ## Contributing
