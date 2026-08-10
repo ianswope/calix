@@ -338,6 +338,10 @@ impl State {
 struct Ui {
     carousel: adw::Carousel,
     calendar_list: gtk::Box,
+    /// Holds the sidebar's mini month. It follows `current_date` rather than
+    /// carrying an anchor of its own, so there is no second notion of "the
+    /// month being looked at" that could drift from the main view's.
+    mini_month: gtk::Box,
     title_label: gtk::Label,
     toast_overlay: adw::ToastOverlay,
     state: Rc<RefCell<State>>,
@@ -380,6 +384,11 @@ impl Ui {
         };
         // A full rebuild makes every page current again.
         self.zoom_dirty.set(false);
+
+        // The mini month follows the same date, so it is rebuilt on the same
+        // beat rather than left showing the month the user just navigated away
+        // from.
+        self.reset_mini_month();
 
         let mut child = self.carousel.first_child();
         while let Some(widget) = child {
@@ -615,6 +624,67 @@ impl Ui {
             move_now_indicators(&page, margin);
             child = page.next_sibling();
         }
+    }
+
+    /// Rebuilds the sidebar's mini month from the current date.
+    ///
+    /// Its arrows move the main view by a month rather than paging the
+    /// thumbnail alone. One date is being looked at, not two, and a mini month
+    /// showing March while the grid shows August is a bug users have to hold in
+    /// their head.
+    fn reset_mini_month(self: &Rc<Self>) {
+        let mut child = self.mini_month.first_child();
+        while let Some(widget) = child {
+            let next = widget.next_sibling();
+            self.mini_month.remove(&widget);
+            child = next;
+        }
+
+        let anchor = self.state.borrow().current_date;
+        let (range_start, range_end) = month_grid_bounds(anchor);
+        let events = self
+            .store
+            .events_between(store::day_start(range_start), store::day_start(range_end))
+            .unwrap_or_default();
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let prev = gtk::Button::from_icon_name("go-previous-symbolic");
+        let next = gtk::Button::from_icon_name("go-next-symbolic");
+        for button in [&prev, &next] {
+            button.add_css_class("flat");
+        }
+        let title = gtk::Label::new(Some(&anchor.format("%B %Y").to_string()));
+        title.add_css_class("heading");
+        title.set_hexpand(true);
+        title.set_xalign(0.0);
+        header.append(&title);
+        header.append(&prev);
+        header.append(&next);
+
+        for (button, delta) in [(&prev, -1), (&next, 1)] {
+            let ui = self.clone();
+            button.connect_clicked(move |_| {
+                let shifted = shift_months(ui.state.borrow().current_date, delta);
+                ui.state.borrow_mut().current_date = shifted;
+                ui.reset();
+            });
+        }
+
+        let ui = self.clone();
+        let thumbnail = year_view::month_thumbnail(
+            month_start(anchor),
+            &events,
+            self.today.get(),
+            Rc::new(move |picked: NaiveDate| {
+                // Keeps the current view mode: the mini month answers "take me
+                // to this date", not "show me a day".
+                ui.state.borrow_mut().current_date = picked;
+                ui.reset();
+            }),
+        );
+
+        self.mini_month.append(&header);
+        self.mini_month.append(&thumbnail);
     }
 
     fn reset_calendar_sidebar(self: &Rc<Self>) {
@@ -861,6 +931,9 @@ pub fn build(app: &adw::Application) {
     calendar_sidebar.set_size_request(300, -1);
     calendar_sidebar.set_visible(false);
     calendar_sidebar.add_css_class("calendar-sidebar");
+    let mini_month = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    mini_month.add_css_class("mini-month");
+
     let calendar_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
     calendar_list.set_hexpand(true);
     calendar_list.set_vexpand(true);
@@ -872,6 +945,7 @@ pub fn build(app: &adw::Application) {
     let ui = Rc::new(Ui {
         carousel: carousel.clone(),
         calendar_list: calendar_list.clone(),
+        mini_month: mini_month.clone(),
         title_label,
         toast_overlay: adw::ToastOverlay::new(),
         state,
@@ -1143,8 +1217,10 @@ pub fn build(app: &adw::Application) {
         &caldav_sync_button,
         &manage_accounts_button,
     ));
+    calendar_sidebar.append(&mini_month);
     calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
+    ui.reset_mini_month();
 
     // Refresh from every connected account as soon as the window is up, then
     // keep the grid fresh with a periodic background re-sync while the app

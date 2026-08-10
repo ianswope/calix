@@ -149,7 +149,7 @@ The left sidebar lists local calendars and synced Google/iCloud/CalDAV calendars
 
 **Year view** shows the twelve months as thumbnails with busy days weighted; clicking a day opens it in Day view. Swiping or the arrows move a whole year at a time.
 
-The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add**/**Sync** buttons for Google, iCloud, and CalDAV.
+The calendar button in the header toggles the sidebar, which opens with a mini month for jumping to a date — its arrows move the calendar a month at a time, and clicking a day goes there without changing the view mode. The sidebar's Accounts section contains **Add**/**Sync** buttons for Google, iCloud, and CalDAV.
 
 ### Working with events
 
@@ -197,6 +197,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 
 - [x] Swipeable month/week grid
 - [x] Year view — twelve month thumbnails, busy days weighted, click a day to open it
+- [x] Sidebar mini month for jumping to a date
 - [x] Local event storage (SQLite) + create/edit events
 - [x] Google sign-in (OAuth + PKCE, verified by fetching the calendar list)
 - [x] Pull Google events from multiple Google accounts into the month/week grid (one-way sync)
