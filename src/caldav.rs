@@ -356,7 +356,7 @@ fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<S
         .map(str::to_owned);
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("CalDAV error ({status}): {body}"));
+        return Err(http_error(status.as_u16(), &body));
     }
     Ok((body, etag))
 }
@@ -380,7 +380,7 @@ fn put_event(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("CalDAV error ({status}): {body}"));
+        return Err(http_error(status.as_u16(), &body));
     }
     Ok(())
 }
@@ -408,7 +408,7 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(format!("CalDAV error ({status}): {body}"));
+        return Err(http_error(status.as_u16(), &body));
     }
     Ok(())
 }
@@ -595,9 +595,29 @@ fn request(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() && status.as_u16() != 207 {
-        return Err(format!("CalDAV error ({status}): {body}"));
+        return Err(http_error(status.as_u16(), &body));
     }
     Ok(body)
+}
+
+/// Renders a failed CalDAV response as a message that says what to do next.
+///
+/// A 401 is the one status that actually means "this credential is dead": for
+/// iCloud that happens when the app-specific password is revoked, which
+/// changing your Apple ID password does to all of them at once. Every other
+/// status is a server- or request-level problem that generating a new password
+/// would not fix, so the message must not imply otherwise — an unexplained 5xx
+/// that reads like an auth failure is what sends you to Apple's website to
+/// mint a password you did not need.
+fn http_error(status: u16, body: &str) -> String {
+    if status == 401 {
+        return "CalDAV rejected the saved credential (401 Unauthorized). \
+                Generate a new app-specific password at account.apple.com and \
+                reconnect the account — changing your Apple ID password revokes \
+                every app-specific password at once."
+            .to_string();
+    }
+    format!("CalDAV error ({status}): {body}")
 }
 
 /// Resolves a possibly-relative href (as CalDAV servers return in multistatus
@@ -1487,6 +1507,28 @@ fn unescape_ics_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_credential_says_to_generate_a_new_app_specific_password() {
+        let message = http_error(401, "");
+        assert!(
+            message.contains("app-specific password"),
+            "a 401 should name the fix: {message}"
+        );
+    }
+
+    #[test]
+    fn a_server_error_does_not_blame_the_saved_password() {
+        let message = http_error(503, "Service Unavailable");
+        assert!(
+            !message.contains("app-specific password"),
+            "only a 401 means the credential is dead: {message}"
+        );
+        assert!(
+            message.contains("503") && message.contains("Service Unavailable"),
+            "the status and body still have to survive: {message}"
+        );
+    }
 
     #[test]
     fn canonical_base_url_normalizes_equivalent_spellings() {
