@@ -2279,12 +2279,63 @@ fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     group.add(&apple_id_row);
     group.add(&password_row);
 
+    // Spelled out as steps rather than one line of prose: the password is
+    // usually generated on a phone while this dialog sits on the desktop, so
+    // the instructions have to survive being read from across the room.
     let note = gtk::Label::new(Some(
-        "Use an app-specific password from account.apple.com, not your Apple Account password.",
+        "iCloud needs an app-specific password — not your Apple Account password.\n\
+         1. Open Apple Account settings below and sign in.\n\
+         2. Under Sign-In and Security, choose App-Specific Passwords.\n\
+         3. Generate one for Calix and paste it here.",
     ));
+    // `set_wrap` alone isn't enough: a wrapping GtkLabel still requests its
+    // full natural width, so a long line silently widens the dialog past the
+    // 420px it asked for. Capping the character width is what makes it
+    // actually wrap instead.
+    const PROSE_WIDTH_CHARS: i32 = 44;
+
     note.set_wrap(true);
+    note.set_max_width_chars(PROSE_WIDTH_CHARS);
     note.set_xalign(0.0);
     note.add_css_class("dim-label");
+
+    let link_button = gtk::LinkButton::builder()
+        .label("Open Apple Account settings")
+        .uri(icloud::APP_PASSWORD_URL)
+        .halign(gtk::Align::Start)
+        .build();
+
+    // Hint, not a gate: it appears while the field doesn't look like Apple's
+    // format, but never blocks Connect. See `normalize_app_password`.
+    let hint_label = gtk::Label::new(None);
+    hint_label.set_wrap(true);
+    hint_label.set_max_width_chars(PROSE_WIDTH_CHARS);
+    hint_label.set_xalign(0.0);
+    hint_label.add_css_class("dim-label");
+    hint_label.set_visible(false);
+
+    let error_label = gtk::Label::new(None);
+    error_label.set_wrap(true);
+    error_label.set_max_width_chars(PROSE_WIDTH_CHARS);
+    error_label.set_xalign(0.0);
+    error_label.add_css_class("error");
+    error_label.set_visible(false);
+
+    password_row.connect_changed(clone!(
+        #[weak]
+        hint_label,
+        move |row| {
+            let text = row.text();
+            let unrecognized =
+                !text.trim().is_empty() && icloud::normalize_app_password(&text).is_none();
+            hint_label.set_label(
+                "That doesn't look like an app-specific password — Apple's are \
+                 sixteen letters, shown like abcd-efgh-ijkl-mnop. Connecting will \
+                 still try it.",
+            );
+            hint_label.set_visible(unrecognized);
+        }
+    ));
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_margin_top(18);
@@ -2292,7 +2343,10 @@ fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     content.set_margin_start(18);
     content.set_margin_end(18);
     content.append(&group);
+    content.append(&hint_label);
+    content.append(&error_label);
     content.append(&note);
+    content.append(&link_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
@@ -2316,29 +2370,63 @@ fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
         sync_button,
         #[weak]
         dialog,
+        #[weak]
+        error_label,
+        #[strong]
+        connect_button,
         move |_| {
             let apple_id = apple_id_row.text().trim().to_string();
-            let app_password = password_row.text().trim().to_string();
-            if apple_id.is_empty() || app_password.is_empty() {
+            let typed = password_row.text().to_string();
+            if apple_id.is_empty() || typed.trim().is_empty() {
+                // Previously a silent `return`, which read as a dead button.
+                error_label
+                    .set_label("Enter your Apple Account email and an app-specific password.");
+                error_label.set_visible(true);
                 return;
             }
-            dialog.close();
-            add_icloud_account(&ui, &add_button, &sync_button, apple_id, app_password);
+            error_label.set_visible(false);
+            // Send the canonical form when we recognize one, and the raw input
+            // when we don't — an unfamiliar format is still worth attempting.
+            let app_password =
+                icloud::normalize_app_password(&typed).unwrap_or_else(|| typed.trim().to_string());
+            add_icloud_account(
+                &ui,
+                &add_button,
+                &sync_button,
+                &dialog,
+                &error_label,
+                &connect_button,
+                apple_id,
+                app_password,
+            );
         }
     ));
 
     dialog.present(Some(&ui.carousel));
 }
 
+/// Connects an iCloud account, keeping `dialog` open until it succeeds.
+///
+/// The dialog used to close on click, before the network attempt: a mistyped
+/// password then threw away both fields and reported itself as a toast over an
+/// empty screen, so correcting a single character meant retyping everything.
+/// Holding it open until the credentials actually verify makes a failed attempt
+/// cost one edit.
+#[allow(clippy::too_many_arguments)]
 fn add_icloud_account(
     ui: &Rc<Ui>,
     add_button: &gtk::Button,
     sync_button: &gtk::Button,
+    dialog: &adw::Dialog,
+    error_label: &gtk::Label,
+    connect_button: &gtk::Button,
     apple_id: String,
     app_password: String,
 ) {
     add_button.set_sensitive(false);
     add_button.set_label("Connecting…");
+    connect_button.set_sensitive(false);
+    connect_button.set_label("Connecting…");
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -2376,38 +2464,52 @@ fn add_icloud_account(
             add_button,
             #[strong]
             sync_button,
-            move || match rx.try_recv() {
-                Ok(Ok(result)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
-                            &result.outcome,
-                            &result.display_name,
-                            "iCloud calendar",
-                        ))));
+            #[strong]
+            dialog,
+            #[strong]
+            error_label,
+            #[strong]
+            connect_button,
+            move || {
+                let restore = || {
                     add_button.set_label("Add iCloud");
                     add_button.set_sensitive(true);
-                    update_icloud_sync_button(&ui, &sync_button);
-                    ui.reset_calendar_sidebar();
-                    ui.reset();
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(error)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
-                            "iCloud connect failed: {}",
-                            first_line(&error)
-                        ))));
-                    add_button.set_label("Add iCloud");
-                    add_button.set_sensitive(true);
-                    update_icloud_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    add_button.set_label("Add iCloud");
-                    add_button.set_sensitive(true);
-                    update_icloud_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
+                    connect_button.set_label("Connect");
+                    connect_button.set_sensitive(true);
+                };
+                match rx.try_recv() {
+                    Ok(Ok(result)) => {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                                &result.outcome,
+                                &result.display_name,
+                                "iCloud calendar",
+                            ))));
+                        restore();
+                        dialog.close();
+                        update_icloud_sync_button(&ui, &sync_button);
+                        ui.reset_calendar_sidebar();
+                        ui.reset();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        // Inline, with the dialog still up and both fields
+                        // intact, rather than a toast over an empty screen.
+                        error_label.set_label(first_line(&error));
+                        error_label.set_visible(true);
+                        restore();
+                        update_icloud_sync_button(&ui, &sync_button);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error_label
+                            .set_label("The connection attempt stopped unexpectedly. Try again.");
+                        error_label.set_visible(true);
+                        restore();
+                        update_icloud_sync_button(&ui, &sync_button);
+                        glib::ControlFlow::Break
+                    }
                 }
             }
         ),
@@ -2679,7 +2781,13 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
          or your Nextcloud URL. Many providers want an app password rather than \
          your login password.",
     ));
+    // Capped for the same reason as the iCloud dialog: wrapping alone still
+    // lets a long line widen the dialog. This one now carries server error
+    // text, which can be arbitrarily long.
+    const PROSE_WIDTH_CHARS: i32 = 44;
+
     note.set_wrap(true);
+    note.set_max_width_chars(PROSE_WIDTH_CHARS);
     note.set_xalign(0.0);
     note.add_css_class("dim-label");
 
@@ -2687,6 +2795,7 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
+    error_label.set_max_width_chars(PROSE_WIDTH_CHARS);
     error_label.set_visible(false);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -2722,6 +2831,8 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
         dialog,
         #[weak]
         error_label,
+        #[strong]
+        connect_button,
         move |_| {
             let server_url = server_row.text().trim().to_string();
             let username = username_row.text().trim().to_string();
@@ -2753,11 +2864,14 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
                 error_label.set_visible(true);
                 return;
             }
-            dialog.close();
+            error_label.set_visible(false);
             add_caldav_account(
                 &ui,
                 &add_button,
                 &sync_button,
+                &dialog,
+                &error_label,
+                &connect_button,
                 server_url,
                 username,
                 password,
@@ -2768,16 +2882,29 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     dialog.present(Some(&ui.carousel));
 }
 
+/// Connects a generic CalDAV account, keeping `dialog` open until it succeeds.
+/// Same reasoning as [`add_icloud_account`]: a rejected password should cost
+/// one edit, not a full retype of server, username, and password.
+///
+/// Unlike iCloud there's no format to normalize against — every provider
+/// issues its own shape — so the password is passed through untouched rather
+/// than trimmed, since a server password may legitimately end in a space.
+#[allow(clippy::too_many_arguments)]
 fn add_caldav_account(
     ui: &Rc<Ui>,
     add_button: &gtk::Button,
     sync_button: &gtk::Button,
+    dialog: &adw::Dialog,
+    error_label: &gtk::Label,
+    connect_button: &gtk::Button,
     server_url: String,
     username: String,
     password: String,
 ) {
     add_button.set_sensitive(false);
     add_button.set_label("Connecting…");
+    connect_button.set_sensitive(false);
+    connect_button.set_label("Connecting…");
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -2817,38 +2944,50 @@ fn add_caldav_account(
             add_button,
             #[strong]
             sync_button,
-            move || match rx.try_recv() {
-                Ok(Ok(result)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
-                            &result.outcome,
-                            &result.display_name,
-                            "calendar",
-                        ))));
+            #[strong]
+            dialog,
+            #[strong]
+            error_label,
+            #[strong]
+            connect_button,
+            move || {
+                let restore = || {
                     add_button.set_label("Add CalDAV");
                     add_button.set_sensitive(true);
-                    update_caldav_sync_button(&ui, &sync_button);
-                    ui.reset_calendar_sidebar();
-                    ui.reset();
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(error)) => {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
-                            "CalDAV connect failed: {}",
-                            first_line(&error)
-                        ))));
-                    add_button.set_label("Add CalDAV");
-                    add_button.set_sensitive(true);
-                    update_caldav_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    add_button.set_label("Add CalDAV");
-                    add_button.set_sensitive(true);
-                    update_caldav_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
+                    connect_button.set_label("Connect");
+                    connect_button.set_sensitive(true);
+                };
+                match rx.try_recv() {
+                    Ok(Ok(result)) => {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                                &result.outcome,
+                                &result.display_name,
+                                "calendar",
+                            ))));
+                        restore();
+                        dialog.close();
+                        update_caldav_sync_button(&ui, &sync_button);
+                        ui.reset_calendar_sidebar();
+                        ui.reset();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        error_label.set_label(first_line(&error));
+                        error_label.set_visible(true);
+                        restore();
+                        update_caldav_sync_button(&ui, &sync_button);
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error_label
+                            .set_label("The connection attempt stopped unexpectedly. Try again.");
+                        error_label.set_visible(true);
+                        restore();
+                        update_caldav_sync_button(&ui, &sync_button);
+                        glib::ControlFlow::Break
+                    }
                 }
             }
         ),
