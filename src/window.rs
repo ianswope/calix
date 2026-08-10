@@ -13,6 +13,7 @@ use crate::sync::{self, SyncOutcome};
 use crate::views::{drag::DragKind, month_view, week_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
+use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
 use gtk::glib::clone;
@@ -20,6 +21,57 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// A command reachable from the keyboard.
+///
+/// Kept separate from the widgets that perform it so the mapping is a pure
+/// function: which key means what is the part worth testing, and it needs no
+/// display to check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCommand {
+    Today,
+    Previous,
+    Next,
+    ViewMonth,
+    ViewWeek,
+    ViewDay,
+    NewEvent,
+}
+
+/// Maps a keypress to the command it triggers, or `None` to let it through.
+///
+/// Every binding requires Ctrl. Plain keys are deliberately unbound: this
+/// controller sits on the window, so an unmodified letter reaching it would be
+/// a letter the user was typing into an event title. Requiring a modifier is
+/// what keeps a global shortcut from eating text entry.
+fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
+    // Caps Lock rides along on ordinary presses and says nothing about
+    // intent, so it's ignored. Alt, Super, Hyper and Meta do change intent, so
+    // a chord carrying one of them belongs to some other binding, not ours.
+    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+    let other = state.intersects(
+        gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SUPER_MASK
+            | gdk::ModifierType::HYPER_MASK
+            | gdk::ModifierType::META_MASK,
+    );
+    if !ctrl || other {
+        return None;
+    }
+    match key {
+        // Numbered left-to-right as the header's toggles read, so the digit
+        // matches what the eye sees. Apple numbers by its View menu instead,
+        // which would put Day on Ctrl+1 while Month sits leftmost on screen.
+        gdk::Key::_1 | gdk::Key::KP_1 => Some(KeyCommand::ViewMonth),
+        gdk::Key::_2 | gdk::Key::KP_2 => Some(KeyCommand::ViewWeek),
+        gdk::Key::_3 | gdk::Key::KP_3 => Some(KeyCommand::ViewDay),
+        gdk::Key::t | gdk::Key::T => Some(KeyCommand::Today),
+        gdk::Key::n | gdk::Key::N => Some(KeyCommand::NewEvent),
+        gdk::Key::Left | gdk::Key::KP_Left => Some(KeyCommand::Previous),
+        gdk::Key::Right | gdk::Key::KP_Right => Some(KeyCommand::Next),
+        _ => None,
+    }
+}
 
 type CreateFn = Rc<dyn Fn(DateTime<Local>)>;
 type EditFn = Rc<dyn Fn(Event)>;
@@ -851,13 +903,19 @@ pub fn build(app: &adw::Application) {
         ),
     );
 
+    // Tooltips carry the accelerator: with no menu bar and no shortcuts
+    // window yet, the control itself is the only place a binding can be
+    // discovered.
     let today_button = gtk::Button::builder().label("Today").build();
     today_button.add_css_class("header-small");
+    today_button.set_tooltip_text(Some("Jump to today (Ctrl+T)"));
     // Header-bar children default to valign fill, which stretches buttons to
     // the bar's full content height — natural (small) height needs center.
     today_button.set_valign(gtk::Align::Center);
     let prev_button = gtk::Button::from_icon_name("go-previous-symbolic");
+    prev_button.set_tooltip_text(Some("Previous (Ctrl+Left)"));
     let next_button = gtk::Button::from_icon_name("go-next-symbolic");
+    next_button.set_tooltip_text(Some("Next (Ctrl+Right)"));
     let nav_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     nav_box.add_css_class("linked");
     nav_box.append(&prev_button);
@@ -877,6 +935,10 @@ pub fn build(app: &adw::Application) {
         .group(&month_toggle)
         .active(initial_view_mode == ViewMode::Day)
         .build();
+    month_toggle.set_tooltip_text(Some("Month view (Ctrl+1)"));
+    week_toggle.set_tooltip_text(Some("Week view (Ctrl+2)"));
+    day_toggle.set_tooltip_text(Some("Day view (Ctrl+3)"));
+
     let view_toggle_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     view_toggle_box.add_css_class("linked");
     view_toggle_box.append(&month_toggle);
@@ -904,7 +966,7 @@ pub fn build(app: &adw::Application) {
     refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
 
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
-    new_event_button.set_tooltip_text(Some("New Event"));
+    new_event_button.set_tooltip_text(Some("New Event (Ctrl+N)"));
     new_event_button.connect_clicked(clone!(
         #[strong]
         ui,
@@ -1164,6 +1226,50 @@ pub fn build(app: &adw::Application) {
         .default_height(750)
         .content(&ui.toast_overlay)
         .build();
+
+    // Each command re-triggers the control that already performs it rather
+    // than repeating its body, so a shortcut can't drift from the button it
+    // shadows. View switching activates the toggle instead of calling
+    // `set_view_mode`, because the toggle is what the header draws — bypassing
+    // it would change the grid while the header still claimed the old mode.
+    //
+    // The controller stays on the default (bubble) phase, so a focused entry
+    // sees the key first and only unclaimed presses reach here.
+    let key_controller = gtk::EventControllerKey::new();
+    key_controller.connect_key_pressed(clone!(
+        #[strong]
+        today_button,
+        #[strong]
+        prev_button,
+        #[strong]
+        next_button,
+        #[strong]
+        new_event_button,
+        #[strong]
+        month_toggle,
+        #[strong]
+        week_toggle,
+        #[strong]
+        day_toggle,
+        move |_, key, _, state| {
+            let Some(command) = key_command(key, state) else {
+                return glib::Propagation::Proceed;
+            };
+            match command {
+                KeyCommand::Today => today_button.emit_clicked(),
+                KeyCommand::Previous => prev_button.emit_clicked(),
+                KeyCommand::Next => next_button.emit_clicked(),
+                KeyCommand::NewEvent => new_event_button.emit_clicked(),
+                // Setting an already-active toggle emits nothing, which is
+                // exactly the wanted no-op.
+                KeyCommand::ViewMonth => month_toggle.set_active(true),
+                KeyCommand::ViewWeek => week_toggle.set_active(true),
+                KeyCommand::ViewDay => day_toggle.set_active(true),
+            }
+            glib::Propagation::Stop
+        }
+    ));
+    window.add_controller(key_controller);
 
     // Below this width, step the grid's text down a size (style.rs's
     // `window.compact-text` rules) so day columns stay readable instead of
@@ -3089,6 +3195,95 @@ fn host_label(server_url: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    const CTRL: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK;
+    const NONE: gdk::ModifierType = gdk::ModifierType::empty();
+
+    #[test]
+    fn ctrl_and_a_digit_switches_view_in_the_order_the_toggles_read() {
+        assert_eq!(
+            key_command(gdk::Key::_1, CTRL),
+            Some(KeyCommand::ViewMonth),
+            "Ctrl+1 should pick the leftmost toggle"
+        );
+        assert_eq!(key_command(gdk::Key::_2, CTRL), Some(KeyCommand::ViewWeek));
+        assert_eq!(key_command(gdk::Key::_3, CTRL), Some(KeyCommand::ViewDay));
+    }
+
+    #[test]
+    fn the_keypad_digits_work_too() {
+        assert_eq!(
+            key_command(gdk::Key::KP_1, CTRL),
+            Some(KeyCommand::ViewMonth)
+        );
+        assert_eq!(
+            key_command(gdk::Key::KP_2, CTRL),
+            Some(KeyCommand::ViewWeek)
+        );
+        assert_eq!(key_command(gdk::Key::KP_3, CTRL), Some(KeyCommand::ViewDay));
+    }
+
+    #[test]
+    fn ctrl_navigates_and_creates() {
+        assert_eq!(key_command(gdk::Key::t, CTRL), Some(KeyCommand::Today));
+        assert_eq!(key_command(gdk::Key::n, CTRL), Some(KeyCommand::NewEvent));
+        assert_eq!(
+            key_command(gdk::Key::Left, CTRL),
+            Some(KeyCommand::Previous)
+        );
+        assert_eq!(key_command(gdk::Key::Right, CTRL), Some(KeyCommand::Next));
+    }
+
+    #[test]
+    fn an_unmodified_key_is_left_for_whatever_has_focus() {
+        // The controller lives on the window, so anything claimed here is
+        // taken away from an event title being typed into.
+        for key in [
+            gdk::Key::_1,
+            gdk::Key::t,
+            gdk::Key::n,
+            gdk::Key::Left,
+            gdk::Key::Right,
+        ] {
+            assert_eq!(
+                key_command(key, NONE),
+                None,
+                "an unmodified key must reach the focused widget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chord_carrying_alt_or_super_is_not_ours() {
+        for extra in [gdk::ModifierType::ALT_MASK, gdk::ModifierType::SUPER_MASK] {
+            assert_eq!(
+                key_command(gdk::Key::_1, CTRL | extra),
+                None,
+                "Ctrl+Alt+1 and Ctrl+Super+1 belong to someone else"
+            );
+        }
+    }
+
+    #[test]
+    fn caps_lock_does_not_break_a_shortcut() {
+        // Lock rides along on ordinary presses and says nothing about intent.
+        assert_eq!(
+            key_command(gdk::Key::_1, CTRL | gdk::ModifierType::LOCK_MASK),
+            Some(KeyCommand::ViewMonth),
+            "a stuck lock key must not disable the shortcut"
+        );
+        assert_eq!(
+            key_command(gdk::Key::T, CTRL | gdk::ModifierType::SHIFT_MASK),
+            Some(KeyCommand::Today),
+            "Shift produces the uppercase keyval; it's the same chord"
+        );
+    }
+
+    #[test]
+    fn an_unbound_key_is_ignored() {
+        assert_eq!(key_command(gdk::Key::_9, CTRL), None);
+        assert_eq!(key_command(gdk::Key::z, CTRL), None);
+    }
 
     fn local_midnight(year: i32, month: u32, day: u32) -> DateTime<Local> {
         Local

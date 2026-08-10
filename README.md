@@ -157,6 +157,17 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - **Edit**: click any event to open it.
 - **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts work on any event, including synced ones, but live only on this machine (they aren't written back to Google/CalDAV) and fire while Calix is running — pair them with autostarting Calix if you rely on them.
 
+### Keyboard shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Month / Week / Day view |
+| `Ctrl+←` / `Ctrl+→` | Previous / next period |
+| `Ctrl+T` | Jump to today |
+| `Ctrl+N` | New event |
+
+The digits follow the view toggles left-to-right as they appear in the header. Every binding takes Ctrl on purpose: an unmodified key belongs to whatever has focus, so a shortcut can never swallow a character you meant to type into an event title.
+
 ## Architecture
 
 - `src/date_util.rs` — pure date-math helpers (month grids, week ranges, month/week shifting), unit tested independent of any GTK state.
