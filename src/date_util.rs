@@ -44,6 +44,37 @@ pub fn day_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
     (date, date + chrono::Duration::days(1))
 }
 
+/// January 1st of the year containing `date`.
+pub fn year_start(date: NaiveDate) -> NaiveDate {
+    NaiveDate::from_ymd_opt(date.year(), 1, 1).expect("January 1st is always valid")
+}
+
+/// Half-open [start, end) date range covering the whole year containing
+/// `date`.
+pub fn year_bounds(date: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let start = year_start(date);
+    (
+        start,
+        NaiveDate::from_ymd_opt(date.year() + 1, 1, 1).expect("January 1st is always valid"),
+    )
+}
+
+/// The twelve month anchors of the year containing `date`, January first.
+pub fn year_months(date: NaiveDate) -> [NaiveDate; 12] {
+    let year = date.year();
+    std::array::from_fn(|i| {
+        NaiveDate::from_ymd_opt(year, i as u32 + 1, 1).expect("months 1..=12 are always valid")
+    })
+}
+
+/// Shift `date` forward/backward by whole years.
+///
+/// Goes through `shift_months` so February 29th lands on the 28th of a common
+/// year rather than failing, the same clamping every other shift uses.
+pub fn shift_years(date: NaiveDate, delta: i32) -> NaiveDate {
+    shift_months(date, delta * 12)
+}
+
 /// Shift `date` forward (delta > 0) or backward (delta < 0) by whole months,
 /// clamping the day-of-month if the target month is shorter.
 pub fn shift_months(date: NaiveDate, delta: i32) -> NaiveDate {
@@ -99,6 +130,37 @@ pub fn local_day_start(date: NaiveDate) -> DateTime<Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn year_bounds_covers_january_through_december() {
+        assert_eq!(year_bounds(d(2026, 8, 10)), (d(2026, 1, 1), d(2027, 1, 1)));
+        // Half-open, so the last day of the year is inside and the boundary is
+        // the next January 1st.
+        assert_eq!(year_bounds(d(2026, 12, 31)), (d(2026, 1, 1), d(2027, 1, 1)));
+    }
+
+    #[test]
+    fn year_months_lists_the_twelve_first_of_months() {
+        let months = year_months(d(2026, 8, 10));
+        assert_eq!(months[0], d(2026, 1, 1));
+        assert_eq!(months[11], d(2026, 12, 1));
+        assert!(months.iter().all(|month| month.day() == 1));
+    }
+
+    #[test]
+    fn shifting_years_clamps_a_leap_day() {
+        // 2028 is a leap year, 2029 is not; the 29th has to land somewhere
+        // real rather than panicking.
+        assert_eq!(shift_years(d(2028, 2, 29), 1), d(2029, 2, 28));
+        assert_eq!(shift_years(d(2028, 2, 29), -1), d(2027, 2, 28));
+    }
+
+    #[test]
+    fn shifting_years_moves_whole_years() {
+        assert_eq!(shift_years(d(2026, 8, 10), 2), d(2028, 8, 10));
+        assert_eq!(shift_years(d(2026, 8, 10), -3), d(2023, 8, 10));
+        assert_eq!(shift_years(d(2026, 8, 10), 0), d(2026, 8, 10));
+    }
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()

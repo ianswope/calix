@@ -14,6 +14,20 @@ const CSS: &str = "
     border-bottom: 1px solid @borders;
 }
 
+/* Year view. A thumbnail is read as a shape rather than a list, so the
+   day buttons shed their padding and a busy day is weighted instead of
+   dotted — at this size a dot is indistinguishable from an artifact. */
+.year-month button {
+    padding: 0;
+    min-width: 22px;
+    min-height: 20px;
+}
+
+.year-day-busy {
+    font-weight: bold;
+    color: @accent_color;
+}
+
 .today-cell {
     background-color: alpha(@accent_bg_color, 0.08);
 }

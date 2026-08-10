@@ -8,6 +8,7 @@ pub(crate) mod drag;
 mod event_widget;
 pub mod month_view;
 pub mod week_view;
+pub mod year_view;
 
 /// Opens the new-event dialog at `start`. The second argument is the end time
 /// when the caller knows one — a create-drag draws an explicit span — and

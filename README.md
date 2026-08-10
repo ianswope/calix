@@ -147,6 +147,8 @@ If you previously connected Google before Calix had multi-account storage, **Syn
 
 The left sidebar lists local calendars and synced Google/iCloud/CalDAV calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
 
+**Year view** shows the twelve months as thumbnails with busy days weighted; clicking a day opens it in Day view. Swiping or the arrows move a whole year at a time.
+
 The calendar button in the header toggles the sidebar. The sidebar's Accounts section contains **Add**/**Sync** buttons for Google, iCloud, and CalDAV.
 
 ### Working with events
@@ -163,7 +165,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` | Month / Week / Day view |
+| `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` | Year / Month / Week / Day view |
 | `Ctrl+←` / `Ctrl+→` | Previous / next period |
 | `Ctrl+T` | Jump to today |
 | `Ctrl+N` | New event |
@@ -194,6 +196,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 ## Roadmap
 
 - [x] Swipeable month/week grid
+- [x] Year view — twelve month thumbnails, busy days weighted, click a day to open it
 - [x] Local event storage (SQLite) + create/edit events
 - [x] Google sign-in (OAuth + PKCE, verified by fetching the calendar list)
 - [x] Pull Google events from multiple Google accounts into the month/week grid (one-way sync)

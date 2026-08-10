@@ -2,8 +2,8 @@ use crate::caldav;
 use crate::calendar_dialog;
 use crate::config::Config;
 use crate::date_util::{
-    day_bounds, month_grid_bounds, month_start, shift_days, shift_months, shift_weeks, week_bounds,
-    week_dates, week_start,
+    day_bounds, month_grid_bounds, month_start, shift_days, shift_months, shift_weeks, shift_years,
+    week_bounds, week_dates, week_start, year_bounds, year_start,
 };
 use crate::event_dialog;
 use crate::event_popover;
@@ -12,7 +12,7 @@ use crate::icloud;
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
-use crate::views::{drag::DragKind, month_view, week_view};
+use crate::views::{drag::DragKind, month_view, week_view, year_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
 use gtk::gdk;
@@ -34,6 +34,7 @@ enum KeyCommand {
     Today,
     Previous,
     Next,
+    ViewYear,
     ViewMonth,
     ViewWeek,
     ViewDay,
@@ -65,9 +66,10 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
         // Numbered left-to-right as the header's toggles read, so the digit
         // matches what the eye sees. Apple numbers by its View menu instead,
         // which would put Day on Ctrl+1 while Month sits leftmost on screen.
-        gdk::Key::_1 | gdk::Key::KP_1 => Some(KeyCommand::ViewMonth),
-        gdk::Key::_2 | gdk::Key::KP_2 => Some(KeyCommand::ViewWeek),
-        gdk::Key::_3 | gdk::Key::KP_3 => Some(KeyCommand::ViewDay),
+        gdk::Key::_1 | gdk::Key::KP_1 => Some(KeyCommand::ViewYear),
+        gdk::Key::_2 | gdk::Key::KP_2 => Some(KeyCommand::ViewMonth),
+        gdk::Key::_3 | gdk::Key::KP_3 => Some(KeyCommand::ViewWeek),
+        gdk::Key::_4 | gdk::Key::KP_4 => Some(KeyCommand::ViewDay),
         gdk::Key::t | gdk::Key::T => Some(KeyCommand::Today),
         gdk::Key::n | gdk::Key::N => Some(KeyCommand::NewEvent),
         gdk::Key::f | gdk::Key::F => Some(KeyCommand::Search),
@@ -85,6 +87,7 @@ type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
+    Year,
     Month,
     Week,
     Day,
@@ -97,12 +100,14 @@ impl ViewMode {
         match value.as_deref() {
             Some("day") => ViewMode::Day,
             Some("week") => ViewMode::Week,
+            Some("year") => ViewMode::Year,
             _ => ViewMode::Month,
         }
     }
 
     fn as_setting(self) -> &'static str {
         match self {
+            ViewMode::Year => "year",
             ViewMode::Month => "month",
             ViewMode::Week => "week",
             ViewMode::Day => "day",
@@ -290,6 +295,7 @@ struct State {
 impl State {
     fn period_anchor(&self) -> NaiveDate {
         match self.view_mode {
+            ViewMode::Year => year_start(self.current_date),
             ViewMode::Month => month_start(self.current_date),
             ViewMode::Week => week_start(self.current_date),
             ViewMode::Day => self.current_date,
@@ -302,6 +308,7 @@ impl State {
 
     fn shift_from(&self, date: NaiveDate, delta: i32) -> NaiveDate {
         match self.view_mode {
+            ViewMode::Year => shift_years(date, delta),
             ViewMode::Month => shift_months(date, delta),
             ViewMode::Week => shift_weeks(date, delta),
             ViewMode::Day => shift_days(date, delta),
@@ -310,6 +317,7 @@ impl State {
 
     fn title(&self) -> String {
         match self.view_mode {
+            ViewMode::Year => self.period_anchor().format("%Y").to_string(),
             ViewMode::Month => self.period_anchor().format("%B %Y").to_string(),
             ViewMode::Week => {
                 let days = week_dates(self.current_date);
@@ -383,7 +391,7 @@ impl Ui {
         let state = self.state.borrow();
         let view_mode = state.view_mode;
         self.carousel.set_orientation(match view_mode {
-            ViewMode::Month => gtk::Orientation::Vertical,
+            ViewMode::Year | ViewMode::Month => gtk::Orientation::Vertical,
             ViewMode::Week | ViewMode::Day => gtk::Orientation::Horizontal,
         });
         let current_date = state.current_date;
@@ -707,6 +715,7 @@ impl Ui {
         initial_scroll: week_view::InitialScroll,
     ) -> gtk::Widget {
         let (range_start, range_end) = match view_mode {
+            ViewMode::Year => year_bounds(date),
             ViewMode::Month => month_grid_bounds(date),
             ViewMode::Week => week_bounds(date),
             ViewMode::Day => day_bounds(date),
@@ -718,6 +727,20 @@ impl Ui {
         let (on_create, on_edit, on_move) = self.event_callbacks(events.clone());
 
         match view_mode {
+            ViewMode::Year => {
+                // Picking a day drops into Day view on it, which is the only
+                // reason to click a date at this zoom.
+                let ui = self.clone();
+                year_view::build(
+                    date,
+                    &events,
+                    Rc::new(move |picked: NaiveDate| {
+                        ui.state.borrow_mut().current_date = picked;
+                        set_view_mode(&ui, ViewMode::Day);
+                        ui.reset();
+                    }),
+                )
+            }
             ViewMode::Month => month_view::build(date, &events, on_create, on_edit, on_move),
             ViewMode::Week => {
                 let hour_row_height = self.state.borrow().hour_row_height;
@@ -938,31 +961,38 @@ pub fn build(app: &adw::Application) {
     nav_box.append(&prev_button);
     nav_box.append(&next_button);
 
+    let year_toggle = gtk::ToggleButton::builder()
+        .label("Year")
+        .active(initial_view_mode == ViewMode::Year)
+        .build();
     let month_toggle = gtk::ToggleButton::builder()
         .label("Month")
+        .group(&year_toggle)
         .active(initial_view_mode == ViewMode::Month)
         .build();
     let week_toggle = gtk::ToggleButton::builder()
         .label("Week")
-        .group(&month_toggle)
+        .group(&year_toggle)
         .active(initial_view_mode == ViewMode::Week)
         .build();
     let day_toggle = gtk::ToggleButton::builder()
         .label("Day")
-        .group(&month_toggle)
+        .group(&year_toggle)
         .active(initial_view_mode == ViewMode::Day)
         .build();
-    month_toggle.set_tooltip_text(Some("Month view (Ctrl+1)"));
-    week_toggle.set_tooltip_text(Some("Week view (Ctrl+2)"));
-    day_toggle.set_tooltip_text(Some("Day view (Ctrl+3)"));
+    year_toggle.set_tooltip_text(Some("Year view (Ctrl+1)"));
+    month_toggle.set_tooltip_text(Some("Month view (Ctrl+2)"));
+    week_toggle.set_tooltip_text(Some("Week view (Ctrl+3)"));
+    day_toggle.set_tooltip_text(Some("Day view (Ctrl+4)"));
 
     let view_toggle_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     view_toggle_box.add_css_class("linked");
+    view_toggle_box.append(&year_toggle);
     view_toggle_box.append(&month_toggle);
     view_toggle_box.append(&week_toggle);
     view_toggle_box.append(&day_toggle);
     view_toggle_box.set_valign(gtk::Align::Center);
-    for toggle in [&month_toggle, &week_toggle, &day_toggle] {
+    for toggle in [&year_toggle, &month_toggle, &week_toggle, &day_toggle] {
         toggle.add_css_class("header-small");
     }
 
@@ -1288,6 +1318,8 @@ pub fn build(app: &adw::Application) {
         #[strong]
         search_button,
         #[strong]
+        year_toggle,
+        #[strong]
         month_toggle,
         #[strong]
         week_toggle,
@@ -1305,6 +1337,7 @@ pub fn build(app: &adw::Application) {
                 KeyCommand::Search => search_button.emit_clicked(),
                 // Setting an already-active toggle emits nothing, which is
                 // exactly the wanted no-op.
+                KeyCommand::ViewYear => year_toggle.set_active(true),
                 KeyCommand::ViewMonth => month_toggle.set_active(true),
                 KeyCommand::ViewWeek => week_toggle.set_active(true),
                 KeyCommand::ViewDay => day_toggle.set_active(true),
@@ -1394,6 +1427,8 @@ pub fn build(app: &adw::Application) {
                 #[strong]
                 next_button,
                 #[strong]
+                year_toggle,
+                #[strong]
                 month_toggle,
                 #[strong]
                 week_toggle,
@@ -1411,6 +1446,7 @@ pub fn build(app: &adw::Application) {
                         &today_button,
                         &prev_button,
                         &next_button,
+                        &year_toggle,
                         &month_toggle,
                         &week_toggle,
                         &day_toggle,
@@ -1492,6 +1528,7 @@ fn connect_handlers(
     today_button: &gtk::Button,
     prev_button: &gtk::Button,
     next_button: &gtk::Button,
+    year_toggle: &gtk::ToggleButton,
     month_toggle: &gtk::ToggleButton,
     week_toggle: &gtk::ToggleButton,
     day_toggle: &gtk::ToggleButton,
@@ -1554,6 +1591,7 @@ fn connect_handlers(
     ));
 
     for (toggle, mode) in [
+        (year_toggle, ViewMode::Year),
         (month_toggle, ViewMode::Month),
         (week_toggle, ViewMode::Week),
         (day_toggle, ViewMode::Day),
@@ -1691,7 +1729,9 @@ fn refresh_zoom_controls(
     zoom_in_button: &gtk::Button,
 ) {
     let state = ui.state.borrow();
-    zoom_box.set_visible(state.view_mode != ViewMode::Month);
+    // Only the timed views have a day to stretch; month and year are grids of
+    // dates with no hour axis to zoom.
+    zoom_box.set_visible(!matches!(state.view_mode, ViewMode::Month | ViewMode::Year));
     zoom_out_button.set_sensitive(state.hour_row_height > week_view::MIN_HOUR_ROW_HEIGHT);
     zoom_in_button.set_sensitive(state.hour_row_height < week_view::MAX_HOUR_ROW_HEIGHT);
 }
@@ -3246,24 +3286,29 @@ mod tests {
     fn ctrl_and_a_digit_switches_view_in_the_order_the_toggles_read() {
         assert_eq!(
             key_command(gdk::Key::_1, CTRL),
-            Some(KeyCommand::ViewMonth),
+            Some(KeyCommand::ViewYear),
             "Ctrl+1 should pick the leftmost toggle"
         );
-        assert_eq!(key_command(gdk::Key::_2, CTRL), Some(KeyCommand::ViewWeek));
-        assert_eq!(key_command(gdk::Key::_3, CTRL), Some(KeyCommand::ViewDay));
+        assert_eq!(key_command(gdk::Key::_2, CTRL), Some(KeyCommand::ViewMonth));
+        assert_eq!(key_command(gdk::Key::_3, CTRL), Some(KeyCommand::ViewWeek));
+        assert_eq!(key_command(gdk::Key::_4, CTRL), Some(KeyCommand::ViewDay));
     }
 
     #[test]
     fn the_keypad_digits_work_too() {
         assert_eq!(
             key_command(gdk::Key::KP_1, CTRL),
-            Some(KeyCommand::ViewMonth)
+            Some(KeyCommand::ViewYear)
         );
         assert_eq!(
             key_command(gdk::Key::KP_2, CTRL),
+            Some(KeyCommand::ViewMonth)
+        );
+        assert_eq!(
+            key_command(gdk::Key::KP_3, CTRL),
             Some(KeyCommand::ViewWeek)
         );
-        assert_eq!(key_command(gdk::Key::KP_3, CTRL), Some(KeyCommand::ViewDay));
+        assert_eq!(key_command(gdk::Key::KP_4, CTRL), Some(KeyCommand::ViewDay));
     }
 
     #[test]
@@ -3317,7 +3362,7 @@ mod tests {
         // Lock rides along on ordinary presses and says nothing about intent.
         assert_eq!(
             key_command(gdk::Key::_1, CTRL | gdk::ModifierType::LOCK_MASK),
-            Some(KeyCommand::ViewMonth),
+            Some(KeyCommand::ViewYear),
             "a stuck lock key must not disable the shortcut"
         );
         assert_eq!(
