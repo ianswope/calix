@@ -980,7 +980,7 @@ fn attendees_group(event: &Event) -> Option<adw::PreferencesGroup> {
 }
 
 /// Human-readable form of the normalized response status the syncs store.
-fn attendee_status_label(status: &str) -> &str {
+pub(crate) fn attendee_status_label(status: &str) -> &str {
     match status {
         "accepted" => "Accepted",
         "declined" => "Declined",

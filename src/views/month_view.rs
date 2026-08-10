@@ -1,7 +1,7 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
 use crate::views::{
-    CreateFn, add_new_event_menu,
+    CreateFn, EditFn, add_new_event_menu,
     drag::{DragKind, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
@@ -21,7 +21,7 @@ pub fn build(
     anchor: NaiveDate,
     events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -82,7 +82,7 @@ fn day_cell(
     today: NaiveDate,
     day_events: Vec<Event>,
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -109,7 +109,7 @@ fn day_cell(
         let chip = event_widget::event_button(event, "event-chip", 20);
         let ev = event.clone();
         let on_edit = on_edit.clone();
-        chip.connect_clicked(move |_| on_edit(ev.clone()));
+        chip.connect_clicked(move |btn| on_edit(ev.clone(), btn.clone().upcast()));
         cell.append(&chip);
     }
     if day_events.len() > MAX_CHIPS_PER_CELL {

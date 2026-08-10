@@ -1,7 +1,7 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
 use crate::views::{
-    CreateFn, add_new_event_menu,
+    CreateFn, EditFn, add_new_event_menu,
     drag::{BlockPlacement, DragKind, TimedGrid, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
@@ -42,7 +42,7 @@ pub fn build(
     anchor: NaiveDate,
     events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
@@ -62,7 +62,7 @@ pub fn build_day(
     day: NaiveDate,
     events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
@@ -83,7 +83,7 @@ fn build_days(
     days: Vec<NaiveDate>,
     events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
@@ -149,7 +149,7 @@ pub fn build_hour_grid(
     days: &[NaiveDate],
     events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
 ) -> gtk::Widget {
@@ -225,7 +225,7 @@ fn day_header_row(
 fn all_day_row(
     days: &[NaiveDate],
     events: &[Event],
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
@@ -250,7 +250,7 @@ fn all_day_row(
 
                 let ev = event.clone();
                 let on_edit = on_edit.clone();
-                chip.connect_clicked(move |_| on_edit(ev.clone()));
+                chip.connect_clicked(move |btn| on_edit(ev.clone(), btn.clone().upcast()));
                 cell.append(&chip);
             }
 
@@ -318,7 +318,7 @@ fn day_column(
     today: NaiveDate,
     day_events: &[Event],
     on_create: CreateFn,
-    on_edit: Rc<dyn Fn(Event)>,
+    on_edit: EditFn,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     timed_grid: &Rc<TimedGrid>,
     col_index: usize,

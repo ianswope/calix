@@ -14,6 +14,11 @@ pub mod week_view;
 /// `None` when it should fall back to the default duration.
 pub(crate) type CreateFn = Rc<dyn Fn(DateTime<Local>, Option<DateTime<Local>>)>;
 
+/// Opens the inspector for an event. The widget is the chip or block that was
+/// clicked, which the popover anchors itself to — a popover with no anchor has
+/// nowhere meaningful to point.
+pub(crate) type EditFn = Rc<dyn Fn(Event, gtk::Widget)>;
+
 /// Whether an event's half-open time range includes a calendar date.
 pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
     let start = event.start.date_naive();

@@ -7,6 +7,7 @@ mod calendar_dialog;
 mod config;
 mod date_util;
 mod event_dialog;
+mod event_popover;
 mod google;
 mod http;
 mod icloud;

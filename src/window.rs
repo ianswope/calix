@@ -6,6 +6,7 @@ use crate::date_util::{
     week_dates, week_start,
 };
 use crate::event_dialog;
+use crate::event_popover;
 use crate::google;
 use crate::icloud;
 use crate::store::{self, Event, EventDraft, Store};
@@ -74,7 +75,7 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
 }
 
 use crate::views::CreateFn;
-type EditFn = Rc<dyn Fn(Event)>;
+use crate::views::EditFn;
 type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
 /// Work parked until a rebuild verifiably centers the carousel, run once.
 type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
@@ -649,7 +650,10 @@ impl Ui {
                 },
             )
         };
-        let on_edit: EditFn = {
+        // Clicking an event shows the inspector; the dialog is what its Edit
+        // button opens. Glancing at when something is — by far the commoner
+        // reason to click — no longer costs a modal to dismiss.
+        let open_dialog: Rc<dyn Fn(Event)> = {
             let ui = self.clone();
             Rc::new(move |event: Event| {
                 // Local recurring events render as many occurrences that share
@@ -678,6 +682,12 @@ impl Ui {
                     move || ui_for_saved.reset(),
                     remote_event,
                 );
+            })
+        };
+        let on_edit: EditFn = {
+            let open_dialog = open_dialog.clone();
+            Rc::new(move |event: Event, anchor: gtk::Widget| {
+                event_popover::open(&anchor, &event, open_dialog.clone());
             })
         };
         let on_move = move_handler(self, events);

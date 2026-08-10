@@ -1,4 +1,5 @@
 use crate::store::Event;
+use crate::views::EditFn;
 use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, drag_payload};
 use gtk::gdk;
 use gtk::prelude::*;
@@ -21,7 +22,7 @@ pub fn timed_event_widget(
     event: &Event,
     css_class: &str,
     min_height: i32,
-    on_click: Rc<dyn Fn(Event)>,
+    on_click: EditFn,
     grid: &Rc<TimedGrid>,
     placement: &BlockPlacement,
 ) -> gtk::Widget {
@@ -29,7 +30,7 @@ pub fn timed_event_widget(
     let button = event_button_with_padding(event, css_class, min_height, 0, false);
     let ev = event.clone();
     let click = on_click.clone();
-    button.connect_clicked(move |_| click(ev.clone()));
+    button.connect_clicked(move |btn| click(ev.clone(), btn.clone().upcast()));
     overlay.set_child(Some(&button));
 
     // A local recurring event is drawn as many occurrences sharing one id;
@@ -64,7 +65,12 @@ pub fn timed_event_widget(
         let click_gesture = gtk::GestureClick::new();
         let ev = event.clone();
         let on_click = on_click.clone();
-        click_gesture.connect_released(move |_, _, _, _| on_click(ev.clone()));
+        // Anchored to the block rather than the handle: the handle is a few
+        // pixels tall at the block's edge, so a popover pointing at it would
+        // appear to belong to whatever sits above or below.
+        let anchor = button.clone();
+        click_gesture
+            .connect_released(move |_, _, _, _| on_click(ev.clone(), anchor.clone().upcast()));
         handle.add_controller(click_gesture);
 
         overlay.add_overlay(&handle);

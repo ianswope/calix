@@ -155,7 +155,7 @@ The calendar button in the header toggles the sidebar. The sidebar's Accounts se
 - **Drag out a new event**: in week/day view, press on empty grid space and drag to draw the event's span, with a live preview snapped to 15 minutes. The dialog opens pre-filled with exactly the range you drew instead of the default hour. Dragging upward works the same as downward, and the span stops at midnight rather than spilling into the next day.
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
-- **Edit**: click any event to open it.
+- **Inspect**: click any event for a popover with its time, calendar, location, notes, and attendee replies. **Edit** opens the full dialog. Glancing at an event no longer costs a modal to dismiss.
 - **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts work on any event, including synced ones, but live only on this machine (they aren't written back to Google/CalDAV) and fire while Calix is running — pair them with autostarting Calix if you rely on them.
 
 ### Keyboard shortcuts
@@ -204,6 +204,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - [x] Drag to move/resize events in the week/day grid (snapped preview, edge auto-scroll)
 - [x] Drag across empty grid space to create an event spanning that range
 - [x] Right-click to create an event at a specific spot
+- [x] Event inspector popover on click, with the edit dialog one button away
 - [x] Keyboard shortcuts for view switching, navigation, today, and new event
 - [x] Match the active Omarchy theme's colors automatically
 - [x] Recurring event creation (daily/weekly/monthly/yearly), expanded on the grid
