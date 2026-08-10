@@ -110,6 +110,8 @@ iCloud uses CalDAV with an Apple app-specific password:
 
 Synced iCloud events can be edited or deleted, including recurring ones: opening an occurrence of a series offers a **This event / All events** choice for both edits and deletes, written back as standard iCalendar overrides and exclusions.
 
+App-specific passwords don't expire — if iCloud sync starts failing, it's usually the local keyring rather than a dead password. [docs/icloud-auth.md](docs/icloud-auth.md) has a one-command check that tells the two apart, plus why Calix uses app-specific passwords instead of Apple's 2FA/token flow.
+
 ## Connecting other CalDAV calendars
 
 Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, and so on. iCloud is just a CalDAV server with a fixed address, so it uses the same engine under the hood.
