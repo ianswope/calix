@@ -73,7 +73,7 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
     }
 }
 
-type CreateFn = Rc<dyn Fn(DateTime<Local>)>;
+use crate::views::CreateFn;
 type EditFn = Rc<dyn Fn(Event)>;
 type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
 /// Work parked until a rebuild verifiably centers the carousel, run once.
@@ -633,18 +633,21 @@ impl Ui {
     fn event_callbacks(self: &Rc<Self>, events: Vec<Event>) -> (CreateFn, EditFn, MoveFn) {
         let on_create: CreateFn = {
             let ui = self.clone();
-            Rc::new(move |start: DateTime<Local>| {
-                let ui_for_saved = ui.clone();
-                event_dialog::open(
-                    &ui.carousel,
-                    ui.store.clone(),
-                    create_targets(&ui),
-                    None,
-                    start,
-                    move || ui_for_saved.reset(),
-                    None,
-                );
-            })
+            Rc::new(
+                move |start: DateTime<Local>, end: Option<DateTime<Local>>| {
+                    let ui_for_saved = ui.clone();
+                    event_dialog::open(
+                        &ui.carousel,
+                        ui.store.clone(),
+                        create_targets(&ui),
+                        None,
+                        start,
+                        end,
+                        move || ui_for_saved.reset(),
+                        None,
+                    );
+                },
+            )
         };
         let on_edit: EditFn = {
             let ui = self.clone();
@@ -671,6 +674,7 @@ impl Ui {
                     Vec::new(),
                     Some(event),
                     start,
+                    None,
                     move || ui_for_saved.reset(),
                     remote_event,
                 );
@@ -979,6 +983,7 @@ pub fn build(app: &adw::Application) {
                 create_targets(&ui),
                 None,
                 start,
+                None,
                 move || ui2.reset(),
                 None,
             );

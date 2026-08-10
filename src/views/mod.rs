@@ -9,6 +9,11 @@ mod event_widget;
 pub mod month_view;
 pub mod week_view;
 
+/// Opens the new-event dialog at `start`. The second argument is the end time
+/// when the caller knows one — a create-drag draws an explicit span — and
+/// `None` when it should fall back to the default duration.
+pub(crate) type CreateFn = Rc<dyn Fn(DateTime<Local>, Option<DateTime<Local>>)>;
+
 /// Whether an event's half-open time range includes a calendar date.
 pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
     let start = event.start.date_naive();
@@ -26,7 +31,7 @@ pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
 pub(crate) fn add_new_event_menu(
     widget: &impl IsA<gtk::Widget>,
     moment_at: impl Fn(f64, f64) -> Option<DateTime<Local>> + 'static,
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
 ) {
     let target = widget.clone().upcast::<gtk::Widget>();
     let gesture = gtk::GestureClick::new();
@@ -46,7 +51,7 @@ pub(crate) fn add_new_event_menu(
 
 /// Whether the press landed on a button (an event chip/block) rather than
 /// empty calendar space.
-fn press_hits_button(root: &gtk::Widget, x: f64, y: f64) -> bool {
+pub(crate) fn press_hits_button(root: &gtk::Widget, x: f64, y: f64) -> bool {
     let mut widget = root.pick(x, y, gtk::PickFlags::DEFAULT);
     while let Some(current) = widget {
         if current == *root {
@@ -65,7 +70,7 @@ fn show_new_event_menu(
     x: f64,
     y: f64,
     start: DateTime<Local>,
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
 ) {
     let popover = gtk::Popover::new();
     popover.set_parent(parent);
@@ -85,7 +90,7 @@ fn show_new_event_menu(
         if let Some(popover) = weak.upgrade() {
             popover.popdown();
         }
-        on_create(start);
+        on_create(start, None);
     });
 
     // A dismissed popover must be manually unparented or it (and everything

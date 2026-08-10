@@ -1,6 +1,8 @@
+use crate::views::press_hits_button;
 use chrono::{NaiveDate, NaiveTime};
 use gtk::gdk;
 use gtk::glib;
+use gtk::glib::clone;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -436,6 +438,148 @@ impl TimedGrid {
     }
 }
 
+/// Fired when a create-drag commits, with the snapped span it drew.
+pub(crate) type CreateRangeFn = Rc<dyn Fn(NaiveTime, NaiveTime)>;
+
+/// Attach drag-to-create to one day column's empty space.
+///
+/// Deliberately per column rather than folded into [`TimedGrid`]: a create
+/// drag never crosses a day, so none of that type's column mapping,
+/// cross-column commit math or block bookkeeping applies. The day is fixed by
+/// which column the gesture is on.
+///
+/// Presses landing on an event block are left alone — that block owns its own
+/// move/resize gesture, and starting a create underneath it would fight for
+/// the same pointer.
+pub(crate) fn install_create_drag(
+    column: &gtk::Overlay,
+    hour_height: f64,
+    on_create_range: CreateRangeFn,
+) {
+    let preview = gtk::Fixed::new();
+    preview.set_can_target(false);
+    preview.add_css_class("drag-preview-layer");
+
+    let block = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    block.add_css_class("drag-preview");
+    block.set_can_target(false);
+    block.set_visible(false);
+
+    let label = gtk::Label::new(None);
+    label.add_css_class("drag-preview-label");
+    label.set_halign(gtk::Align::Start);
+    label.set_valign(gtk::Align::Start);
+    label.set_margin_start(8);
+    label.set_margin_top(2);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    block.append(&label);
+    preview.put(&block, 0.0, 0.0);
+    column.add_overlay(&preview);
+
+    let gesture = gtk::GestureDrag::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+
+    // Set once the press has travelled far enough to be a drag rather than a
+    // click, so a plain click still falls through to the hour cell beneath.
+    let dragging = Rc::new(Cell::new(false));
+    let root = column.clone().upcast::<gtk::Widget>();
+
+    gesture.connect_drag_update(clone!(
+        #[strong]
+        block,
+        #[strong]
+        label,
+        #[strong]
+        dragging,
+        #[strong]
+        root,
+        move |gesture, offset_x, offset_y| {
+            let Some((press_x, press_y)) = gesture.start_point() else {
+                return;
+            };
+            if !dragging.get() {
+                if offset_x.hypot(offset_y) < DRAG_THRESHOLD {
+                    return;
+                }
+                if press_hits_button(&root, press_x, press_y) {
+                    return;
+                }
+                // Claiming denies the hour cell's click gesture, which would
+                // otherwise also fire on release and open a second dialog.
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                dragging.set(true);
+            }
+            let Some((start, end)) = create_range(press_y, press_y + offset_y, hour_height) else {
+                return;
+            };
+            let top = start / 60.0 * hour_height;
+            let height = (end - start) / 60.0 * hour_height;
+            block.set_size_request(root.width().max(1), height as i32);
+            block.set_visible(true);
+            label.set_visible(height >= PREVIEW_LABEL_MIN_PX);
+            label.set_label(&format!(
+                "{} – {}",
+                format_minutes(start),
+                format_minutes(end)
+            ));
+            if let Some(fixed) = block.parent().and_downcast::<gtk::Fixed>() {
+                fixed.move_(&block, 0.0, top);
+            }
+        }
+    ));
+
+    gesture.connect_drag_end(clone!(
+        #[strong]
+        block,
+        #[strong]
+        dragging,
+        move |gesture, _, offset_y| {
+            block.set_visible(false);
+            if !dragging.replace(false) {
+                return;
+            }
+            let Some((_, press_y)) = gesture.start_point() else {
+                return;
+            };
+            let Some((start, end)) = create_range(press_y, press_y + offset_y, hour_height) else {
+                return;
+            };
+            // `time_of` clamps 1440 to 23:59, so a drag to the very bottom
+            // ends at the last minute of the day rather than failing.
+            if let (Some(start), Some(end)) = (time_of(start), time_of(end)) {
+                on_create_range(start, end);
+            }
+        }
+    ));
+
+    column.add_controller(gesture);
+}
+
+/// The snapped time range a create-drag covers, in minutes from midnight.
+///
+/// `from_y` is where the press landed, `to_y` where the pointer has reached,
+/// both on the day column's y axis. Dragging upward is the same gesture as
+/// dragging downward — people reach for the end of a meeting as readily as its
+/// start — so the pair is ordered rather than treated as invalid.
+///
+/// Never returns a zero-length range. A press that barely moves is a click,
+/// and the caller still wants a usable event out of it, so the range widens to
+/// `MIN_BLOCK_MINUTES` rather than collapsing. Both edges are clamped into the
+/// day, so dragging off the top or bottom of the grid stops at midnight
+/// instead of producing a time that doesn't exist.
+pub(crate) fn create_range(from_y: f64, to_y: f64, hour_height: f64) -> Option<(f64, f64)> {
+    if hour_height <= 0.0 {
+        return None;
+    }
+    let minutes_at = |y: f64| snap(y / hour_height * 60.0, SNAP_MINUTES);
+    let (a, b) = (minutes_at(from_y), minutes_at(to_y));
+    // Clamping start first leaves room for the minimum block even when the
+    // press lands in the day's last quarter hour.
+    let start = a.min(b).clamp(0.0, MINUTES_PER_DAY - MIN_BLOCK_MINUTES);
+    let end = a.max(b).clamp(start + MIN_BLOCK_MINUTES, MINUTES_PER_DAY);
+    Some((start, end))
+}
+
 fn snap(value: f64, snap_px: f64) -> f64 {
     if snap_px <= 0.0 {
         value
@@ -498,6 +642,67 @@ mod tests {
         // Midnight-of-next-day (1440) has no same-day NaiveTime, so it clamps
         // to the last representable minute of the day.
         assert_eq!(time_of(MINUTES_PER_DAY), NaiveTime::from_hms_opt(23, 59, 0));
+    }
+
+    /// One pixel per minute, so a y of 540 reads as 9:00 in these tests.
+    const MINUTE_PX: f64 = 60.0;
+
+    #[test]
+    fn a_downward_create_drag_spans_press_to_release() {
+        // 9:00 down to 10:30.
+        assert_eq!(create_range(540.0, 630.0, MINUTE_PX), Some((540.0, 630.0)));
+    }
+
+    #[test]
+    fn dragging_upward_produces_the_same_range_as_dragging_down() {
+        // Grabbing 10:30 and pulling up to 9:00 means the same meeting.
+        assert_eq!(
+            create_range(630.0, 540.0, MINUTE_PX),
+            create_range(540.0, 630.0, MINUTE_PX)
+        );
+    }
+
+    #[test]
+    fn both_edges_snap_to_the_quarter_hour() {
+        // 9:07 -> 9:00 and 10:23 -> 10:30, matching the move/resize grid.
+        assert_eq!(create_range(547.0, 623.0, MINUTE_PX), Some((540.0, 630.0)));
+    }
+
+    #[test]
+    fn a_press_that_barely_moves_still_yields_a_usable_event() {
+        // Otherwise a click would create a zero-length event.
+        let (start, end) = create_range(540.0, 542.0, MINUTE_PX).expect("a range");
+        assert_eq!(start, 540.0);
+        assert_eq!(end - start, MIN_BLOCK_MINUTES);
+    }
+
+    #[test]
+    fn a_drag_off_the_bottom_stops_at_the_end_of_the_day() {
+        let (start, end) = create_range(1380.0, 5000.0, MINUTE_PX).expect("a range");
+        assert_eq!(start, 1380.0); // 23:00
+        assert_eq!(end, MINUTES_PER_DAY);
+    }
+
+    #[test]
+    fn a_drag_off_the_top_stops_at_midnight() {
+        let (start, end) = create_range(60.0, -500.0, MINUTE_PX).expect("a range");
+        assert_eq!(start, 0.0);
+        assert_eq!(end, 60.0);
+    }
+
+    #[test]
+    fn a_press_at_the_very_bottom_still_leaves_room_for_the_minimum_block() {
+        // Starting inside the last quarter hour must not produce an event that
+        // ends before it starts.
+        let (start, end) = create_range(1439.0, 1439.0, MINUTE_PX).expect("a range");
+        assert!(end > start, "{start} -> {end}");
+        assert_eq!(end, MINUTES_PER_DAY);
+        assert_eq!(end - start, MIN_BLOCK_MINUTES);
+    }
+
+    #[test]
+    fn a_grid_with_no_height_has_no_range_rather_than_dividing_by_zero() {
+        assert_eq!(create_range(540.0, 630.0, 0.0), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
 use crate::views::{
-    add_new_event_menu,
+    CreateFn, add_new_event_menu,
     drag::{BlockPlacement, DragKind, TimedGrid, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
@@ -41,7 +41,7 @@ pub enum InitialScroll {
 pub fn build(
     anchor: NaiveDate,
     events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
@@ -61,7 +61,7 @@ pub fn build(
 pub fn build_day(
     day: NaiveDate,
     events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
@@ -82,7 +82,7 @@ pub fn build_day(
 fn build_days(
     days: Vec<NaiveDate>,
     events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
@@ -148,7 +148,7 @@ fn initial_scroll_hours(days: &[NaiveDate], today: NaiveDate, initial: InitialSc
 pub fn build_hour_grid(
     days: &[NaiveDate],
     events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     hour_row_height: i32,
@@ -317,7 +317,7 @@ fn day_column(
     day: NaiveDate,
     today: NaiveDate,
     day_events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
     timed_grid: &Rc<TimedGrid>,
@@ -344,7 +344,7 @@ fn day_column(
                 .and_local_timezone(Local)
                 .single();
             if let Some(start) = start {
-                on_create(start);
+                on_create(start, None);
             }
         });
         cell.add_controller(click);
@@ -356,6 +356,25 @@ fn day_column(
     overlay.add_css_class("week-day-column");
     overlay.set_child(Some(&col));
     add_drop_target(&overlay, day, Some(hour_row_height), on_move);
+
+    // Dragging across empty grid space creates an event spanning exactly what
+    // was drawn, rather than the default hour a click gives.
+    {
+        let on_create = on_create.clone();
+        crate::views::drag::install_create_drag(
+            &overlay,
+            hour_row_height as f64,
+            std::rc::Rc::new(move |start: NaiveTime, end: NaiveTime| {
+                let (Some(start), Some(end)) = (
+                    day.and_time(start).and_local_timezone(Local).single(),
+                    day.and_time(end).and_local_timezone(Local).single(),
+                ) else {
+                    return;
+                };
+                on_create(start, Some(end));
+            }),
+        );
+    }
 
     // Right-clicking empty grid space offers a new event at that spot,
     // snapped down to the quarter hour it lands in.

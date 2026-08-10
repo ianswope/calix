@@ -248,12 +248,21 @@ impl RemoteEvent {
 
 /// Opens a create/edit dialog for an event. Remote changes are completed in a
 /// worker thread before the local cache is updated.
+// Eight arguments, one over clippy's threshold. They are the dialog's inputs
+// and nothing here groups meaningfully: `editing` and `remote_event` describe
+// an existing event, `create_targets` only a new one, and the start/end pair
+// applies to both. A struct to hold them would be built inline at all three
+// call sites and read no better than the argument list does.
+#[allow(clippy::too_many_arguments)]
 pub fn open(
     parent: &impl IsA<gtk::Widget>,
     store: Rc<Store>,
     create_targets: Vec<TargetChoice>,
     editing: Option<Event>,
     initial_start: DateTime<Local>,
+    // End time for a new event. `None` takes the one-hour default; a
+    // create-drag passes the span the user actually drew.
+    initial_end: Option<DateTime<Local>>,
     on_saved: impl Fn() + 'static,
     remote_event: Option<RemoteEvent>,
 ) {
@@ -404,7 +413,7 @@ pub fn open(
                 &start_row,
                 &end_row,
                 initial_start,
-                initial_start + chrono::Duration::hours(1),
+                initial_end.unwrap_or_else(|| initial_start + chrono::Duration::hours(1)),
                 false,
             );
         }

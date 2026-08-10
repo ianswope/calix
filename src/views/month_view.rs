@@ -1,11 +1,11 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
 use crate::views::{
-    add_new_event_menu,
+    CreateFn, add_new_event_menu,
     drag::{DragKind, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
 use std::rc::Rc;
 
@@ -20,7 +20,7 @@ const MAX_CHIPS_PER_CELL: usize = 3;
 pub fn build(
     anchor: NaiveDate,
     events: &[Event],
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
@@ -81,7 +81,7 @@ fn day_cell(
     current_month: u32,
     today: NaiveDate,
     day_events: Vec<Event>,
-    on_create: Rc<dyn Fn(DateTime<Local>)>,
+    on_create: CreateFn,
     on_edit: Rc<dyn Fn(Event)>,
     on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
 ) -> gtk::Widget {
@@ -147,7 +147,7 @@ fn day_cell(
             .and_local_timezone(Local)
             .single();
         if let Some(start) = start {
-            on_create(start);
+            on_create(start, None);
         }
     });
     cell.add_controller(click);
