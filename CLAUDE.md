@@ -53,7 +53,8 @@ functions** and test those:
 - `views/drag.rs` — snap-to-grid, minute→time, time formatting, drag-payload
   parsing.
 - `window.rs` — draft move/resize arithmetic, including DST edge cases.
-- `omarchy.rs` — hex parsing and color mixing for theme overrides.
+- `omarchy.rs` — palette parsing, hex parsing, and color mixing for theme
+  overrides.
 - `store.rs` — open an in-memory DB with `Store::open_in_memory()` and assert
   on real queries; no filesystem or network needed.
 
@@ -61,16 +62,32 @@ If a change lives inside a widget callback and feels untestable, that's the
 signal to extract the decision into a free function and test it there. Wiring
 (signal connections, layout) stays thin and is verified by running the app.
 
+### The `gui` feature gate
+
+`src/lib.rs` splits the crate in two. Storage, sync, recurrence, alerts and
+date math are always compiled; the GTK frontend sits behind the `gui` feature,
+which is on by default and is what the `calix` binary requires.
+
+The rule this enforces: **nothing in the backend half may `use gtk::`,
+`adw::`, `glib::` or `gio::`** — including for conveniences like
+`glib::user_data_dir()`, which is why `src/xdg.rs` exists. `cargo check
+--no-default-features` is the gate, and it runs in CI before the GTK system
+libraries are even installed.
+
+Keeping that seam intact is what makes the headless tests possible and leaves
+room for a second frontend to link the backend without dragging GTK in.
+
 ## CI gates
 
 CI (`.github/workflows/ci.yml`) runs, in order and all required:
 
 ```sh
+cargo check --no-default-features   # backend must not need GTK (see below)
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-Run all three locally before committing. A local pre-commit hook also blocks
+Run all four locally before committing. A local pre-commit hook also blocks
 unformatted commits. Clippy warnings are hard errors here — fix them, don't
 `#[allow]` them without a reason.
