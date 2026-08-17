@@ -33,6 +33,21 @@ fn main() -> glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
+    // Whether the desktop theme was picked up is invisible from a screenshot
+    // once it's wrong — a missing palette and a palette that parsed to stock
+    // colors look identical. This prints what was actually resolved, without
+    // needing a display.
+    if std::env::args().any(|arg| arg == "--print-theme") {
+        match omarchy::theme_overrides() {
+            Some(overrides) => {
+                println!("# resolved Omarchy theme (dark = {})", overrides.dark);
+                print!("{}", overrides.css);
+            }
+            None => println!("# no Omarchy theme found; using stock Adwaita colors"),
+        }
+        return glib::ExitCode::SUCCESS;
+    }
+
     // Same line into the journal, so a bug report from a running instance
     // carries its provenance without anyone having to think of it.
     eprintln!("calix {}", build_info::stamp());
