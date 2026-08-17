@@ -377,7 +377,7 @@ impl Store {
         self.accounts_for_provider("caldav")
     }
 
-    fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
+    pub fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, provider, provider_account_id, display_name, token_key, server_url
              FROM accounts

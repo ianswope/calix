@@ -20,6 +20,7 @@ pub mod http;
 pub mod icloud;
 pub mod notify;
 pub mod omarchy;
+pub mod provider;
 pub mod recurrence;
 pub mod store;
 pub mod sync;

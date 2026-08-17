@@ -9,6 +9,7 @@ use crate::event_dialog;
 use crate::event_popover;
 use crate::google;
 use crate::icloud;
+use crate::provider::{self, Provider};
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
@@ -1129,7 +1130,7 @@ pub fn build(app: &adw::Application) {
     ));
 
     let google_sync_button = gtk::Button::with_label("Sync Google");
-    update_google_sync_button(&ui, &google_sync_button);
+    update_sync_button(&ui, &google_sync_button, provider::GOOGLE);
     google_sync_button.connect_clicked(clone!(
         #[strong]
         ui,
@@ -1151,7 +1152,7 @@ pub fn build(app: &adw::Application) {
     ));
 
     let icloud_sync_button = gtk::Button::with_label("Sync iCloud");
-    update_icloud_sync_button(&ui, &icloud_sync_button);
+    update_sync_button(&ui, &icloud_sync_button, provider::ICLOUD);
     icloud_sync_button.connect_clicked(clone!(
         #[strong]
         ui,
@@ -1173,7 +1174,7 @@ pub fn build(app: &adw::Application) {
     ));
 
     let caldav_sync_button = gtk::Button::with_label("Sync CalDAV");
-    update_caldav_sync_button(&ui, &caldav_sync_button);
+    update_sync_button(&ui, &caldav_sync_button, provider::CALDAV);
     caldav_sync_button.connect_clicked(clone!(
         #[strong]
         ui,
@@ -2216,32 +2217,18 @@ fn add_summary(outcome: &Result<SyncOutcome, String>, display_name: &str, noun: 
     }
 }
 
-fn update_google_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
-    let account_count = ui
-        .store
-        .google_accounts()
-        .map(|accounts| accounts.len())
-        .unwrap_or(0);
+/// Re-enables a provider's Sync button and points its tooltip at whichever job
+/// the next press will do. Called after every sync attempt, however it ended.
+fn update_sync_button(ui: &Rc<Ui>, button: &gtk::Button, provider: Provider) {
     button.set_sensitive(true);
-    button.set_tooltip_text(if account_count > 0 {
-        Some("Fetch the latest events from connected Google accounts")
-    } else {
-        Some("Fetch calendars from connected Google accounts")
-    });
+    button.set_tooltip_text(Some(&provider.sync_tooltip(has_accounts(ui, provider))));
 }
 
-fn update_icloud_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
-    let account_count = ui
-        .store
-        .icloud_accounts()
-        .map(|accounts| accounts.len())
-        .unwrap_or(0);
-    button.set_sensitive(true);
-    button.set_tooltip_text(if account_count > 0 {
-        Some("Fetch the latest events from connected iCloud accounts")
-    } else {
-        Some("Fetch calendars from connected iCloud accounts")
-    });
+fn has_accounts(ui: &Rc<Ui>, provider: Provider) -> bool {
+    ui.store
+        .accounts_for_provider(provider.key)
+        .map(|accounts| !accounts.is_empty())
+        .unwrap_or(false)
 }
 
 /// A completed Add. The account row and its secret are written before the
@@ -2311,7 +2298,7 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                         ))));
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
-                    update_google_sync_button(&ui, &sync_button);
+                    update_sync_button(&ui, &sync_button, provider::GOOGLE);
                     ui.reset_calendar_sidebar();
                     ui.reset();
                     glib::ControlFlow::Break
@@ -2324,14 +2311,14 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                         ))));
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
-                    update_google_sync_button(&ui, &sync_button);
+                    update_sync_button(&ui, &sync_button, provider::GOOGLE);
                     glib::ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     add_button.set_label("Add Google");
                     add_button.set_sensitive(true);
-                    update_google_sync_button(&ui, &sync_button);
+                    update_sync_button(&ui, &sync_button, provider::GOOGLE);
                     glib::ControlFlow::Break
                 }
             }
@@ -2344,16 +2331,6 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
 struct CaldavAddResult {
     display_name: String,
     outcome: Result<SyncOutcome, String>,
-}
-
-/// Human-readable provider name for the account list.
-fn provider_label(provider: &str) -> &str {
-    match provider {
-        "google" => "Google",
-        "icloud" => "iCloud",
-        "caldav" => "CalDAV",
-        other => other,
-    }
 }
 
 /// Forgets `account`: its keyring credential, then its events, calendars, and
@@ -2405,8 +2382,8 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
         let group = adw::PreferencesGroup::new();
         for account in accounts {
             let subtitle = match &account.server_url {
-                Some(url) => format!("{} · {url}", provider_label(&account.provider)),
-                None => provider_label(&account.provider).to_string(),
+                Some(url) => format!("{} · {url}", Provider::label_for_key(&account.provider)),
+                None => Provider::label_for_key(&account.provider).to_string(),
             };
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&account.display_name))
@@ -2470,7 +2447,7 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
              cached calendars and events from this computer.\n\nYour calendars and \
              events are not touched on the provider, and no password or token is \
              revoked there.",
-            provider_label(&account.provider)
+            Provider::label_for_key(&account.provider)
         ))
         .build();
     alert.add_response("cancel", "Cancel");
@@ -2752,7 +2729,7 @@ fn add_icloud_account(
                             ))));
                         restore();
                         dialog.close();
-                        update_icloud_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::ICLOUD);
                         ui.reset_calendar_sidebar();
                         ui.reset();
                         glib::ControlFlow::Break
@@ -2763,7 +2740,7 @@ fn add_icloud_account(
                         error_label.set_label(first_line(&error));
                         error_label.set_visible(true);
                         restore();
-                        update_icloud_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::ICLOUD);
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2772,7 +2749,7 @@ fn add_icloud_account(
                             .set_label("The connection attempt stopped unexpectedly. Try again.");
                         error_label.set_visible(true);
                         restore();
-                        update_icloud_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::ICLOUD);
                         glib::ControlFlow::Break
                     }
                 }
@@ -2794,37 +2771,92 @@ fn sync_connected_accounts(
     icloud_sync_button: &gtk::Button,
     caldav_sync_button: &gtk::Button,
 ) {
-    if google_sync_button.is_sensitive()
-        && ui
-            .store
-            .google_accounts()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-    {
-        sync_google_accounts(ui, google_sync_button, true);
-    }
-    if icloud_sync_button.is_sensitive()
-        && ui
-            .store
-            .icloud_accounts()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-    {
-        sync_icloud_accounts(ui, icloud_sync_button, true);
-    }
-    if caldav_sync_button.is_sensitive()
-        && ui
-            .store
-            .caldav_accounts()
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-    {
-        sync_caldav_accounts(ui, caldav_sync_button, true);
+    // A button that's already insensitive has a sync in flight; skipping it
+    // keeps an automatic pass from stacking a second one on top.
+    type SyncFn = fn(&Rc<Ui>, &gtk::Button, bool);
+    let providers: [(Provider, &gtk::Button, SyncFn); 3] = [
+        (provider::GOOGLE, google_sync_button, sync_google_accounts),
+        (provider::ICLOUD, icloud_sync_button, sync_icloud_accounts),
+        (provider::CALDAV, caldav_sync_button, sync_caldav_accounts),
+    ];
+    for (provider, button, sync) in providers {
+        if button.is_sensitive() && has_accounts(ui, provider) {
+            sync(ui, button, true);
+        }
     }
 }
 
+/// The shared half of every sync: disable the button, run `load_and_sync` on a
+/// worker thread, poll for its result, then report and re-enable.
+///
 /// `quiet` suppresses the success toast (errors are always surfaced) so
 /// automatic launch/periodic syncs don't nag; manual clicks pass `false`.
+/// `load_and_sync` returns how many accounts it tried along with the outcome —
+/// it runs off the main thread, so it opens its own `Store`.
+fn run_account_sync<F>(
+    ui: &Rc<Ui>,
+    sync_button: &gtk::Button,
+    quiet: bool,
+    provider: Provider,
+    load_and_sync: F,
+) where
+    F: FnOnce() -> Result<(usize, SyncOutcome), String> + Send + 'static,
+{
+    sync_button.set_sensitive(false);
+    sync_button.set_label("Syncing…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(load_and_sync());
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            sync_button,
+            move || {
+                let outcome = match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                    // The worker died without sending; nothing to report beyond
+                    // giving the button back.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        sync_button.set_label(&provider.sync_label());
+                        update_sync_button(&ui, &sync_button, provider);
+                        return glib::ControlFlow::Break;
+                    }
+                };
+
+                match outcome {
+                    Ok((account_count, outcome)) => {
+                        if !quiet || !outcome.failed.is_empty() {
+                            ui.toast_overlay.add_toast(adw::Toast::new(
+                                &outcome.synced_summary(provider.calendar_noun, account_count),
+                            ));
+                        }
+                        ui.reset_calendar_sidebar();
+                        ui.reset();
+                    }
+                    Err(error) => {
+                        eprintln!("calix: {}", provider.sync_failed(&error));
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(
+                                &provider.sync_failed(first_line(&error)),
+                            )));
+                    }
+                }
+
+                sync_button.set_label(&provider.sync_label());
+                update_sync_button(&ui, &sync_button, provider);
+                glib::ControlFlow::Break
+            }
+        ),
+    );
+}
+
 fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
     let Some(google_config) = ui.config.google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
@@ -2833,181 +2865,69 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
         return;
     };
 
-    sync_button.set_sensitive(false);
-    sync_button.set_label("Syncing…");
+    run_account_sync(ui, sync_button, quiet, provider::GOOGLE, move || {
+        let store = Store::open().map_err(|e| e.to_string())?;
+        let mut accounts = store.google_accounts().map_err(|e| e.to_string())?;
+        // A token saved before accounts were per-account gets adopted here, so
+        // an upgrade doesn't look like a disconnected account.
+        if accounts.is_empty()
+            && let Some(token) =
+                google::oauth::get_access_token(&google_config, google::oauth::legacy_token_key())
+                    .map_err(|e| e.to_string())?
+        {
+            let (provider_account_id, display_name) = google::sync::account_identity(&token)?;
+            let token_key = google::oauth::token_key(&provider_account_id);
+            google::oauth::copy_refresh_token(google::oauth::legacy_token_key(), &token_key)
+                .map_err(|e| e.to_string())?;
+            store
+                .upsert_google_account(&provider_account_id, &display_name, &token_key)
+                .map_err(|e| e.to_string())?;
+            accounts = store.google_accounts().map_err(|e| e.to_string())?;
+        }
+        if accounts.is_empty() {
+            return Err(provider::GOOGLE.none_connected());
+        }
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, SyncOutcome), String> {
-            let store = Store::open().map_err(|e| e.to_string())?;
-            let mut accounts = store.google_accounts().map_err(|e| e.to_string())?;
-            if accounts.is_empty()
-                && let Some(token) = google::oauth::get_access_token(
-                    &google_config,
-                    google::oauth::legacy_token_key(),
-                )
-                .map_err(|e| e.to_string())?
-            {
-                let (provider_account_id, display_name) = google::sync::account_identity(&token)?;
-                let token_key = google::oauth::token_key(&provider_account_id);
-                google::oauth::copy_refresh_token(google::oauth::legacy_token_key(), &token_key)
-                    .map_err(|e| e.to_string())?;
-                store
-                    .upsert_google_account(&provider_account_id, &display_name, &token_key)
-                    .map_err(|e| e.to_string())?;
-                accounts = store.google_accounts().map_err(|e| e.to_string())?;
-            }
-            if accounts.is_empty() {
-                return Err("No Google accounts connected. Use Add Google first.".to_string());
-            }
-            let account_count = accounts.len();
-            let outcome = sync::sync_accounts(
-                &accounts,
-                |account| account.label(),
-                |account| {
-                    let token = google::oauth::get_access_token(&google_config, &account.token_key)
-                        .map_err(|e| e.to_string())?
-                        .ok_or("no saved token — reconnect the account")?;
-                    google::sync::sync_account(&token, &store, account.id)
-                },
-            );
-
-            Ok((account_count, outcome))
-        })();
-        let _ = tx.send(result);
+        let account_count = accounts.len();
+        let outcome = sync::sync_accounts(
+            &accounts,
+            |account| account.label(),
+            |account| {
+                let token = google::oauth::get_access_token(&google_config, &account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("no saved token — reconnect the account")?;
+                google::sync::sync_account(&token, &store, account.id)
+            },
+        );
+        Ok((account_count, outcome))
     });
-
-    glib::timeout_add_local(
-        Duration::from_millis(200),
-        clone!(
-            #[strong]
-            ui,
-            #[strong]
-            sync_button,
-            move || match rx.try_recv() {
-                Ok(Ok((account_count, outcome))) => {
-                    if !quiet || !outcome.failed.is_empty() {
-                        ui.toast_overlay.add_toast(adw::Toast::new(
-                            &outcome.synced_summary("calendar", account_count),
-                        ));
-                    }
-                    sync_button.set_label("Sync Google");
-                    update_google_sync_button(&ui, &sync_button);
-                    ui.reset_calendar_sidebar();
-                    ui.reset();
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(error)) => {
-                    eprintln!("calix: Google sync failed: {error}");
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
-                            "Google sync failed: {}",
-                            first_line(&error)
-                        ))));
-                    sync_button.set_label("Sync Google");
-                    update_google_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    sync_button.set_label("Sync Google");
-                    update_google_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-            }
-        ),
-    );
 }
 
 fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
-    sync_button.set_sensitive(false);
-    sync_button.set_label("Syncing…");
+    run_account_sync(ui, sync_button, quiet, provider::ICLOUD, || {
+        let store = Store::open().map_err(|e| e.to_string())?;
+        let accounts = store.icloud_accounts().map_err(|e| e.to_string())?;
+        if accounts.is_empty() {
+            return Err(provider::ICLOUD.none_connected());
+        }
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, SyncOutcome), String> {
-            let store = Store::open().map_err(|e| e.to_string())?;
-            let accounts = store.icloud_accounts().map_err(|e| e.to_string())?;
-            if accounts.is_empty() {
-                return Err("No iCloud accounts connected. Use Add iCloud first.".to_string());
-            }
-
-            let account_count = accounts.len();
-            let outcome = sync::sync_accounts(
-                &accounts,
-                |account| account.label(),
-                |account| {
-                    let app_password = icloud::credentials::app_password(&account.token_key)
-                        .map_err(|e| e.to_string())?
-                        .ok_or("no saved app-specific password — reconnect the account")?;
-                    let credentials = caldav::Credentials {
-                        base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
-                        username: account.provider_account_id.clone(),
-                        password: app_password,
-                    };
-                    caldav::sync_account(&credentials, &store, account.id)
-                },
-            );
-
-            Ok((account_count, outcome))
-        })();
-        let _ = tx.send(result);
-    });
-
-    glib::timeout_add_local(
-        Duration::from_millis(200),
-        clone!(
-            #[strong]
-            ui,
-            #[strong]
-            sync_button,
-            move || match rx.try_recv() {
-                Ok(Ok((account_count, outcome))) => {
-                    if !quiet || !outcome.failed.is_empty() {
-                        ui.toast_overlay.add_toast(adw::Toast::new(
-                            &outcome.synced_summary("iCloud calendar", account_count),
-                        ));
-                    }
-                    sync_button.set_label("Sync iCloud");
-                    update_icloud_sync_button(&ui, &sync_button);
-                    ui.reset_calendar_sidebar();
-                    ui.reset();
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(error)) => {
-                    eprintln!("calix: iCloud sync failed: {error}");
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
-                            "iCloud sync failed: {}",
-                            first_line(&error)
-                        ))));
-                    sync_button.set_label("Sync iCloud");
-                    update_icloud_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    sync_button.set_label("Sync iCloud");
-                    sync_button.set_sensitive(true);
-                    update_icloud_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-            }
-        ),
-    );
-}
-
-fn update_caldav_sync_button(ui: &Rc<Ui>, button: &gtk::Button) {
-    let account_count = ui
-        .store
-        .caldav_accounts()
-        .map(|accounts| accounts.len())
-        .unwrap_or(0);
-    button.set_sensitive(true);
-    button.set_tooltip_text(if account_count > 0 {
-        Some("Fetch the latest events from connected CalDAV accounts")
-    } else {
-        Some("Fetch calendars from connected CalDAV accounts")
+        let account_count = accounts.len();
+        let outcome = sync::sync_accounts(
+            &accounts,
+            |account| account.label(),
+            |account| {
+                let app_password = icloud::credentials::app_password(&account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("no saved app-specific password — reconnect the account")?;
+                let credentials = caldav::Credentials {
+                    base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
+                    username: account.provider_account_id.clone(),
+                    password: app_password,
+                };
+                caldav::sync_account(&credentials, &store, account.id)
+            },
+        );
+        Ok((account_count, outcome))
     });
 }
 
@@ -3232,7 +3152,7 @@ fn add_caldav_account(
                             ))));
                         restore();
                         dialog.close();
-                        update_caldav_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::CALDAV);
                         ui.reset_calendar_sidebar();
                         ui.reset();
                         glib::ControlFlow::Break
@@ -3241,7 +3161,7 @@ fn add_caldav_account(
                         error_label.set_label(first_line(&error));
                         error_label.set_visible(true);
                         restore();
-                        update_caldav_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::CALDAV);
                         glib::ControlFlow::Break
                     }
                     Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -3250,7 +3170,7 @@ fn add_caldav_account(
                             .set_label("The connection attempt stopped unexpectedly. Try again.");
                         error_label.set_visible(true);
                         restore();
-                        update_caldav_sync_button(&ui, &sync_button);
+                        update_sync_button(&ui, &sync_button, provider::CALDAV);
                         glib::ControlFlow::Break
                     }
                 }
@@ -3260,85 +3180,35 @@ fn add_caldav_account(
 }
 
 fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
-    sync_button.set_sensitive(false);
-    sync_button.set_label("Syncing…");
+    run_account_sync(ui, sync_button, quiet, provider::CALDAV, || {
+        let store = Store::open().map_err(|e| e.to_string())?;
+        let accounts = store.caldav_accounts().map_err(|e| e.to_string())?;
+        if accounts.is_empty() {
+            return Err(provider::CALDAV.none_connected());
+        }
 
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<(usize, SyncOutcome), String> {
-            let store = Store::open().map_err(|e| e.to_string())?;
-            let accounts = store.caldav_accounts().map_err(|e| e.to_string())?;
-            if accounts.is_empty() {
-                return Err("No CalDAV accounts connected. Use Add CalDAV first.".to_string());
-            }
-
-            let account_count = accounts.len();
-            let outcome = sync::sync_accounts(
-                &accounts,
-                |account| account.label(),
-                |account| {
-                    let base_url = account
-                        .server_url
-                        .clone()
-                        .ok_or("no server address — remove and re-add the account")?;
-                    let password = icloud::credentials::app_password(&account.token_key)
-                        .map_err(|e| e.to_string())?
-                        .ok_or("no saved password — reconnect the account")?;
-                    let credentials = caldav::Credentials {
-                        base_url,
-                        username: account.provider_account_id.clone(),
-                        password,
-                    };
-                    caldav::sync_account(&credentials, &store, account.id)
-                },
-            );
-
-            Ok((account_count, outcome))
-        })();
-        let _ = tx.send(result);
+        let account_count = accounts.len();
+        let outcome = sync::sync_accounts(
+            &accounts,
+            |account| account.label(),
+            |account| {
+                let base_url = account
+                    .server_url
+                    .clone()
+                    .ok_or("no server address — remove and re-add the account")?;
+                let password = icloud::credentials::app_password(&account.token_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("no saved password — reconnect the account")?;
+                let credentials = caldav::Credentials {
+                    base_url,
+                    username: account.provider_account_id.clone(),
+                    password,
+                };
+                caldav::sync_account(&credentials, &store, account.id)
+            },
+        );
+        Ok((account_count, outcome))
     });
-
-    glib::timeout_add_local(
-        Duration::from_millis(200),
-        clone!(
-            #[strong]
-            ui,
-            #[strong]
-            sync_button,
-            move || match rx.try_recv() {
-                Ok(Ok((account_count, outcome))) => {
-                    if !quiet || !outcome.failed.is_empty() {
-                        ui.toast_overlay.add_toast(adw::Toast::new(
-                            &outcome.synced_summary("CalDAV calendar", account_count),
-                        ));
-                    }
-                    sync_button.set_label("Sync CalDAV");
-                    update_caldav_sync_button(&ui, &sync_button);
-                    ui.reset_calendar_sidebar();
-                    ui.reset();
-                    glib::ControlFlow::Break
-                }
-                Ok(Err(error)) => {
-                    eprintln!("calix: CalDAV sync failed: {error}");
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
-                            "CalDAV sync failed: {}",
-                            first_line(&error)
-                        ))));
-                    sync_button.set_label("Sync CalDAV");
-                    update_caldav_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    sync_button.set_label("Sync CalDAV");
-                    sync_button.set_sensitive(true);
-                    update_caldav_sync_button(&ui, &sync_button);
-                    glib::ControlFlow::Break
-                }
-            }
-        ),
-    );
 }
 
 /// Host portion of a server URL, for a compact account label; falls back to
