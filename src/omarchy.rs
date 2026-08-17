@@ -62,6 +62,47 @@ pub fn theme_overrides() -> Option<ThemeOverrides> {
     overrides
 }
 
+/// The monospace family the desktop's terminal uses, so the calendar grid can
+/// be set in the same face as everything else on screen. `None` means fall back
+/// to whatever fontconfig calls `monospace`.
+///
+/// Read from `~/.config/alacritty/alacritty.toml`, which is where Omarchy keeps
+/// the font — the theme files carry colors only, and the font is a user choice
+/// that survives theme switches. `import`s aren't followed: a font declared only
+/// in an imported file falls back rather than being chased across files.
+pub fn terminal_font_family() -> Option<String> {
+    let path = crate::xdg::config_home().join("alacritty/alacritty.toml");
+    font_family_from_toml(&std::fs::read_to_string(path).ok()?)
+}
+
+/// Alacritty's font family, from either spelling of the same table:
+/// `[font] normal = { family = "…" }` or `[font.normal] family = "…"`.
+fn font_family_from_toml(contents: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct AlacrittyConfig {
+        font: Option<Font>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Font {
+        normal: Option<FontFace>,
+    }
+    #[derive(serde::Deserialize)]
+    struct FontFace {
+        family: Option<String>,
+    }
+
+    let config: AlacrittyConfig = toml::from_str(contents).ok()?;
+    config
+        .font?
+        .normal?
+        .family
+        .map(|family| family.trim().to_string())
+        .filter(|family| !family.is_empty())
+        // The name is interpolated into a CSS declaration, and no real family
+        // contains either character.
+        .filter(|family| !family.contains(['"', ';']))
+}
+
 /// Where `colors.toml` may live, newest layout first. Omarchy moved the
 /// `current` symlink out of `~/.config/omarchy` and into `~/.local/state/omarchy`;
 /// both are checked so the theming works either side of that move.
@@ -330,6 +371,62 @@ foreground = "#d3c6aa"
 "##;
         assert!(overrides_from_toml(palette).is_none());
         assert!(overrides_from_toml("").is_none());
+    }
+
+    #[test]
+    fn the_terminal_font_family_is_read_from_an_inline_table() {
+        // The spelling Omarchy's own alacritty.toml ships with.
+        let config = r##"
+[font]
+normal = { family = "JetBrainsMono Nerd Font", style = "Regular" }
+size = 10
+"##;
+        assert_eq!(
+            font_family_from_toml(config).as_deref(),
+            Some("JetBrainsMono Nerd Font")
+        );
+    }
+
+    #[test]
+    fn the_terminal_font_family_is_read_from_a_section_too() {
+        // Same structure, other spelling — a hand-edited config may use either.
+        let config = r##"
+[font.normal]
+family = "Berkeley Mono"
+"##;
+        assert_eq!(
+            font_family_from_toml(config).as_deref(),
+            Some("Berkeley Mono")
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_font_of_its_own_yields_no_family() {
+        // A config that only imports the theme, which carries colors and no font.
+        let config = r##"
+general.import = [ "~/.local/state/omarchy/current/theme/alacritty.toml" ]
+
+[window]
+padding.x = 14
+"##;
+        assert_eq!(font_family_from_toml(config), None);
+        assert_eq!(font_family_from_toml(""), None);
+        assert_eq!(font_family_from_toml("this isn't toml at all ["), None);
+    }
+
+    #[test]
+    fn a_blank_font_family_is_treated_as_absent() {
+        // Rather than emitting `font-family: ""` and losing the fallback.
+        let config = "[font]\nnormal = { family = \"   \" }\n";
+        assert_eq!(font_family_from_toml(config), None);
+    }
+
+    #[test]
+    fn a_family_that_could_break_out_of_the_css_declaration_is_refused() {
+        // The name lands inside a quoted CSS value; nothing legitimate carries
+        // a quote or a semicolon, so treat it as absent rather than emit it.
+        let config = "[font]\nnormal = { family = 'Mono\"; color: red' }\n";
+        assert_eq!(font_family_from_toml(config), None);
     }
 
     #[test]

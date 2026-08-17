@@ -1,12 +1,97 @@
 use gtk::gdk;
 
 const CSS: &str = "
+/* ── Terminal grammar ──────────────────────────────────────────────────────
+   Calix sits on an Omarchy desktop, where every other window is a terminal.
+   The house style there is built from three things: a monospace face, 1px
+   rules, and inverse video for emphasis — never rounding, gradients or
+   elevation. These rules strip GTK's defaults back to that vocabulary; the
+   layout rules further down were already line-based and mostly just work.
+
+   This provider loads at APPLICATION priority, which outranks libadwaita's
+   own THEME-priority rules regardless of selector specificity — which is why
+   a bare `*` is enough to square everything off. */
+
+* {
+    border-radius: 0;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+}
+
+/* Elevation is the other half of the GTK look: chrome lifts off the page with
+   a shadow. Flatten it, and let borders do the separating. Entries and buttons
+   are included because libadwaita draws their outline as an inset shadow,
+   which is replaced with a real border below. */
+window,
+headerbar,
+popover > contents,
+.card,
+.boxed-list,
+dialog,
+toast,
+.toast,
+.osd,
+button,
+entry,
+spinbutton {
+    box-shadow: none;
+}
+
+/* Controls read as bracketed regions rather than raised chips: flat ground,
+   one hairline, and inverse video on hover the way a selected line inverts. */
+button {
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid @borders;
+}
+
+button:hover {
+    background-color: alpha(@window_fg_color, 0.08);
+}
+
+button:active,
+button:checked {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-color: @accent_bg_color;
+}
+
+/* Flat buttons carry no border at all until pointed at — used for the grid's
+   own event blocks and the icon buttons in the header, where a box around
+   every one would out-shout the calendar. */
+button.flat {
+    border-color: transparent;
+}
+
+entry,
+spinbutton,
+popover > contents,
+.card,
+.boxed-list,
+toast,
+.toast {
+    background-image: none;
+    border: 1px solid @borders;
+}
+
+entry:focus-within {
+    border-color: @accent_bg_color;
+}
+
+/* A terminal's selected line inverts; it doesn't tint. */
+:selected,
+row:selected {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+}
+
+/* Today's date is the one piece of inverse video in the grid — a filled block
+   the way a block cursor sits on a character cell, not a pill. */
 .today-badge {
     background-color: @accent_bg_color;
     color: @accent_fg_color;
-    border-radius: 999px;
-    min-width: 26px;
-    min-height: 26px;
+    min-width: 24px;
+    min-height: 22px;
 }
 
 .month-cell {
@@ -72,27 +157,27 @@ const CSS: &str = "
     border-bottom: 1px solid alpha(@borders, 0.6);
 }
 
+/* The current time reads as a rule across the day with a square tick in the
+   gutter — the shape a terminal draws a marker with. */
 .now-line {
     background-color: @destructive_bg_color;
-    min-height: 2px;
+    min-height: 1px;
 }
 
 .now-dot {
     background-color: @destructive_bg_color;
-    border-radius: 999px;
-    min-width: 8px;
-    min-height: 8px;
+    min-width: 6px;
+    min-height: 6px;
 }
 
 .event-chip {
     background-color: transparent;
     color: @window_fg_color;
-    border-radius: 6px;
-    box-shadow: none;
     padding: 0;
-    margin: 0 4px;
+    margin: 0 2px;
     font-size: 0.85em;
     min-height: 20px;
+    border: none;
 }
 
 .event-chip label {
@@ -114,10 +199,9 @@ const CSS: &str = "
 .event-block {
     background-color: transparent;
     color: @window_fg_color;
-    border-radius: 6px;
-    box-shadow: none;
     padding: 0;
     font-size: 0.85em;
+    border: none;
 }
 
 .event-block label {
@@ -134,21 +218,9 @@ const CSS: &str = "
     background-color: alpha(@accent_bg_color, 0.45);
 }
 
-.event-resize-handle-start {
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-}
-
-.event-resize-handle-end {
-    border-bottom-left-radius: 6px;
-    border-bottom-right-radius: 6px;
-}
-
 .drag-preview {
     background-color: alpha(@accent_bg_color, 0.9);
     border: 1px solid @accent_bg_color;
-    border-radius: 6px;
-    box-shadow: 0 2px 6px alpha(black, 0.3);
 }
 
 .drag-preview-label {
@@ -202,6 +274,14 @@ window.compact-text .drag-preview-label {
     font-size: 0.7em;
 }
 
+/* The header is a rule with controls on it, not a raised bar: its shadow is
+   gone, so a hairline does the separating and the height comes down to
+   something closer to a status line. */
+headerbar {
+    border-bottom: 1px solid @borders;
+    min-height: 34px;
+}
+
 /* Header controls (Today, Month/Week/Day) sized down from GTK's default
    header-bar button bulk. */
 .header-small {
@@ -227,11 +307,27 @@ window.compact-text .drag-preview-label {
 }
 ";
 
+/// The rule that sets the whole app in the desktop's monospace face.
+///
+/// Kept separate from `CSS` because the family is discovered at runtime. The
+/// generic `monospace` stays on the end as a fallback, so a machine with no
+/// alacritty config still gets a fixed-width face rather than the UI sans.
+fn font_css(family: Option<&str>) -> String {
+    match family {
+        // The family is quoted: real names have spaces in them.
+        Some(family) => format!("* {{ font-family: \"{family}\", monospace; }}\n"),
+        None => "* { font-family: monospace; }\n".to_string(),
+    }
+}
+
 pub fn load() {
     let display = gdk::Display::default().expect("a display is available");
 
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
+    provider.load_from_string(&format!(
+        "{}{CSS}",
+        font_css(crate::omarchy::terminal_font_family().as_deref())
+    ));
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
@@ -256,5 +352,25 @@ pub fn load() {
         } else {
             adw::ColorScheme::ForceLight
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_discovered_family_is_quoted_and_backed_by_the_generic_monospace() {
+        assert_eq!(
+            font_css(Some("JetBrainsMono Nerd Font")),
+            "* { font-family: \"JetBrainsMono Nerd Font\", monospace; }\n"
+        );
+    }
+
+    #[test]
+    fn without_a_discovered_family_the_generic_monospace_stands_alone() {
+        // Still fixed-width: falling back to the UI sans would lose the look
+        // entirely on a machine with no alacritty config.
+        assert_eq!(font_css(None), "* { font-family: monospace; }\n");
     }
 }

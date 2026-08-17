@@ -3,7 +3,6 @@ use crate::views::EditFn;
 use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, drag_payload};
 use gtk::gdk;
 use gtk::prelude::*;
-use std::f64::consts::PI;
 use std::rc::Rc;
 
 pub fn event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
@@ -93,32 +92,28 @@ fn event_button_with_padding(
     background.set_hexpand(true);
     background.set_vexpand(false);
     background.set_content_height(min_height);
+    // Square, flat, and marked by a solid bar down the leading edge — the shape
+    // a terminal gives a highlighted region. Nothing here rounds or clips,
+    // because there are no corners left to clip against.
     background.set_draw_func(move |_, cr, width, height| {
         let width = width as f64;
         let height = height as f64;
-        let radius = 6.0_f64.min(height / 2.0);
-
-        cr.set_source_rgba(
+        let rgb = (
             color.red() as f64,
             color.green() as f64,
             color.blue() as f64,
-            0.22,
         );
-        rounded_rect(cr, 0.0, 0.0, width, height, radius);
+
+        // A wash of the calendar's color, dim enough to read text over.
+        cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.22);
+        cr.rectangle(0.0, 0.0, width, height);
         let _ = cr.fill();
 
-        let _ = cr.save();
-        rounded_rect(cr, 0.0, 0.0, width, height, radius);
-        cr.clip();
-        cr.set_source_rgba(
-            color.red() as f64,
-            color.green() as f64,
-            color.blue() as f64,
-            0.92,
-        );
-        cr.rectangle(0.0, 0.0, 5.0_f64.min(width), height);
+        // The bar carries the calendar's identity at full strength; it's what
+        // stays legible when the block is only a few pixels tall.
+        cr.set_source_rgba(rgb.0, rgb.1, rgb.2, 0.92);
+        cr.rectangle(0.0, 0.0, 3.0_f64.min(width), height);
         let _ = cr.fill();
-        let _ = cr.restore();
     });
 
     let label = gtk::Label::new(None);
@@ -162,11 +157,6 @@ fn event_button_with_padding(
 fn resize_handle(kind: DragKind, height: i32) -> gtk::Box {
     let handle = gtk::Box::new(gtk::Orientation::Vertical, 0);
     handle.add_css_class("event-resize-handle");
-    handle.add_css_class(match kind {
-        DragKind::ResizeStart => "event-resize-handle-start",
-        DragKind::ResizeEnd => "event-resize-handle-end",
-        DragKind::Move => unreachable!("move drags never use resize handles"),
-    });
     handle.set_hexpand(true);
     handle.set_size_request(-1, height);
     handle.set_halign(gtk::Align::Fill);
@@ -186,13 +176,4 @@ fn make_draggable(widget: &impl IsA<gtk::Widget>, event_id: i64, kind: DragKind)
     let payload = drag_payload(kind, event_id);
     drag.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&payload.to_value())));
     widget.add_controller(drag);
-}
-
-fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -PI / 2.0, 0.0);
-    cr.arc(x + w - r, y + h - r, r, 0.0, PI / 2.0);
-    cr.arc(x + r, y + h - r, r, PI / 2.0, PI);
-    cr.arc(x + r, y + r, r, PI, 3.0 * PI / 2.0);
-    cr.close_path();
 }
