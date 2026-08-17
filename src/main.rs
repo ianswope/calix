@@ -20,6 +20,7 @@ mod style;
 mod sync;
 mod views;
 mod window;
+mod xdg;
 
 const APP_ID: &str = "com.ianswope.Calix";
 

@@ -1136,9 +1136,7 @@ fn normalized_timestamp(value: &str) -> Option<String> {
 }
 
 fn data_file_path() -> PathBuf {
-    gtk::glib::user_data_dir()
-        .join("calix")
-        .join("calix.sqlite3")
+    crate::xdg::data_home().join("calix").join("calix.sqlite3")
 }
 
 #[cfg(test)]
