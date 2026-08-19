@@ -120,12 +120,17 @@ pub fn occurrences_in<Tz: TimeZone>(
     let base_time = base_start.time();
 
     // Jump the index close to the range so an ancient base isn't stepped through
-    // one occurrence at a time; start a step early to catch an occurrence that
-    // begins just before the range yet spans into it.
-    let start_index = approximate_start_index(base_date, freq, range_start.date_naive());
-    // Enough headroom for any realistic viewport even after the fast-forward;
-    // a hard stop so a degenerate call can never loop unbounded.
-    let last_index = start_index + 4000;
+    // one occurrence at a time.
+    let range_index = approximate_index_at(base_date, freq, range_start.date_naive());
+    // Then back up far enough to catch the occurrences that began before the
+    // range and are still running when it opens. One step covers the ordinary
+    // event, shorter than its own repeat interval; an event longer than that has
+    // several in flight at once.
+    let start_index = (range_index - steps_spanning(duration, freq)).max(0);
+    // Enough headroom for any realistic viewport even after the fast-forward; a
+    // hard stop so a degenerate call can never loop unbounded. Anchored to the
+    // range rather than to `start_index`, so backing up can't eat into it.
+    let last_index = range_index + MAX_STEPS;
 
     let mut occurrences = Vec::new();
     let mut index = start_index;
@@ -144,17 +149,39 @@ pub fn occurrences_in<Tz: TimeZone>(
     occurrences
 }
 
-/// The occurrence index at (or just before) `range_start`, so expansion can skip
-/// straight there instead of iterating from `base`. Approximate on purpose —
-/// callers step forward from here — so month/year skips need no accounting.
-fn approximate_start_index(base: NaiveDate, freq: Frequency, range_start: NaiveDate) -> i64 {
-    let index = match freq {
+/// Hard stop on how far one call will step: enough headroom for any realistic
+/// viewport, and for an event spanning many of its own intervals, while keeping
+/// a degenerate call from looping unbounded.
+const MAX_STEPS: i64 = 4000;
+
+/// The occurrence index nearest `range_start`, so expansion can skip straight
+/// there instead of iterating from `base`. Approximate on purpose — callers step
+/// out from here in both directions — so month/year skips need no accounting.
+fn approximate_index_at(base: NaiveDate, freq: Frequency, range_start: NaiveDate) -> i64 {
+    match freq {
         Frequency::Daily => (range_start - base).num_days(),
         Frequency::Weekly => (range_start - base).num_days().div_euclid(7),
         Frequency::Monthly => months_between(base, range_start),
         Frequency::Yearly => (range_start.year() - base.year()) as i64,
+    }
+}
+
+/// How many recurrence steps back cover an event of `duration`, so expansion
+/// starts at the earliest occurrence that could still be running when the range
+/// opens.
+///
+/// Measured against the *shortest* interval the frequency can have — a 28-day
+/// month, a 365-day year — so the count is only ever generous: an occurrence
+/// that turns out not to overlap is filtered out a line later, while one missed
+/// is an event silently absent from the grid.
+fn steps_spanning(duration: Duration, freq: Frequency) -> i64 {
+    let interval_days = match freq {
+        Frequency::Daily => 1,
+        Frequency::Weekly => 7,
+        Frequency::Monthly => 28,
+        Frequency::Yearly => 365,
     };
-    (index - 1).max(0)
+    (duration.num_days().max(0) / interval_days + 1).min(MAX_STEPS)
 }
 
 /// The date of occurrence `index` (0-based), or `None` when the rule skips it —
@@ -372,5 +399,58 @@ mod tests {
                 .all(|o| o.time() == NaiveTime::from_hms_opt(9, 0, 0).unwrap())
         );
         assert_eq!((occ[1] - occ[0]).num_hours(), 167);
+    }
+
+    #[test]
+    fn an_event_longer_than_its_interval_keeps_every_occurrence_still_running() {
+        // A ten-day event that repeats daily has ten of them in flight on any
+        // given day, and every one of them belongs in a range that day covers.
+        let occ = occurrences_in(
+            at(2026, 8, 1, 9),
+            Duration::days(10),
+            Frequency::Daily,
+            at(2026, 8, 20, 0),
+            at(2026, 8, 21, 0),
+        );
+        // The 10th is the earliest still running: it ends 9am on the 20th.
+        assert_eq!(
+            occurrence_days(&occ),
+            (10..=20)
+                .map(|d| NaiveDate::from_ymd_opt(2026, 8, d).unwrap())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_monthly_event_spanning_months_keeps_the_earlier_occurrence_still_running() {
+        // Starts the 5th, runs 100 days: the June range is covered by the March,
+        // April and May occurrences, which all overlap it.
+        let occ = occurrences_in(
+            at(2026, 1, 5, 9),
+            Duration::days(100),
+            Frequency::Monthly,
+            at(2026, 6, 10, 0),
+            at(2026, 6, 11, 0),
+        );
+        assert_eq!(
+            occurrence_days(&occ),
+            [(2026, 3, 5), (2026, 4, 5), (2026, 5, 5), (2026, 6, 5)]
+                .map(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_multi_year_event_keeps_the_yearly_occurrence_still_running() {
+        let occ = occurrences_in(
+            at(2020, 6, 1, 9),
+            Duration::days(800),
+            Frequency::Yearly,
+            at(2026, 1, 1, 0),
+            at(2026, 1, 2, 0),
+        );
+        assert_eq!(
+            occurrence_days(&occ),
+            [(2024, 6, 1), (2025, 6, 1)].map(|(y, m, d)| NaiveDate::from_ymd_opt(y, m, d).unwrap())
+        );
     }
 }
