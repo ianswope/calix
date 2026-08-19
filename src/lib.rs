@@ -45,6 +45,7 @@ mod window;
 #[cfg(feature = "gui")]
 pub fn run() -> gtk::glib::ExitCode {
     use adw::prelude::*;
+    use gtk::gio;
     use gtk::glib;
 
     const APP_ID: &str = "com.ianswope.Calix";
@@ -76,8 +77,33 @@ pub fn run() -> gtk::glib::ExitCode {
     // carries its provenance without anyone having to think of it.
     eprintln!("calix {}", build_info::stamp());
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // Checked here, in the process the user typed into, so a bad date prints
+    // where they can see it. Once forwarded, stderr belongs to whichever
+    // instance started first and the complaint would land in its journal.
+    let args: Vec<String> = std::env::args().collect();
+    if let Err(message) = date_util::parse_date_arg(&args) {
+        eprintln!("calix: {message}");
+        return glib::ExitCode::FAILURE;
+    }
+
+    // HANDLES_COMMAND_LINE so `calix 2026-08-22` reaches the instance that is
+    // already running: GApplication forwards argv to it, and the date moves
+    // the window that's up rather than opening a second one beside it.
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     app.connect_startup(|_| style::load());
-    app.connect_activate(window::build);
+    app.connect_command_line(|app, command_line| {
+        let args: Vec<String> = command_line
+            .arguments()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        // The invoking process rejects a bad date before it forwards, so one
+        // can't arrive here; opening on today beats refusing to open at all.
+        window::open(app, date_util::parse_date_arg(&args).unwrap_or(None));
+        glib::ExitCode::SUCCESS
+    });
     app.run()
 }

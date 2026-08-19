@@ -937,7 +937,36 @@ impl Ui {
     }
 }
 
-pub fn build(app: &adw::Application) {
+thread_local! {
+    /// The window that's up, so a forwarded `calix <date>` can move it. Only
+    /// ever read back through `open`, which drops it if the window it belongs
+    /// to has since gone.
+    static LIVE_UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
+}
+
+/// Shows Calix on `date`, or wherever it already was when no date was asked
+/// for. Every activation lands here: the first builds the window, and a second
+/// `calix` invocation moves the one on screen instead of opening another.
+pub fn open(app: &adw::Application, date: Option<NaiveDate>) {
+    let live = LIVE_UI.with(|live| live.borrow().clone());
+    match live.filter(|_| app.active_window().is_some()) {
+        Some(ui) => {
+            if let Some(date) = date {
+                ui.state.borrow_mut().current_date = date;
+                ui.reset();
+            }
+            if let Some(window) = app.active_window() {
+                window.present();
+            }
+        }
+        None => {
+            LIVE_UI.with(|live| live.replace(None));
+            build(app, date);
+        }
+    }
+}
+
+fn build(app: &adw::Application, date: Option<NaiveDate>) {
     // Register the keyring store on the main thread before any sync worker
     // spawns, so the concurrent launch/resync threads don't race its lazy
     // initialization. See `icloud::credentials::prime_keyring_store`.
@@ -949,7 +978,7 @@ pub fn build(app: &adw::Application) {
     let initial_hour_row_height = load_hour_row_height(&store);
     let state = Rc::new(RefCell::new(State {
         view_mode: initial_view_mode,
-        current_date: Local::now().date_naive(),
+        current_date: date.unwrap_or_else(|| Local::now().date_naive()),
         hour_row_height: initial_hour_row_height,
     }));
 
@@ -990,6 +1019,8 @@ pub fn build(app: &adw::Application) {
         zoom_dirty: Rc::new(Cell::new(false)),
         request_sync: Rc::new(RefCell::new(None)),
     });
+
+    LIVE_UI.with(|live| live.replace(Some(ui.clone())));
 
     // Keep the display anchored to real time: slide the "now" line and, on a
     // date rollover, re-anchor "today". A half-minute cadence keeps the line
@@ -1543,7 +1574,13 @@ pub fn build(app: &adw::Application) {
                 return glib::ControlFlow::Continue;
             }
 
-            ui.state.borrow_mut().current_date = Local::now().date_naive();
+            // Re-read the clock rather than trusting the date this closure
+            // was built with: a window realizing slowly (or a machine waking
+            // into a new day) should still open on today. A date asked for on
+            // the command line is left alone — it was asked for.
+            if date.is_none() {
+                ui.state.borrow_mut().current_date = Local::now().date_naive();
+            }
             // Installed before the rebuild so the settle loop can find it.
             // If something supersedes this rebuild before it lands, the
             // replacement inherits the pending action and connects instead —

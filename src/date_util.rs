@@ -1,5 +1,20 @@
 use chrono::{DateTime, Datelike, Local, Months, NaiveDate, NaiveTime, TimeZone, Weekday};
 
+/// The day Calix was asked to open on, from its command line.
+///
+/// One optional positional `YYYY-MM-DD`; anything starting with `-` belongs to
+/// GTK and is left alone. A date that doesn't parse is an error rather than a
+/// silent fall back to today — being shown the wrong day is worse than being
+/// told the day was unreadable.
+pub fn parse_date_arg(args: &[String]) -> Result<Option<NaiveDate>, String> {
+    let Some(arg) = args.iter().skip(1).find(|arg| !arg.starts_with('-')) else {
+        return Ok(None);
+    };
+    NaiveDate::parse_from_str(arg, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| format!("not a date: {arg} (expected YYYY-MM-DD)"))
+}
+
 /// First day of the week, matching Apple/Google Calendar's US default.
 const WEEK_START: Weekday = Weekday::Sun;
 
@@ -164,6 +179,33 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn no_arguments_asks_for_no_particular_day() {
+        assert_eq!(parse_date_arg(&["calix".into()]), Ok(None));
+    }
+
+    #[test]
+    fn an_iso_date_argument_is_the_day_to_open_on() {
+        assert_eq!(
+            parse_date_arg(&["calix".into(), "2026-08-22".into()]),
+            Ok(Some(d(2026, 8, 22)))
+        );
+    }
+
+    #[test]
+    fn flags_are_left_for_gtk_rather_than_read_as_a_date() {
+        assert_eq!(
+            parse_date_arg(&["calix".into(), "--gapplication-service".into()]),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_date_that_is_not_a_date_is_reported_rather_than_ignored() {
+        assert!(parse_date_arg(&["calix".into(), "2026-02-30".into()]).is_err());
+        assert!(parse_date_arg(&["calix".into(), "tomorrow".into()]).is_err());
     }
 
     #[test]
