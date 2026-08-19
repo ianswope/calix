@@ -295,14 +295,56 @@ fn day_column_index(days: &[NaiveDate], day: NaiveDate) -> i32 {
         .expect("day belongs to the rendered range") as i32
 }
 
+/// One box stacked down the hour gutter. A label sits centred in its box, so
+/// the box's vertical centre is where that hour's grid line falls — except
+/// midnight, which has no line above the grid and hugs the top of the column
+/// instead. The trailing entry carries no label and just pads the gutter out
+/// to the full height of the day grid.
+struct GutterSlot {
+    hour: Option<u32>,
+    height: i32,
+    align_top: bool,
+}
+
+fn gutter_slots(hour_row_height: i32) -> Vec<GutterSlot> {
+    // Midnight's box is only half a row tall, which shifts every box below it
+    // up by half a row and so lands each label's centre on its hour line. The
+    // two halves are split so they add back up to a whole row on odd heights.
+    let leading = hour_row_height - hour_row_height / 2;
+    let mut slots = vec![GutterSlot {
+        hour: Some(0),
+        height: leading,
+        align_top: true,
+    }];
+    slots.extend((1..24).map(|hour| GutterSlot {
+        hour: Some(hour),
+        height: hour_row_height,
+        align_top: false,
+    }));
+    slots.push(GutterSlot {
+        hour: None,
+        height: hour_row_height / 2,
+        align_top: false,
+    });
+    slots
+}
+
 fn gutter_column(hour_row_height: i32) -> gtk::Widget {
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_size_request(GUTTER_WIDTH, -1);
     col.add_css_class("week-gutter");
-    for hour in 0..24u32 {
+    for slot in gutter_slots(hour_row_height) {
+        let Some(hour) = slot.hour else {
+            let filler = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            filler.set_size_request(-1, slot.height);
+            col.append(&filler);
+            continue;
+        };
         let label = gtk::Label::new(Some(&hour_label(hour)));
-        label.set_size_request(-1, hour_row_height);
-        label.set_valign(gtk::Align::Start);
+        label.set_size_request(-1, slot.height);
+        // The label fills its box, so it's `yalign` — not `valign` — that
+        // decides where the text lands inside it.
+        label.set_yalign(if slot.align_top { 0.0 } else { 0.5 });
         label.set_halign(gtk::Align::End);
         label.set_margin_end(6);
         label.add_css_class("caption");
@@ -662,6 +704,48 @@ fn hour_fraction(datetime: DateTime<Local>) -> f64 {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// The y offset of the point each gutter label is drawn at, per hour.
+    fn label_offsets(hour_row_height: i32) -> Vec<(u32, i32)> {
+        let mut y = 0;
+        let mut offsets = Vec::new();
+        for slot in gutter_slots(hour_row_height) {
+            if let Some(hour) = slot.hour {
+                let drawn_at = if slot.align_top {
+                    y
+                } else {
+                    y + slot.height / 2
+                };
+                offsets.push((hour, drawn_at));
+            }
+            y += slot.height;
+        }
+        offsets
+    }
+
+    #[test]
+    fn every_gutter_label_sits_on_its_own_hour_line() {
+        for hour_row_height in [37, 48, 60] {
+            for (hour, drawn_at) in label_offsets(hour_row_height) {
+                assert_eq!(
+                    drawn_at,
+                    hour as i32 * hour_row_height,
+                    "{hour}:00 at row height {hour_row_height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_hour_gutter_is_exactly_as_tall_as_the_day_grid() {
+        for hour_row_height in [37, 48, 60] {
+            let total: i32 = gutter_slots(hour_row_height)
+                .iter()
+                .map(|slot| slot.height)
+                .sum();
+            assert_eq!(total, 24 * hour_row_height);
+        }
+    }
 
     fn event(id: i64, start_hour: u32, end_hour: u32) -> Event {
         let start = Local
