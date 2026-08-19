@@ -356,7 +356,7 @@ fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<S
         .map(str::to_owned);
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(http_error(status.as_u16(), &body));
+        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
     }
     Ok((body, etag))
 }
@@ -380,7 +380,7 @@ fn put_event(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(http_error(status.as_u16(), &body));
+        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
     }
     Ok(())
 }
@@ -408,7 +408,7 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(http_error(status.as_u16(), &body));
+        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
     }
     Ok(())
 }
@@ -595,7 +595,7 @@ fn request(
     let status = response.status();
     let body = response.text().map_err(|e| e.to_string())?;
     if !status.is_success() && status.as_u16() != 207 {
-        return Err(http_error(status.as_u16(), &body));
+        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
     }
     Ok(body)
 }
@@ -609,13 +609,26 @@ fn request(
 /// would not fix, so the message must not imply otherwise — an unexplained 5xx
 /// that reads like an auth failure is what sends you to Apple's website to
 /// mint a password you did not need.
-fn http_error(status: u16, body: &str) -> String {
+///
+/// `icloud` picks which recovery advice a 401 carries. This module drives
+/// Fastmail, Nextcloud and self-hosted servers too, and sending one of those
+/// users to `account.apple.com` is a dead end that reads like the app is
+/// confused about which account it just failed to sync.
+fn http_error(status: u16, body: &str, icloud: bool) -> String {
     if status == 401 {
-        return "CalDAV rejected the saved credential (401 Unauthorized). \
-                Generate a new app-specific password at account.apple.com and \
-                reconnect the account — changing your Apple ID password revokes \
-                every app-specific password at once."
-            .to_string();
+        return if icloud {
+            "CalDAV rejected the saved credential (401 Unauthorized). \
+             Generate a new app-specific password at account.apple.com and \
+             reconnect the account — changing your Apple ID password revokes \
+             every app-specific password at once."
+                .to_string()
+        } else {
+            "CalDAV rejected the saved credential (401 Unauthorized). \
+             Check this account's username and password on the server and \
+             reconnect it — some servers want an app password generated for \
+             Calix rather than your login password."
+                .to_string()
+        };
     }
     format!("CalDAV error ({status}): {body}")
 }
@@ -640,13 +653,23 @@ fn absolute_url(base_url: &str, href: &str) -> Result<String, String> {
 }
 
 fn is_icloud_partition_pair(root: &url::Url, resolved: &url::Url) -> bool {
-    fn https_icloud_host(url: &url::Url) -> bool {
-        url.scheme() == "https"
-            && url
-                .host_str()
-                .is_some_and(|host| host == "icloud.com" || host.ends_with(".icloud.com"))
-    }
     https_icloud_host(root) && https_icloud_host(resolved)
+}
+
+fn https_icloud_host(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "icloud.com" || host.ends_with(".icloud.com"))
+}
+
+/// Whether an account is iCloud, which is the one thing this module needs a
+/// provider distinction for: only Apple has app-specific passwords to
+/// regenerate. Everything else here is the same for Fastmail, Nextcloud or a
+/// self-hosted server, which is why the account's own URL is enough to tell —
+/// there is no provider tag to thread down here.
+fn is_icloud(credentials: &Credentials) -> bool {
+    url::Url::parse(&credentials.base_url).is_ok_and(|url| https_icloud_host(&url))
 }
 
 fn multistatus_responses(xml: &str) -> Vec<String> {
@@ -1508,9 +1531,48 @@ fn unescape_ics_text(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn credentials_for(base_url: &str) -> Credentials {
+        Credentials {
+            base_url: base_url.to_string(),
+            username: "person@example.com".to_string(),
+            password: "secret".to_string(),
+        }
+    }
+
     #[test]
-    fn a_rejected_credential_says_to_generate_a_new_app_specific_password() {
-        let message = http_error(401, "");
+    fn an_icloud_account_is_recognized_by_its_url() {
+        assert!(is_icloud(&credentials_for("https://caldav.icloud.com")));
+        assert!(is_icloud(&credentials_for(
+            "https://p42-caldav.icloud.com/123456/calendars/"
+        )));
+    }
+
+    #[test]
+    fn another_providers_account_is_not_icloud() {
+        assert!(!is_icloud(&credentials_for("https://caldav.fastmail.com")));
+        assert!(!is_icloud(&credentials_for(
+            "https://cloud.example.com/dav"
+        )));
+        // Not a suffix match on the bare string: this is somebody else's host.
+        assert!(!is_icloud(&credentials_for("https://evil-icloud.com")));
+    }
+
+    #[test]
+    fn a_rejected_credential_on_another_provider_is_not_sent_to_apple() {
+        let message = http_error(401, "", false);
+        assert!(
+            !message.contains("account.apple.com") && !message.contains("Apple ID"),
+            "a Fastmail or Nextcloud 401 has nothing to do with Apple: {message}"
+        );
+        assert!(
+            message.contains("401"),
+            "it still has to say the credential was rejected: {message}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_icloud_credential_says_to_generate_a_new_app_specific_password() {
+        let message = http_error(401, "", true);
         assert!(
             message.contains("app-specific password"),
             "a 401 should name the fix: {message}"
@@ -1519,7 +1581,7 @@ mod tests {
 
     #[test]
     fn a_server_error_does_not_blame_the_saved_password() {
-        let message = http_error(503, "Service Unavailable");
+        let message = http_error(503, "Service Unavailable", true);
         assert!(
             !message.contains("app-specific password"),
             "only a 401 means the credential is dead: {message}"
