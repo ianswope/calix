@@ -677,6 +677,14 @@ impl Store {
     }
 
     /// Creates or updates a Google-sourced event by its Google event id.
+    ///
+    /// `reminder_minutes` is written on INSERT but deliberately left out of the
+    /// `DO UPDATE`: an alert is Calix-local — nothing sends it to Google, and
+    /// nothing reads one back — so the row created right after the user adds an
+    /// event is the only chance to keep the alert they picked, while every later
+    /// sync must leave the column alone rather than blank it. (An alert on a
+    /// *recurring* remote event still can't outlive the first sync, which
+    /// replaces the series row with the provider's expanded instances.)
     pub fn upsert_google_event(
         &self,
         calendar_id: i64,
@@ -685,8 +693,8 @@ impl Store {
         attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id, attendees)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id, attendees, reminder_minutes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(calendar_id, google_event_id) WHERE google_event_id IS NOT NULL
              DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
             params![
@@ -699,11 +707,15 @@ impl Store {
                 draft.notes,
                 google_event_id,
                 attendees_to_json(attendees),
+                draft.reminder_minutes,
             ],
         )?;
         Ok(())
     }
 
+    /// Creates or updates a CalDAV-sourced event by its href. Handles
+    /// `reminder_minutes` exactly as [`Self::upsert_google_event`] does, and for
+    /// the same reason.
     pub fn upsert_caldav_event(
         &self,
         calendar_id: i64,
@@ -712,8 +724,8 @@ impl Store {
         attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id, attendees)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id, attendees, reminder_minutes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
              DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
             params![
@@ -726,6 +738,7 @@ impl Store {
                 draft.notes,
                 icloud_event_id,
                 attendees_to_json(attendees),
+                draft.reminder_minutes,
             ],
         )?;
         Ok(())
@@ -1973,6 +1986,73 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "Lunch (moved)");
         assert_eq!(events[0].reminder_minutes, Some(10));
+    }
+
+    #[test]
+    fn creating_a_google_event_stores_the_alert_the_user_chose() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account(
+                "person@example.com",
+                "person@example.com",
+                "google-refresh-token:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 14, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        let mut with_alert = draft("Review", start, end);
+        with_alert.reminder_minutes = Some(15);
+
+        // The row Calix caches right after creating the event on Google is the
+        // only copy of the alert — nothing sends it to the server, and the sync
+        // that follows deliberately leaves the column alone.
+        store
+            .upsert_google_event(calendar_id, "evt-new", &with_alert, &[])
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(15));
+    }
+
+    #[test]
+    fn creating_a_caldav_event_stores_the_alert_the_user_chose() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account(
+                "person@example.com",
+                "person@example.com",
+                "icloud-app-password:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 14, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        let mut with_alert = draft("Review", start, end);
+        with_alert.reminder_minutes = Some(15);
+
+        store
+            .upsert_caldav_event(calendar_id, "/calendars/work/new.ics", &with_alert, &[])
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(15));
     }
 
     #[test]
