@@ -37,6 +37,35 @@ pub enum RemoteEvent {
     },
 }
 
+/// What the local cache is worth once a save has landed, which is what decides
+/// whether the caller can simply redraw or has to go back to the provider first.
+///
+/// A remote series is cached as the individual occurrences its provider expanded
+/// for Calix, never as one row with a repeat rule. So any operation that acts on
+/// a series *as a whole* leaves the cache holding one row where the server now
+/// has many — or still holding the occurrences the server just moved or deleted.
+/// Only a sync settles that; redrawing from the cache in the meantime shows a new
+/// weekly event as a single one, or an edit that only took on the occurrence that
+/// was clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Saved {
+    /// The cache already matches the provider; redraw and stop.
+    Cached,
+    /// Redraw, then refresh from the provider.
+    StaleUntilSync,
+}
+
+/// [`Saved`] for one completed save: `remote` is whether the event lives on a
+/// provider, `whole_series` whether the operation covered a whole series rather
+/// than a single event or occurrence.
+fn saved_state(remote: bool, whole_series: bool) -> Saved {
+    if remote && whole_series {
+        Saved::StaleUntilSync
+    } else {
+        Saved::Cached
+    }
+}
+
 /// A calendar the dialog can create events on, plus whether it belongs to
 /// the default picker set (the calendars currently shown in the sidebar —
 /// accounts can carry dozens of calendars, and the hidden ones shouldn't
@@ -263,7 +292,9 @@ pub fn open(
     // End time for a new event. `None` takes the one-hour default; a
     // create-drag passes the span the user actually drew.
     initial_end: Option<DateTime<Local>>,
-    on_saved: impl Fn() + 'static,
+    // Called once a save, delete or create has landed, with what the local cache
+    // is worth afterwards — see [`Saved`].
+    on_saved: impl Fn(Saved) + 'static,
     remote_event: Option<RemoteEvent>,
 ) {
     let on_saved = Rc::new(on_saved);
@@ -523,7 +554,10 @@ pub fn open(
                             move || match rx.try_recv() {
                                 Ok(Ok(())) => match store.delete_event(event_id) {
                                     Ok(()) => {
-                                        on_saved();
+                                        // Deleting a whole remote series takes one
+                                        // cached occurrence with it; the rest are
+                                        // separate rows only a sync can prune.
+                                        on_saved(saved_state(true, all_events));
                                         dialog.close();
                                         glib::ControlFlow::Break
                                     }
@@ -552,7 +586,7 @@ pub fn open(
                 } else {
                     match store.delete_event(event_id) {
                         Ok(()) => {
-                            on_saved();
+                            on_saved(Saved::Cached);
                             dialog.close();
                         }
                         Err(error) => {
@@ -678,7 +712,7 @@ pub fn open(
                         move || match rx.try_recv() {
                             Ok(Ok(None)) => match store.create_event(target.calendar_id(), &draft) {
                                 Ok(_) => {
-                                    on_saved();
+                                    on_saved(Saved::Cached);
                                     dialog.close();
                                     glib::ControlFlow::Break
                                 }
@@ -700,7 +734,13 @@ pub fn open(
                                 };
                                 match result {
                                     Ok(()) => {
-                                        on_saved();
+                                        // A recurring event was created on the
+                                        // server as a series; the row just cached
+                                        // is one occurrence of it.
+                                        on_saved(saved_state(
+                                            true,
+                                            draft.recurrence.is_some(),
+                                        ));
                                         dialog.close();
                                         glib::ControlFlow::Break
                                     }
@@ -763,7 +803,9 @@ pub fn open(
                         move || match rx.try_recv() {
                             Ok(Ok(())) => match store.update_event(event_id, &draft) {
                                 Ok(()) => {
-                                    on_saved();
+                                    // "All events" moved every occurrence on the
+                                    // server; only the clicked row moved locally.
+                                    on_saved(saved_state(true, all_events));
                                     dialog.close();
                                     glib::ControlFlow::Break
                                 }
@@ -792,7 +834,7 @@ pub fn open(
             } else {
                 match store.update_event(event.id, &draft) {
                     Ok(()) => {
-                        on_saved();
+                        on_saved(Saved::Cached);
                         dialog.close();
                     }
                     Err(error) => error_label.set_label(&format!("Couldn't save event: {error}")),
@@ -1038,6 +1080,24 @@ mod tests {
             message.contains("Created on the server"),
             "the message must say the event exists remotely: {message}"
         );
+    }
+
+    #[test]
+    fn a_purely_local_save_leaves_the_cache_up_to_date() {
+        assert_eq!(saved_state(false, false), Saved::Cached);
+        // A local recurring event is stored as one row with its rule and
+        // expanded on read, so the cache is complete on its own.
+        assert_eq!(saved_state(false, true), Saved::Cached);
+    }
+
+    #[test]
+    fn a_single_remote_event_is_complete_in_the_cache() {
+        assert_eq!(saved_state(true, false), Saved::Cached);
+    }
+
+    #[test]
+    fn acting_on_a_whole_remote_series_needs_a_sync_before_the_grid_is_right() {
+        assert_eq!(saved_state(true, true), Saved::StaleUntilSync);
     }
 
     #[test]

@@ -86,6 +86,11 @@ type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
 /// Work parked until a rebuild verifiably centers the carousel, run once.
 type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
+/// Kicks a quiet background sync of every connected provider. Held in a slot
+/// because the per-provider sync buttons it drives are built after the `Ui` is,
+/// and it must not keep the `Ui` alive — see [`Ui::request_sync`].
+type RequestSyncFn = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Year,
@@ -364,9 +369,34 @@ struct Ui {
     // offscreen neighbor pages at the old height. Navigation then preserves
     // the hour the user was looking at across the rebuild.
     zoom_dirty: Rc<Cell<bool>>,
+    // Asks for a background refresh from every connected provider. Installed by
+    // `build_window` once the sync buttons exist, so any code holding a `Ui` can
+    // request one without threading three buttons through; a no-op until then.
+    request_sync: RequestSyncFn,
 }
 
 impl Ui {
+    /// Redraws after the event dialog saved something, and goes back to the
+    /// provider first when the local cache can't be right on its own — see
+    /// [`event_dialog::Saved`].
+    fn apply_saved(self: &Rc<Self>, saved: event_dialog::Saved) {
+        self.reset();
+        if saved == event_dialog::Saved::StaleUntilSync {
+            self.request_background_sync();
+        }
+    }
+
+    /// Asks for a quiet background sync of every connected provider, if
+    /// `build_window` has installed the hook that can start one.
+    fn request_background_sync(&self) {
+        // Cloned out of the slot before the call: the sync it starts touches the
+        // `Ui` this hook is stored on.
+        let request = self.request_sync.borrow().clone();
+        if let Some(request) = request {
+            request();
+        }
+    }
+
     /// Clears the carousel and rebuilds it with prev/current/next pages
     /// centered on the selected date, landing on the usual "now" scroll spot.
     fn reset(self: &Rc<Self>) {
@@ -726,7 +756,7 @@ impl Ui {
                         None,
                         start,
                         end,
-                        move || ui_for_saved.reset(),
+                        move |saved| ui_for_saved.apply_saved(saved),
                         None,
                     );
                 },
@@ -761,7 +791,7 @@ impl Ui {
                     Some(event),
                     start,
                     None,
-                    move || ui_for_saved.reset(),
+                    move |saved| ui_for_saved.apply_saved(saved),
                     remote_event,
                 );
             })
@@ -958,6 +988,7 @@ pub fn build(app: &adw::Application) {
         sync: Rc::new(Cell::new(CarouselSync::default())),
         on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
+        request_sync: Rc::new(RefCell::new(None)),
     });
 
     // Keep the display anchored to real time: slide the "now" line and, on a
@@ -1123,7 +1154,7 @@ pub fn build(app: &adw::Application) {
                 None,
                 start,
                 None,
-                move || ui2.reset(),
+                move |saved| ui2.apply_saved(saved),
                 None,
             );
         }
@@ -1222,6 +1253,29 @@ pub fn build(app: &adw::Application) {
     calendar_sidebar.append(&calendar_list);
     ui.reset_calendar_sidebar();
     ui.reset_mini_month();
+
+    // With the sync buttons in hand, anything holding a `Ui` can now ask for a
+    // refresh from every provider — the event dialog does, after an operation the
+    // local cache can't reflect on its own. Weak throughout: this closure is
+    // stored on the very `Ui` it drives.
+    *ui.request_sync.borrow_mut() = Some(Rc::new(clone!(
+        #[weak]
+        ui,
+        #[weak]
+        google_sync_button,
+        #[weak]
+        icloud_sync_button,
+        #[weak]
+        caldav_sync_button,
+        move || {
+            sync_connected_accounts(
+                &ui,
+                &google_sync_button,
+                &icloud_sync_button,
+                &caldav_sync_button,
+            );
+        }
+    )));
 
     // Refresh from every connected account as soon as the window is up, then
     // keep the grid fresh with a periodic background re-sync while the app
