@@ -2821,9 +2821,15 @@ fn run_account_sync<F>(
                 let outcome = match rx.try_recv() {
                     Ok(result) => result,
                     Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    // The worker died without sending; nothing to report beyond
-                    // giving the button back.
+                    // The worker died without sending — it can only have
+                    // panicked. Say so rather than just handing the button back
+                    // looking finished: nothing synced, and the log line is the
+                    // only trace the panic leaves.
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        let message = provider.sync_failed("it stopped unexpectedly");
+                        eprintln!("calix: {message}");
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
                         sync_button.set_label(&provider.sync_label());
                         update_sync_button(&ui, &sync_button, provider);
                         return glib::ControlFlow::Break;
@@ -2832,7 +2838,7 @@ fn run_account_sync<F>(
 
                 match outcome {
                     Ok((account_count, outcome)) => {
-                        if !quiet || !outcome.failed.is_empty() {
+                        if outcome.needs_reporting(quiet) {
                             ui.toast_overlay.add_toast(adw::Toast::new(
                                 &outcome.synced_summary(provider.calendar_noun, account_count),
                             ));

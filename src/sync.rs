@@ -39,6 +39,17 @@ impl SyncOutcome {
         self.failed_accounts.extend(other.failed_accounts);
     }
 
+    /// Whether a finished sync is worth telling the user about: a manual one
+    /// always is, a quiet one only when something went wrong.
+    ///
+    /// Gated on the same pair of collections [`Self::failure_note`] renders, so
+    /// an account that never ran at all — a revoked credential, a secret missing
+    /// from the keyring, a discovery error — can't leave every calendar it owns
+    /// silently stale.
+    pub fn needs_reporting(&self, quiet: bool) -> bool {
+        !quiet || self.failure_note().is_some()
+    }
+
     /// A trailing clause naming the calendars that failed, or `None` when
     /// everything synced. Callers append it to their success message so a
     /// partial failure never reads as a clean success.
@@ -187,6 +198,35 @@ mod tests {
                  — couldn't sync 1: Birthdays"
             )
         );
+    }
+
+    #[test]
+    fn a_quiet_sync_reports_an_account_that_failed_as_a_whole() {
+        let outcome = sync_two_accounts();
+        assert!(outcome.failed.is_empty(), "no calendar failed on its own");
+        assert!(outcome.needs_reporting(true));
+    }
+
+    #[test]
+    fn a_quiet_sync_reports_a_calendar_that_went_stale() {
+        let mut outcome = SyncOutcome::default();
+        outcome.record_success();
+        outcome.record_failure("Birthdays");
+        assert!(outcome.needs_reporting(true));
+    }
+
+    #[test]
+    fn a_quiet_sync_stays_quiet_when_everything_synced() {
+        let mut outcome = SyncOutcome::default();
+        outcome.record_success();
+        assert!(!outcome.needs_reporting(true));
+    }
+
+    #[test]
+    fn a_manual_sync_reports_even_a_clean_run() {
+        let mut outcome = SyncOutcome::default();
+        outcome.record_success();
+        assert!(outcome.needs_reporting(false));
     }
 
     #[test]
