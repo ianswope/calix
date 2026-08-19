@@ -566,7 +566,10 @@ impl Store {
                 params![stored_timestamp(&range_end), stored_timestamp(&range_start)],
                 row_to_event,
             )?
-            .collect::<rusqlite::Result<_>>()?;
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
 
         // Recurring events have no server to expand them, and a master's own
         // stored span may fall outside the range, so fetch them all (unfiltered
@@ -576,8 +579,8 @@ impl Store {
         ))?;
         let masters = recurring
             .query_map([], row_to_event)?
-            .collect::<rusqlite::Result<Vec<Event>>>()?;
-        for master in masters {
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?;
+        for master in masters.into_iter().flatten() {
             events.extend(expand_recurring(&master, range_start, range_end));
         }
 
@@ -615,8 +618,12 @@ impl Store {
              ORDER BY events.start_at
              LIMIT ?2"
         ))?;
-        stmt.query_map(params![pattern, limit as i64], row_to_event)?
-            .collect()
+        Ok(stmt
+            .query_map(params![pattern, limit as i64], row_to_event)?
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// The stored event with `id`, if any. Unlike [`Self::events_between`] this
@@ -630,6 +637,7 @@ impl Store {
                 row_to_event,
             )
             .optional()
+            .map(Option::flatten)
     }
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
@@ -1017,10 +1025,16 @@ fn expand_recurring(
         .collect()
 }
 
-fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+/// `None` for a row whose stored timestamps can't be read — see
+/// [`parse_rfc3339`]. Callers drop those rows instead of failing the query, so
+/// one damaged row costs a single event rather than the whole calendar.
+fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Option<Event>> {
     let start_at: String = row.get(9)?;
     let end_at: String = row.get(10)?;
-    Ok(Event {
+    let (Some(start), Some(end)) = (parse_rfc3339(&start_at), parse_rfc3339(&end_at)) else {
+        return Ok(None);
+    };
+    Ok(Some(Event {
         id: row.get(0)?,
         calendar_id: row.get(1)?,
         calendar_name: row.get(2)?,
@@ -1030,8 +1044,8 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         account_token_key: row.get(6)?,
         google_calendar_id: row.get(7)?,
         title: row.get(8)?,
-        start: parse_rfc3339(&start_at),
-        end: parse_rfc3339(&end_at),
+        start,
+        end,
         all_day: row.get::<_, i64>(11)? != 0,
         location: row.get(12)?,
         notes: row.get(13)?,
@@ -1044,7 +1058,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
             .and_then(Frequency::from_rrule),
         reminder_minutes: row.get(18)?,
         attendees: attendees_from_json(row.get(19)?),
-    })
+    }))
 }
 
 /// Serializes an attendee list for storage. An empty list is stored as SQL NULL
@@ -1085,10 +1099,20 @@ fn row_to_calendar(row: &rusqlite::Row) -> rusqlite::Result<Calendar> {
     })
 }
 
-fn parse_rfc3339(s: &str) -> DateTime<Local> {
-    DateTime::parse_from_rfc3339(s)
-        .expect("dates stored by this app are always valid RFC3339")
-        .with_timezone(&Local)
+/// Parses a stored timestamp, or `None` for a value this app could not have
+/// written — a hand-edited row, a half-applied migration, a partial restore.
+///
+/// Reported and skipped rather than trusted: the alternatives are inventing a
+/// date for the row or panicking, and a panic here takes the whole app down
+/// while events are being loaded, which is every time the grid is drawn.
+fn parse_rfc3339(s: &str) -> Option<DateTime<Local>> {
+    match DateTime::parse_from_rfc3339(s) {
+        Ok(parsed) => Some(parsed.with_timezone(&Local)),
+        Err(error) => {
+            eprintln!("calix: ignoring an event with an unreadable timestamp {s:?}: {error}");
+            None
+        }
+    }
 }
 
 /// A comma-separated run of `n` SQL parameter placeholders, for the `IN (…)`
@@ -1912,6 +1936,44 @@ mod tests {
         assert_eq!(
             events[0].icloud_event_id.as_deref(),
             Some("/calendars/work/evt-1.ics")
+        );
+    }
+
+    #[test]
+    fn a_row_with_an_unreadable_timestamp_is_skipped_rather_than_fatal() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 10, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        store
+            .create_event(store.default_calendar_id(), &draft("Readable", start, end))
+            .unwrap();
+        // Nothing in this app writes a timestamp like that; a hand-edited row, a
+        // half-applied migration or a partial restore can still leave one.
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (calendar_id, title, start_at, end_at, all_day)
+                 VALUES (?1, 'Corrupt', 'not a timestamp', ?2, 0)",
+                params![store.default_calendar_id(), stored_timestamp(&end)],
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), end)
+            .expect("one bad row must not fail the whole query");
+        assert_eq!(
+            events.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            ["Readable"]
+        );
+        // "r" is in both titles, so search would return the corrupt row too if
+        // the skip only covered the range query.
+        let found = store.search_events("r", 20).unwrap();
+        assert_eq!(
+            found.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(),
+            ["Readable"]
         );
     }
 
