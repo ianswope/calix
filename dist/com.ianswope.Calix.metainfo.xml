@@ -54,6 +54,21 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.5.1" date="2026-08-20">
+      <description>
+        <p>
+          Online accounts sync again. In 0.5.0, the sync at launch, the
+          periodic background sync, the sync after waking from suspend, and
+          the account controls in the sidebar all stopped working once an
+          account was connected.
+        </p>
+        <p>
+          This release also refuses a mismatched Google account when updating
+          a sign-in, refuses a second sign-in while one is open, and creates
+          the database's write-ahead log with owner-only permissions.
+        </p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-20">
       <description>
         <p>
