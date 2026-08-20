@@ -54,6 +54,23 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.5.0" date="2026-08-20">
+      <description>
+        <p>
+          Calix now welcomes new users with one guided account connection
+          flow for Google Calendar, Apple iCloud, Fastmail, Nextcloud, and
+          other calendar servers. Google OAuth credentials can be saved
+          securely inside the app, known providers ask for fewer technical
+          details, and the account center shows durable sync health with
+          retry and credential-recovery actions.
+        </p>
+        <p>
+          This release also adds graphical database recovery, owner-only
+          storage permissions, clearer installation documentation, symmetric
+          install and uninstall scripts, and automated release-package checks.
+        </p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-07-18">
       <description>
         <p>

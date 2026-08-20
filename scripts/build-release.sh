@@ -23,6 +23,7 @@ install -Dm644 "$ROOT_DIR/dist/$APP_ID.desktop" "$STAGE/share/applications/$APP_
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.svg" "$STAGE/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 install -Dm644 "$ROOT_DIR/dist/$APP_ID.metainfo.xml" "$STAGE/share/metainfo/$APP_ID.metainfo.xml"
 install -Dm644 "$ROOT_DIR/README.md" "$STAGE/share/doc/calix/README.md"
+install -Dm644 "$ROOT_DIR/CHANGELOG.md" "$STAGE/share/doc/calix/CHANGELOG.md"
 install -Dm644 "$ROOT_DIR/LICENSE" "$STAGE/share/doc/calix/LICENSE"
 
 cat > "$STAGE/install.sh" <<'INSTALL'
@@ -41,6 +42,7 @@ sed -i "s|^Exec=calix$|Exec=$PREFIX/bin/calix|" "$PREFIX/share/applications/$APP
 install -Dm644 "$ROOT_DIR/share/icons/hicolor/scalable/apps/$APP_ID.svg" "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 install -Dm644 "$ROOT_DIR/share/metainfo/$APP_ID.metainfo.xml" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
 install -Dm644 "$ROOT_DIR/share/doc/calix/README.md" "$PREFIX/share/doc/calix/README.md"
+install -Dm644 "$ROOT_DIR/share/doc/calix/CHANGELOG.md" "$PREFIX/share/doc/calix/CHANGELOG.md"
 install -Dm644 "$ROOT_DIR/share/doc/calix/LICENSE" "$PREFIX/share/doc/calix/LICENSE"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
@@ -73,6 +75,7 @@ rm -f "$PREFIX/share/applications/$APP_ID.desktop"
 rm -f "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 rm -f "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
 rm -f "$PREFIX/share/doc/calix/README.md"
+rm -f "$PREFIX/share/doc/calix/CHANGELOG.md"
 rm -f "$PREFIX/share/doc/calix/LICENSE"
 rmdir "$PREFIX/share/doc/calix" 2>/dev/null || true
 
