@@ -352,7 +352,7 @@ struct Ui {
     toast_overlay: adw::ToastOverlay,
     state: Rc<RefCell<State>>,
     store: Rc<Store>,
-    config: Rc<Config>,
+    config: Rc<RefCell<Config>>,
     // The calendar date the display is currently anchored to. A periodic clock
     // tick compares it against the real date so a rollover (left open
     // overnight, or crossed while the machine was suspended) can be noticed and
@@ -972,7 +972,13 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
     // initialization. See `icloud::credentials::prime_keyring_store`.
     icloud::credentials::prime_keyring_store();
 
-    let store = Rc::new(Store::open().expect("failed to open Calix's local database"));
+    let store = match Store::open() {
+        Ok(store) => Rc::new(store),
+        Err(error) => {
+            show_startup_error(app, &error.to_string(), date);
+            return;
+        }
+    };
     let initial_view_mode =
         ViewMode::from_setting(store.setting(ViewMode::SETTING_KEY).unwrap_or_default());
     let initial_hour_row_height = load_hour_row_height(&store);
@@ -1010,7 +1016,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
         toast_overlay: adw::ToastOverlay::new(),
         state,
         store,
-        config: Rc::new(Config::load()),
+        config: Rc::new(RefCell::new(Config::load())),
         today: Rc::new(Cell::new(Local::now().date_naive())),
         // Starts unsettled, so nothing treats the carousel as authoritative
         // before the first rebuild has centered it.
@@ -1191,6 +1197,10 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
         }
     ));
 
+    // These three buttons are deliberately not placed in the sidebar. They are
+    // lightweight state holders for the existing provider sync jobs (sensitive
+    // means idle) while the user sees one refresh action instead of three
+    // protocol-shaped controls.
     let google_sync_button = gtk::Button::with_label("Sync Google");
     update_sync_button(&ui, &google_sync_button, provider::GOOGLE);
     google_sync_button.connect_clicked(clone!(
@@ -1199,18 +1209,6 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
         #[weak]
         google_sync_button,
         move |_| sync_google_accounts(&ui, &google_sync_button, false)
-    ));
-
-    let google_add_button = gtk::Button::with_label("Add Google");
-    google_add_button.set_tooltip_text(Some("Connect another Google account"));
-    google_add_button.connect_clicked(clone!(
-        #[strong]
-        ui,
-        #[weak]
-        google_add_button,
-        #[weak]
-        google_sync_button,
-        move |_| add_google_account(&ui, &google_add_button, &google_sync_button)
     ));
 
     let icloud_sync_button = gtk::Button::with_label("Sync iCloud");
@@ -1223,18 +1221,6 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
         move |_| sync_icloud_accounts(&ui, &icloud_sync_button, false)
     ));
 
-    let icloud_add_button = gtk::Button::with_label("Add iCloud");
-    icloud_add_button.set_tooltip_text(Some("Connect an iCloud account"));
-    icloud_add_button.connect_clicked(clone!(
-        #[strong]
-        ui,
-        #[weak]
-        icloud_add_button,
-        #[weak]
-        icloud_sync_button,
-        move |_| open_icloud_account_dialog(&ui, &icloud_add_button, &icloud_sync_button)
-    ));
-
     let caldav_sync_button = gtk::Button::with_label("Sync CalDAV");
     update_sync_button(&ui, &caldav_sync_button, provider::CALDAV);
     caldav_sync_button.connect_clicked(clone!(
@@ -1245,18 +1231,44 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
         move |_| sync_caldav_accounts(&ui, &caldav_sync_button, false)
     ));
 
-    let caldav_add_button = gtk::Button::with_label("Add CalDAV");
-    caldav_add_button.set_tooltip_text(Some(
-        "Connect any CalDAV server (Fastmail, Nextcloud, Radicale, …)",
-    ));
-    caldav_add_button.connect_clicked(clone!(
+    let connect_account_button = gtk::Button::with_label("Connect an account");
+    connect_account_button.add_css_class("suggested-action");
+    connect_account_button.set_hexpand(true);
+    connect_account_button.connect_clicked(clone!(
         #[strong]
         ui,
         #[weak]
-        caldav_add_button,
+        google_sync_button,
+        #[weak]
+        icloud_sync_button,
         #[weak]
         caldav_sync_button,
-        move |_| open_caldav_account_dialog(&ui, &caldav_add_button, &caldav_sync_button)
+        move |_| open_account_chooser(
+            &ui,
+            &google_sync_button,
+            &icloud_sync_button,
+            &caldav_sync_button,
+            false,
+        )
+    ));
+
+    let refresh_accounts_button = gtk::Button::from_icon_name("view-refresh-symbolic");
+    refresh_accounts_button.set_tooltip_text(Some("Refresh all connected accounts"));
+    refresh_accounts_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        google_sync_button,
+        #[weak]
+        icloud_sync_button,
+        #[weak]
+        caldav_sync_button,
+        move |_| sync_connected_accounts_with_reporting(
+            &ui,
+            &google_sync_button,
+            &icloud_sync_button,
+            &caldav_sync_button,
+        )
     ));
 
     let manage_accounts_button = gtk::Button::builder()
@@ -1268,16 +1280,23 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
     manage_accounts_button.connect_clicked(clone!(
         #[strong]
         ui,
-        move |_| open_manage_accounts_dialog(&ui)
+        #[weak]
+        google_sync_button,
+        #[weak]
+        icloud_sync_button,
+        #[weak]
+        caldav_sync_button,
+        move |_| open_manage_accounts_dialog(
+            &ui,
+            &google_sync_button,
+            &icloud_sync_button,
+            &caldav_sync_button,
+        )
     ));
 
     calendar_sidebar.append(&sidebar_actions(
-        &google_add_button,
-        &google_sync_button,
-        &icloud_add_button,
-        &icloud_sync_button,
-        &caldav_add_button,
-        &caldav_sync_button,
+        &connect_account_button,
+        &refresh_accounts_button,
         &manage_accounts_button,
     ));
     calendar_sidebar.append(&mini_month);
@@ -1531,6 +1550,35 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
 
     window.present();
 
+    // With no remote accounts, make the next step visible without requiring
+    // the user to discover the calendar sidebar first. Dismissing this leaves
+    // local calendars fully usable; it returns on a later launch while there
+    // are still no online accounts, matching the actual account state without
+    // adding a speculative onboarding flag to storage.
+    if ui
+        .store
+        .all_accounts()
+        .is_ok_and(|accounts| accounts.is_empty())
+    {
+        glib::idle_add_local_once(clone!(
+            #[strong]
+            ui,
+            #[strong]
+            google_sync_button,
+            #[strong]
+            icloud_sync_button,
+            #[strong]
+            caldav_sync_button,
+            move || open_account_chooser(
+                &ui,
+                &google_sync_button,
+                &icloud_sync_button,
+                &caldav_sync_button,
+                true,
+            )
+        ));
+    }
+
     // Defer everything interactive until the carousel has actually been
     // allocated real geometry. Two problems otherwise: (1) scroll_to()
     // computes its jump as a pixel offset (position * width); called while
@@ -1632,12 +1680,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
 
 #[allow(clippy::too_many_arguments)]
 fn sidebar_actions(
-    google_add_button: &gtk::Button,
-    google_sync_button: &gtk::Button,
-    icloud_add_button: &gtk::Button,
-    icloud_sync_button: &gtk::Button,
-    caldav_add_button: &gtk::Button,
-    caldav_sync_button: &gtk::Button,
+    connect_button: &gtk::Button,
+    refresh_button: &gtk::Button,
     manage_button: &gtk::Button,
 ) -> gtk::Widget {
     let section = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -1652,40 +1696,14 @@ fn sidebar_actions(
     title.add_css_class("dim-label");
     title.set_xalign(0.0);
     title.set_hexpand(true);
-    // The heading doubles as the row carrying "Manage", which is where
-    // connected accounts are listed and removed.
+    // Keep maintenance compact; connecting is the one primary task here.
     let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     title_row.append(&title);
+    title_row.append(refresh_button);
     title_row.append(manage_button);
     section.append(&title_row);
-
-    let google_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    google_row.append(google_add_button);
-    google_row.append(google_sync_button);
-    section.append(&google_row);
-
-    let icloud_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    icloud_row.append(icloud_add_button);
-    icloud_row.append(icloud_sync_button);
-    section.append(&icloud_row);
-
-    let caldav_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    caldav_row.append(caldav_add_button);
-    caldav_row.append(caldav_sync_button);
-    section.append(&caldav_row);
-
-    for button in [
-        google_add_button,
-        google_sync_button,
-        icloud_add_button,
-        icloud_sync_button,
-        caldav_add_button,
-        caldav_sync_button,
-    ] {
-        button.set_hexpand(true);
-        button.set_halign(gtk::Align::Fill);
-        button.add_css_class("sidebar-action-button");
-    }
+    section.append(connect_button);
+    connect_button.add_css_class("sidebar-action-button");
 
     section.upcast()
 }
@@ -1927,7 +1945,7 @@ fn set_view_mode(ui: &Rc<Ui>, view_mode: ViewMode) {
 fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::RemoteEvent> {
     match event.account_provider.as_deref() {
         Some("google") => {
-            let Some(config) = ui.config.google.clone() else {
+            let Some(config) = ui.config.borrow().google.clone() else {
                 return Some(event_dialog::RemoteEvent::Unavailable(
                     "Google is not configured on this machine".to_string(),
                 ));
@@ -1993,7 +2011,7 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
             let visible = calendar.visible;
             let target = match calendar.provider.as_deref() {
                 Some("google") => match (
-                    ui.config.google.clone(),
+                    ui.config.borrow().google.clone(),
                     calendar.token_key,
                     calendar.google_calendar_id,
                 ) {
@@ -2335,7 +2353,7 @@ struct GoogleAddResult {
 /// signed-in account from its primary calendar, saves that account-specific
 /// refresh token, and immediately performs an initial sync.
 fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
-    let Some(google_config) = ui.config.google.clone() else {
+    let Some(google_config) = ui.config.borrow().google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
         ));
@@ -2362,6 +2380,7 @@ fn add_google_account(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::
                 .upsert_google_account(&provider_account_id, &display_name, &token_key)
                 .map_err(|e| e.to_string())?;
             let outcome = google::sync::sync_account(&tokens.access_token, &store, account_id);
+            record_sync_result(&store, account_id, &display_name, &outcome);
             Ok(GoogleAddResult {
                 display_name,
                 outcome,
@@ -2424,6 +2443,397 @@ struct CaldavAddResult {
     outcome: Result<SyncOutcome, String>,
 }
 
+fn connection_activity_button(label: &str) -> gtk::Button {
+    // Existing connect functions use a button for in-flight state. Chooser
+    // rows close before work starts, so this private button preserves that
+    // plumbing without exposing provider-specific Add controls again.
+    gtk::Button::with_label(label)
+}
+
+fn chooser_row(title: &str, subtitle: &str, action: impl Fn() + 'static) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .activatable(true)
+        .build();
+    let button = gtk::Button::builder()
+        .label("Connect")
+        .valign(gtk::Align::Center)
+        .build();
+    row.add_suffix(&button);
+    row.set_activatable_widget(Some(&button));
+    button.connect_clicked(move |_| action());
+    row
+}
+
+fn open_account_chooser(
+    ui: &Rc<Ui>,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+    welcome: bool,
+) {
+    let dialog = adw::Dialog::builder()
+        .title(if welcome {
+            "Welcome to Calix"
+        } else {
+            "Connect an account"
+        })
+        .content_width(500)
+        .build();
+    let close_button = gtk::Button::with_label("Close");
+    let header = adw::HeaderBar::new();
+    if !welcome {
+        header.pack_start(&close_button);
+    }
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    if welcome {
+        let intro = gtk::Label::new(Some(
+            "Connect a calendar account to see and edit its events here. You can also keep using Calix with local calendars only.",
+        ));
+        intro.set_wrap(true);
+        intro.set_xalign(0.0);
+        content.append(&intro);
+    }
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Choose a service")
+        .build();
+    group.add(&chooser_row(
+        "Google Calendar",
+        if ui.config.borrow().google.is_some() {
+            "Sign in securely in your web browser"
+        } else {
+            "Advanced setup required before browser sign-in"
+        },
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            google_sync_button,
+            move || {
+                dialog.close();
+                if ui.config.borrow().google.is_none() {
+                    open_google_setup_help(&ui, &google_sync_button);
+                    return;
+                }
+                let activity = connection_activity_button("Connect Google");
+                add_google_account(&ui, &activity, &google_sync_button);
+            }
+        ),
+    ));
+    group.add(&chooser_row(
+        "Apple iCloud",
+        "Use an app-specific password from your Apple Account",
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            icloud_sync_button,
+            move || {
+                dialog.close();
+                let activity = connection_activity_button("Connect iCloud");
+                open_icloud_account_dialog(&ui, &activity, &icloud_sync_button, None);
+            }
+        ),
+    ));
+    group.add(&chooser_row(
+        "Fastmail",
+        "Connect calendars using your Fastmail app password",
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            caldav_sync_button,
+            move || {
+                dialog.close();
+                let activity = connection_activity_button("Connect Fastmail");
+                open_caldav_account_dialog(
+                    &ui,
+                    &activity,
+                    &caldav_sync_button,
+                    "Fastmail",
+                    Some("https://caldav.fastmail.com"),
+                    None,
+                );
+            }
+        ),
+    ));
+    group.add(&chooser_row(
+        "Nextcloud",
+        "Enter the address of your Nextcloud server",
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            caldav_sync_button,
+            move || {
+                dialog.close();
+                let activity = connection_activity_button("Connect Nextcloud");
+                open_caldav_account_dialog(
+                    &ui,
+                    &activity,
+                    &caldav_sync_button,
+                    "Nextcloud",
+                    None,
+                    None,
+                );
+            }
+        ),
+    ));
+    group.add(&chooser_row(
+        "Other calendar server",
+        "Advanced: connect a CalDAV-compatible service",
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            caldav_sync_button,
+            move || {
+                dialog.close();
+                let activity = connection_activity_button("Connect server");
+                open_caldav_account_dialog(
+                    &ui,
+                    &activity,
+                    &caldav_sync_button,
+                    "Other calendar server",
+                    None,
+                    None,
+                );
+            }
+        ),
+    ));
+    content.append(&group);
+    let privacy = gtk::Label::new(Some(
+        "Passwords and sign-in tokens are stored in your system keyring. Calendar events are cached on this computer.",
+    ));
+    privacy.set_wrap(true);
+    privacy.set_xalign(0.0);
+    privacy.add_css_class("dim-label");
+    content.append(&privacy);
+    if welcome {
+        let local_only = gtk::Button::with_label("Continue with local calendar");
+        local_only.set_halign(gtk::Align::Center);
+        local_only.connect_clicked(clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        content.append(&local_only);
+    }
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+    close_button.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+    dialog.present(Some(&ui.carousel));
+}
+
+fn open_google_setup_help(ui: &Rc<Ui>, google_sync_button: &gtk::Button) {
+    let dialog = adw::Dialog::builder()
+        .title("Set up Google Calendar")
+        .content_width(480)
+        .build();
+    let close = gtk::Button::with_label("Close");
+    let header = adw::HeaderBar::new();
+    header.pack_start(&close);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    let explanation = gtk::Label::new(Some(
+        "Google requires this development build to use your own OAuth app credentials. This is an advanced, one-time setup in Google Cloud.",
+    ));
+    explanation.set_wrap(true);
+    explanation.set_xalign(0.0);
+    content.append(&explanation);
+    if let Some(error) = ui.config.borrow().load_error.as_deref() {
+        let error_group = adw::PreferencesGroup::builder()
+            .title("Configuration needs attention")
+            .description(error)
+            .build();
+        content.append(&error_group);
+    }
+    let steps = gtk::Label::new(Some(
+        "1. Create a Desktop app OAuth client and enable Google Calendar API.\n\
+         2. Paste the client ID and client secret below.\n\
+         3. Save and continue to sign in with Google.",
+    ));
+    steps.set_wrap(true);
+    steps.set_xalign(0.0);
+    content.append(&steps);
+    let credentials = adw::PreferencesGroup::builder()
+        .title("Google OAuth client")
+        .description("Saved only in ~/.config/calix/config.toml with owner-only permissions")
+        .build();
+    let client_id = adw::EntryRow::builder().title("Client ID").build();
+    let client_secret = adw::PasswordEntryRow::builder()
+        .title("Client secret")
+        .build();
+    if let Some(existing) = ui.config.borrow().google.as_ref() {
+        client_id.set_text(&existing.client_id);
+        client_secret.set_text(&existing.client_secret);
+    }
+    credentials.add(&client_id);
+    credentials.add(&client_secret);
+    content.append(&credentials);
+    let save_error = gtk::Label::new(None);
+    save_error.add_css_class("error");
+    save_error.set_wrap(true);
+    save_error.set_xalign(0.0);
+    save_error.set_visible(false);
+    content.append(&save_error);
+    let save = gtk::Button::with_label("Save and sign in");
+    save.add_css_class("suggested-action");
+    save.set_halign(gtk::Align::Start);
+    content.append(&save);
+    let warning = gtk::Label::new(Some(
+        "If the OAuth app remains in Google's Testing mode, Google may require you to sign in again periodically.",
+    ));
+    warning.set_wrap(true);
+    warning.set_xalign(0.0);
+    warning.add_css_class("dim-label");
+    content.append(&warning);
+    content.append(
+        &gtk::LinkButton::builder()
+            .label("Open the complete Google setup guide")
+            .uri("https://github.com/ianswope/calix#connecting-google-calendar")
+            .halign(gtk::Align::Start)
+            .build(),
+    );
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+    close.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+    save.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        dialog,
+        #[weak]
+        client_id,
+        #[weak]
+        client_secret,
+        #[weak]
+        save_error,
+        #[strong]
+        google_sync_button,
+        move |_| match Config::save_google(&client_id.text(), &client_secret.text()) {
+            Ok(config) => {
+                *ui.config.borrow_mut() = config;
+                dialog.close();
+                let activity = connection_activity_button("Connect Google");
+                add_google_account(&ui, &activity, &google_sync_button);
+            }
+            Err(error) => {
+                save_error.set_label(&error);
+                save_error.set_visible(true);
+            }
+        }
+    ));
+    dialog.present(Some(&ui.carousel));
+}
+
+fn show_startup_error(app: &adw::Application, error: &str, date: Option<NaiveDate>) {
+    let data_directory = crate::xdg::data_home().join("calix");
+    let open_directory = data_directory
+        .ancestors()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| std::path::Path::new("/"))
+        .to_path_buf();
+    let diagnostic = format!(
+        "Calix could not open its local calendar database.\n\nDatabase folder: {}\nError: {error}",
+        data_directory.display()
+    );
+    let status = adw::StatusPage::builder()
+        .icon_name("dialog-error-symbolic")
+        .title("Calix couldn’t open your calendars")
+        .description("Your data has not been deleted. Check the database folder’s permissions, then retry. You can copy the diagnostic below when asking for help.")
+        .build();
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    actions.set_halign(gtk::Align::Center);
+
+    let retry = gtk::Button::with_label("Retry");
+    retry.add_css_class("suggested-action");
+    let open_folder = gtk::Button::with_label("Open data location");
+    let copy = gtk::Button::with_label("Copy diagnostic");
+    actions.append(&retry);
+    actions.append(&open_folder);
+    actions.append(&copy);
+    status.set_child(Some(&actions));
+
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Calix")
+        .default_width(560)
+        .default_height(360)
+        .content(&status)
+        .build();
+    retry.connect_clicked(clone!(
+        #[weak]
+        window,
+        #[weak]
+        app,
+        move |_| {
+            window.close();
+            build(&app, date);
+        }
+    ));
+    open_folder.connect_clicked(move |_| {
+        let Ok(uri) = url::Url::from_directory_path(&open_directory) else {
+            eprintln!(
+                "calix: could not make a file URL for {}",
+                open_directory.display()
+            );
+            return;
+        };
+        if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+            uri.as_str(),
+            None::<&gtk::gio::AppLaunchContext>,
+        ) {
+            eprintln!("calix: could not open database folder: {error}");
+        }
+    });
+    copy.connect_clicked(move |_| {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(&diagnostic);
+        }
+    });
+    window.present();
+}
+
 /// Forgets `account`: its keyring credential, then its events, calendars, and
 /// row. Local only — nothing is deleted or revoked with the provider, so
 /// re-adding the same account later re-syncs it.
@@ -2444,7 +2854,12 @@ fn disconnect_account(store: &Store, account: &store::Account) -> Result<(), Str
 
 /// Lists every connected account with a Remove button. Removal asks for
 /// confirmation first, since it drops the account's cached events.
-fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
+fn open_manage_accounts_dialog(
+    ui: &Rc<Ui>,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+) {
     let dialog = adw::Dialog::builder()
         .title("Accounts")
         .content_width(460)
@@ -2463,7 +2878,7 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
     let accounts = ui.store.all_accounts().unwrap_or_default();
     if accounts.is_empty() {
         let empty = gtk::Label::new(Some(
-            "No accounts connected yet. Use Add Google, Add iCloud, or Add CalDAV.",
+            "No online accounts are connected. Choose Connect an account to get started.",
         ));
         empty.set_wrap(true);
         empty.set_xalign(0.0);
@@ -2472,10 +2887,20 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
     } else {
         let group = adw::PreferencesGroup::new();
         for account in accounts {
-            let subtitle = match &account.server_url {
-                Some(url) => format!("{} · {url}", Provider::label_for_key(&account.provider)),
-                None => Provider::label_for_key(&account.provider).to_string(),
-            };
+            let calendar_count = ui
+                .store
+                .calendars_for_account(account.id)
+                .map(|c| c.len())
+                .unwrap_or(0);
+            let provider_label = friendly_account_provider(&account);
+            let sync_status = account_sync_status(&account);
+            let subtitle = format!(
+                "{} · {} calendar{} · {}",
+                provider_label,
+                calendar_count,
+                if calendar_count == 1 { "" } else { "s" },
+                sync_status,
+            );
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&account.display_name))
                 .subtitle(glib::markup_escape_text(&subtitle))
@@ -2483,8 +2908,66 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
             row.set_title_lines(1);
             row.set_subtitle_lines(1);
 
+            let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let retry_button = gtk::Button::builder()
+                .icon_name("view-refresh-symbolic")
+                .tooltip_text("Refresh this provider's connected accounts")
+                .valign(gtk::Align::Center)
+                .build();
+            retry_button.connect_clicked(clone!(
+                #[strong]
+                ui,
+                #[strong]
+                account,
+                #[strong]
+                google_sync_button,
+                #[strong]
+                icloud_sync_button,
+                #[strong]
+                caldav_sync_button,
+                move |_| retry_account_provider(
+                    &ui,
+                    &account,
+                    &google_sync_button,
+                    &icloud_sync_button,
+                    &caldav_sync_button,
+                )
+            ));
+            let update_button = gtk::Button::builder()
+                .label(if account.provider == "google" {
+                    "Update sign-in"
+                } else {
+                    "Update password"
+                })
+                .valign(gtk::Align::Center)
+                .build();
+            update_button.connect_clicked(clone!(
+                #[strong]
+                ui,
+                #[strong]
+                account,
+                #[weak]
+                dialog,
+                #[strong]
+                google_sync_button,
+                #[strong]
+                icloud_sync_button,
+                #[strong]
+                caldav_sync_button,
+                move |_| {
+                    dialog.close();
+                    update_account_credentials(
+                        &ui,
+                        &account,
+                        &google_sync_button,
+                        &icloud_sync_button,
+                        &caldav_sync_button,
+                    );
+                }
+            ));
             let remove_button = gtk::Button::builder()
-                .label("Remove")
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Disconnect account")
                 .valign(gtk::Align::Center)
                 .css_classes(["destructive-action"])
                 .build();
@@ -2497,7 +2980,10 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
                     confirm_disconnect_account(&ui, &dialog, &account);
                 }
             ));
-            row.add_suffix(&remove_button);
+            actions.append(&retry_button);
+            actions.append(&update_button);
+            actions.append(&remove_button);
+            row.add_suffix(&actions);
             group.add(&row);
         }
         content.append(&group);
@@ -2527,6 +3013,129 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
     ));
 
     dialog.present(Some(&ui.carousel));
+}
+
+fn friendly_account_provider(account: &store::Account) -> String {
+    match account.provider.as_str() {
+        "google" => "Google Calendar".to_string(),
+        "icloud" => "Apple iCloud".to_string(),
+        "caldav" => {
+            let host = account
+                .server_url
+                .as_deref()
+                .map(host_label)
+                .unwrap_or_default();
+            if host.contains("fastmail") {
+                "Fastmail".to_string()
+            } else if host.contains("nextcloud") {
+                "Nextcloud".to_string()
+            } else if host.is_empty() {
+                "Calendar server".to_string()
+            } else {
+                format!("Calendar server · {host}")
+            }
+        }
+        other => Provider::label_for_key(other).to_string(),
+    }
+}
+
+fn account_sync_status(account: &store::Account) -> String {
+    if let Some(error) = account.last_sync_error.as_deref() {
+        return format!("Needs attention: {}", first_line(error));
+    }
+    let Some(timestamp) = account.last_sync_at.as_deref() else {
+        return "Waiting for first sync".to_string();
+    };
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
+        return "Synced automatically".to_string();
+    };
+    let local = timestamp.with_timezone(&Local);
+    format!("Last updated {}", local.format("%b %-d, %-I:%M %p"))
+}
+
+fn sync_account_with_health(
+    store: &Store,
+    account: &store::Account,
+    sync: impl FnOnce() -> Result<SyncOutcome, String>,
+) -> Result<SyncOutcome, String> {
+    let result = sync();
+    record_sync_result(store, account.id, &account.label(), &result);
+    result
+}
+
+fn record_sync_result(
+    store: &Store,
+    account_id: i64,
+    account_label: &str,
+    result: &Result<SyncOutcome, String>,
+) {
+    let error = match &result {
+        Ok(outcome) => outcome.failure_note(),
+        Err(error) => Some(error.clone()),
+    };
+    if let Err(record_error) = store.record_account_sync(account_id, error.as_deref()) {
+        eprintln!(
+            "calix: could not record sync status for {}: {record_error}",
+            account_label
+        );
+    }
+}
+
+fn retry_account_provider(
+    ui: &Rc<Ui>,
+    account: &store::Account,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+) {
+    // Sync is provider-wide in the current backend. Say so in the tooltip, but
+    // route the action from the affected account so recovery is discoverable.
+    match account.provider.as_str() {
+        "google" => sync_google_accounts(ui, google_sync_button, false),
+        "icloud" => sync_icloud_accounts(ui, icloud_sync_button, false),
+        "caldav" => sync_caldav_accounts(ui, caldav_sync_button, false),
+        _ => ui.toast_overlay.add_toast(adw::Toast::new(
+            "This account type cannot be refreshed by this version of Calix",
+        )),
+    }
+}
+
+fn update_account_credentials(
+    ui: &Rc<Ui>,
+    account: &store::Account,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+) {
+    match account.provider.as_str() {
+        "google" => {
+            let activity = connection_activity_button("Update Google sign-in");
+            add_google_account(ui, &activity, google_sync_button);
+        }
+        "icloud" => {
+            let activity = connection_activity_button("Update iCloud sign-in");
+            open_icloud_account_dialog(
+                ui,
+                &activity,
+                icloud_sync_button,
+                Some(&account.provider_account_id),
+            );
+        }
+        "caldav" => {
+            let activity = connection_activity_button("Update server sign-in");
+            open_caldav_account_dialog(
+                ui,
+                &activity,
+                caldav_sync_button,
+                &friendly_account_provider(account),
+                account.server_url.as_deref(),
+                Some(&account.provider_account_id),
+            );
+        }
+        _ => ui.toast_overlay.add_toast(adw::Toast::new(
+            "This account type cannot be updated by this version of Calix",
+        )),
+    }
 }
 
 /// Confirms before disconnecting, naming what is and isn't affected.
@@ -2571,7 +3180,8 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
                         parent.close();
                         // Reopen so the list reflects the removal and more
                         // accounts can be removed without re-navigating.
-                        open_manage_accounts_dialog(&ui);
+                        // The account center can be reopened from the sidebar;
+                        // avoid retaining stale sync controls in this callback.
                     }
                     Err(error) => {
                         ui.toast_overlay
@@ -2585,9 +3195,14 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
     alert.present(Some(parent));
 }
 
-fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
+fn open_icloud_account_dialog(
+    ui: &Rc<Ui>,
+    add_button: &gtk::Button,
+    sync_button: &gtk::Button,
+    apple_id_hint: Option<&str>,
+) {
     let dialog = adw::Dialog::builder()
-        .title("Add iCloud")
+        .title("Apple iCloud")
         .content_width(420)
         .build();
 
@@ -2604,6 +3219,9 @@ fn open_icloud_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
     let apple_id_row = adw::EntryRow::builder()
         .title("Apple Account Email")
         .build();
+    if let Some(apple_id) = apple_id_hint {
+        apple_id_row.set_text(apple_id);
+    }
     let password_row = adw::PasswordEntryRow::builder()
         .title("App-Specific Password")
         .build();
@@ -2780,6 +3398,7 @@ fn add_icloud_account(
                 .upsert_icloud_account(&apple_id, &apple_id, &token_key)
                 .map_err(|e| e.to_string())?;
             let outcome = caldav::sync_account(&credentials, &store, account_id);
+            record_sync_result(&store, account_id, &apple_id, &outcome);
             Ok(CaldavAddResult {
                 display_name: apple_id,
                 outcome,
@@ -2862,6 +3481,47 @@ fn sync_connected_accounts(
     icloud_sync_button: &gtk::Button,
     caldav_sync_button: &gtk::Button,
 ) {
+    sync_connected_accounts_mode(
+        ui,
+        google_sync_button,
+        icloud_sync_button,
+        caldav_sync_button,
+        true,
+    );
+}
+
+fn sync_connected_accounts_with_reporting(
+    ui: &Rc<Ui>,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+) {
+    if ui
+        .store
+        .all_accounts()
+        .is_ok_and(|accounts| accounts.is_empty())
+    {
+        ui.toast_overlay.add_toast(adw::Toast::new(
+            "Connect an account before refreshing online calendars",
+        ));
+        return;
+    }
+    sync_connected_accounts_mode(
+        ui,
+        google_sync_button,
+        icloud_sync_button,
+        caldav_sync_button,
+        false,
+    );
+}
+
+fn sync_connected_accounts_mode(
+    ui: &Rc<Ui>,
+    google_sync_button: &gtk::Button,
+    icloud_sync_button: &gtk::Button,
+    caldav_sync_button: &gtk::Button,
+    quiet: bool,
+) {
     // A button that's already insensitive has a sync in flight; skipping it
     // keeps an automatic pass from stacking a second one on top.
     type SyncFn = fn(&Rc<Ui>, &gtk::Button, bool);
@@ -2872,7 +3532,7 @@ fn sync_connected_accounts(
     ];
     for (provider, button, sync) in providers {
         if button.is_sensitive() && has_accounts(ui, provider) {
-            sync(ui, button, true);
+            sync(ui, button, quiet);
         }
     }
 }
@@ -2955,7 +3615,7 @@ fn run_account_sync<F>(
 }
 
 fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
-    let Some(google_config) = ui.config.google.clone() else {
+    let Some(google_config) = ui.config.borrow().google.clone() else {
         ui.toast_overlay.add_toast(adw::Toast::new(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
         ));
@@ -2990,10 +3650,17 @@ fn sync_google_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             &accounts,
             |account| account.label(),
             |account| {
-                let token = google::oauth::get_access_token(&google_config, &account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("no saved token — reconnect the account")?;
-                google::sync::sync_account(&token, &store, account.id)
+                sync_account_with_health(&store, account, || {
+                    let token = google::oauth::get_access_token(&google_config, &account.token_key)
+                        .map_err(|e| {
+                            e.to_string().replace(
+                                "click Add Google to reconnect",
+                                "open Accounts and choose Update sign-in",
+                            )
+                        })?
+                        .ok_or("no saved sign-in — open Accounts and choose Update sign-in")?;
+                    google::sync::sync_account(&token, &store, account.id)
+                })
             },
         );
         Ok((account_count, outcome))
@@ -3013,24 +3680,35 @@ fn sync_icloud_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             &accounts,
             |account| account.label(),
             |account| {
-                let app_password = icloud::credentials::app_password(&account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("no saved app-specific password — reconnect the account")?;
-                let credentials = caldav::Credentials {
-                    base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
-                    username: account.provider_account_id.clone(),
-                    password: app_password,
-                };
-                caldav::sync_account(&credentials, &store, account.id)
+                sync_account_with_health(&store, account, || {
+                    let app_password = icloud::credentials::app_password(&account.token_key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or(
+                            "no saved app-specific password — open Accounts and choose Update password",
+                        )?;
+                    let credentials = caldav::Credentials {
+                        base_url: icloud::ICLOUD_CALDAV_ROOT.to_string(),
+                        username: account.provider_account_id.clone(),
+                        password: app_password,
+                    };
+                    caldav::sync_account(&credentials, &store, account.id)
+                })
             },
         );
         Ok((account_count, outcome))
     });
 }
 
-fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button: &gtk::Button) {
+fn open_caldav_account_dialog(
+    ui: &Rc<Ui>,
+    add_button: &gtk::Button,
+    sync_button: &gtk::Button,
+    service_name: &str,
+    server_hint: Option<&str>,
+    username_hint: Option<&str>,
+) {
     let dialog = adw::Dialog::builder()
-        .title("Add CalDAV")
+        .title(format!("Connect {service_name}"))
         .content_width(440)
         .build();
 
@@ -3052,16 +3730,34 @@ fn open_caldav_account_dialog(ui: &Rc<Ui>, add_button: &gtk::Button, sync_button
         .subtitle("Sends your password in cleartext — only for trusted local networks")
         .build();
 
-    let group = adw::PreferencesGroup::new();
-    group.add(&server_row);
+    if let Some(server) = server_hint {
+        server_row.set_text(server);
+    }
+    if let Some(username) = username_hint {
+        username_row.set_text(username);
+    }
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Connection details")
+        .description(if service_name == "Other calendar server" {
+            "Advanced: use the CalDAV address supplied by your calendar provider"
+        } else {
+            "Your password is saved securely in the system keyring"
+        })
+        .build();
+    let has_fixed_server = server_hint.is_some();
+    if !has_fixed_server {
+        group.add(&server_row);
+    }
     group.add(&username_row);
     group.add(&password_row);
-    group.add(&http_row);
+    if !has_fixed_server {
+        group.add(&http_row);
+    }
 
     let note = gtk::Label::new(Some(
-        "Enter your provider's CalDAV address — e.g. https://caldav.fastmail.com/ \
-         or your Nextcloud URL. Many providers want an app password rather than \
-         your login password.",
+        "Many calendar services require an app password from their security \
+         settings instead of your normal sign-in password.",
     ));
     // Capped for the same reason as the iCloud dialog: wrapping alone still
     // lets a long line widen the dialog. This one now carries server error
@@ -3209,6 +3905,7 @@ fn add_caldav_account(
                 .upsert_caldav_account(&username, &server_url, &display_name, &token_key)
                 .map_err(|e| e.to_string())?;
             let outcome = caldav::sync_account(&credentials, &store, account_id);
+            record_sync_result(&store, account_id, &display_name, &outcome);
             Ok(CaldavAddResult {
                 display_name,
                 outcome,
@@ -3289,19 +3986,21 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, sync_button: &gtk::Button, quiet: bool) {
             &accounts,
             |account| account.label(),
             |account| {
-                let base_url = account
-                    .server_url
-                    .clone()
-                    .ok_or("no server address — remove and re-add the account")?;
-                let password = icloud::credentials::app_password(&account.token_key)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("no saved password — reconnect the account")?;
-                let credentials = caldav::Credentials {
-                    base_url,
-                    username: account.provider_account_id.clone(),
-                    password,
-                };
-                caldav::sync_account(&credentials, &store, account.id)
+                sync_account_with_health(&store, account, || {
+                    let base_url = account
+                        .server_url
+                        .clone()
+                        .ok_or("no server address — remove and re-add the account")?;
+                    let password = icloud::credentials::app_password(&account.token_key)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("no saved password — open Accounts and choose Update password")?;
+                    let credentials = caldav::Credentials {
+                        base_url,
+                        username: account.provider_account_id.clone(),
+                        password,
+                    };
+                    caldav::sync_account(&credentials, &store, account.id)
+                })
             },
         );
         Ok((account_count, outcome))

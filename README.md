@@ -16,9 +16,67 @@ A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) 
 
 **Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google, iCloud, and generic CalDAV sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, iCloud, or CalDAV calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to the source. Grid text steps down a size when the window is narrow. On [Omarchy](https://omarchy.org/), Calix picks up the active theme's colors automatically, so it matches the rest of the desktop.
 
-## Building
+## Install (recommended)
 
-Requires a Rust toolchain and GTK4 (≥ 4.14) + libadwaita (≥ 1.5) development headers (on Arch: `gtk4`, `libadwaita`; on Debian/Ubuntu: `libgtk-4-dev`, `libadwaita-1-dev`).
+The recommended installation is the prebuilt Linux archive from the
+[latest GitHub release](https://github.com/ianswope/calix/releases/latest). It is
+the only end-user package currently published by the project; Flatpak, AUR, and
+Homebrew support below are development previews rather than stable channels.
+
+1. Download the archive for your CPU and extract it.
+2. Open a terminal in the extracted `calix-<version>-linux-<arch>` folder.
+3. Run:
+
+   ```sh
+   ./install.sh
+   ```
+
+This installs Calix under `~/.local` and gives its desktop entry an absolute
+path, so it works even when graphical applications cannot see `~/.local/bin`.
+Launch **Calix** from the application menu, or run `~/.local/bin/calix`.
+
+### Runtime prerequisites
+
+Calix requires Linux with GTK4 ≥ 4.14 and libadwaita ≥ 1.5. Cloud accounts also
+need:
+
+- a Secret Service-compatible system keyring, such as GNOME Keyring or KWallet,
+  to store passwords and OAuth tokens;
+- `xdg-open` (normally provided by `xdg-utils`) and a default web browser for
+  Google sign-in;
+- network access for Google, iCloud, or CalDAV sync.
+
+Install the runtime libraries before launching if your distribution does not
+already provide them:
+
+| Distribution | Command |
+| --- | --- |
+| Arch / Omarchy | `sudo pacman -S gtk4 libadwaita xdg-utils gnome-keyring` |
+| Debian / Ubuntu | `sudo apt install libgtk-4-1 libadwaita-1-0 xdg-utils gnome-keyring` |
+
+Older distribution releases may not contain the required GTK version. The
+binary is not fully self-contained; if it reports a missing shared library, use
+your distribution's package manager rather than downloading libraries by hand.
+
+### Update, uninstall, and retained data
+
+To update, download the newer release archive, close Calix, and run its
+`./install.sh`; it replaces the application files in the same prefix. To remove
+those files, run `./uninstall.sh` from any Calix release archive. Set the same
+`PREFIX` for both commands if you installed somewhere other than `~/.local`.
+
+Uninstalling deliberately keeps local calendars and settings in
+`${XDG_DATA_HOME:-~/.local/share}/calix`, configuration in
+`${XDG_CONFIG_HOME:-~/.config}/calix`, and credentials in the system keyring.
+To remove account credentials cleanly, use **Calendars → Manage → Remove** for
+each account before uninstalling. Back up the data directory before manually
+deleting it if you may want the local calendar later.
+
+## Developer install from a checkout
+
+Building requires Rust 1.85 or newer, GTK4 ≥ 4.14 and libadwaita ≥ 1.5
+development headers (`gtk4`, `libadwaita`, and `pkgconf` on Arch;
+`libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config` on Debian/Ubuntu).
 
 ```sh
 cargo build
@@ -26,77 +84,54 @@ cargo test
 cargo run
 ```
 
-## Homebrew
+For a user-local development install, run `scripts/install-local.sh`. Re-run it
+after pulling changes to update, and use `scripts/uninstall-local.sh` to remove
+the installed application files. The installer refuses a dirty tree unless
+`CALIX_ALLOW_DIRTY=1` is set.
 
-The tap currently ships the development build straight from master:
-
-```sh
-brew tap ianswope/calix https://github.com/ianswope/calix
-brew install --HEAD ianswope/calix/calix
-```
-
-This installs the `calix` binary and the desktop entry/icon. Tagged releases
-are published as prebuilt tarballs on the
-[releases page](https://github.com/ianswope/calix/releases); a checksum-pinned
-stable formula is still to come.
-
-## Flatpak and AUR
-
-The Flatpak manifest is in `flatpak/com.ianswope.Calix.json`. Before building,
-generate its dependency manifest with:
+The installed binary is a copy rather than a symlink. These commands identify
+and compare it with the checkout:
 
 ```sh
-scripts/generate-flatpak-sources.sh
-flatpak-builder --user --install --force-clean build-dir flatpak/com.ianswope.Calix.json
+calix --version
+scripts/check-installed.sh
 ```
 
-`packaging/aur/PKGBUILD` is the release package definition for Arch users. It
-is pinned to the current release version when publishing to the AUR; replace
-its temporary `SKIP` checksum with the SHA-256 for the tagged source archive.
+## Experimental package channels
 
-## Installing Locally
+These definitions are maintained for packagers and contributors, but are not
+currently published as stable end-user channels:
 
-For a user-local install from a checkout:
+- **Flatpak:** `flatpak/com.ianswope.Calix.json` is a local development
+  manifest, not a Flathub listing. Generate its locked Cargo sources and build
+  it with:
 
-```sh
-scripts/install-local.sh
-```
+  ```sh
+  scripts/generate-flatpak-sources.sh
+  flatpak-builder --user --install --force-clean build-dir flatpak/com.ianswope.Calix.json
+  ```
 
-This builds `target/release/calix` and installs:
+- **AUR:** `packaging/aur/PKGBUILD` is a release template. Its `SKIP` checksum
+  must be replaced with the SHA-256 of the immutable tagged source archive
+  before publication. Do not publish it with `SKIP`.
+- **Homebrew on Linux:** the tap currently builds the development branch from
+  source. There is no checksum-pinned stable formula yet:
 
-- `~/.local/bin/calix`
-- `~/.local/share/applications/com.ianswope.Calix.desktop`
-- `~/.local/share/icons/hicolor/scalable/apps/com.ianswope.Calix.svg`
+  ```sh
+  brew tap ianswope/calix https://github.com/ianswope/calix
+  brew install --HEAD ianswope/calix/calix
+  ```
 
-The installed binary is a **copy**, not a symlink, so committing a fix does not
-change what you launch until you run `install-local.sh` again. Each build is
-stamped with the commit it came from:
+Package-manager installs should be updated and uninstalled with that same
+package manager.
 
-```sh
-calix --version                 # calix 0.4.0 (v0.4.0-25-gb1c3f07 2026-07-30)
-scripts/check-installed.sh      # compares that against the current checkout
-```
+## Building a release archive
 
-`check-installed.sh` exits 0 in sync, 1 drifted (listing the commits you have
-committed but not installed), 2 if it can't tell. `install-local.sh` refuses a
-dirty tree, so a stamped commit always matches what was installed; override with
-`CALIX_ALLOW_DIRTY=1` if you really want an experimental build on your desktop.
-
-Uninstall with:
-
-```sh
-scripts/uninstall-local.sh
-```
-
-## Release Tarball
-
-To build a Linux release archive:
-
-```sh
-scripts/build-release.sh
-```
-
-The archive is written to `target/dist/calix-<version>-linux-<arch>.tar.gz`. It contains the release binary, desktop entry, icon, docs, and an `install.sh` script that installs to `~/.local` by default. Users still need GTK4 + libadwaita runtime libraries available from their distribution.
+Maintainers can run `scripts/build-release.sh`. The output at
+`target/dist/calix-<version>-linux-<arch>.tar.gz` contains the binary, desktop
+metadata, documentation, `install.sh`, and its matching `uninstall.sh`.
+`scripts/check-package.sh` builds the archive and verifies an isolated install,
+desktop launch path, metadata, binary version, and complete uninstall.
 
 ## Connecting iCloud Calendar
 
@@ -104,9 +139,9 @@ iCloud uses CalDAV with an Apple app-specific password:
 
 1. Sign in at [account.apple.com](https://account.apple.com).
 2. Under **Sign-In and Security → App-Specific Passwords**, generate a password for Calix.
-3. In Calix, open the calendar sidebar and click **Add iCloud** in the Accounts section.
+3. In Calix, open the calendar sidebar, choose **Connect an account → Apple iCloud**.
 4. Enter your Apple Account email and the app-specific password. The password is saved to your system keyring, not to a file.
-5. Use **Sync iCloud** to refresh connected iCloud accounts.
+5. Calix verifies the account, imports its calendars, and keeps them refreshed automatically.
 
 Synced iCloud events can be edited or deleted, including recurring ones: opening an occurrence of a series offers a **This event / All events** choice for both edits and deletes, written back as standard iCalendar overrides and exclusions.
 
@@ -116,11 +151,11 @@ App-specific passwords don't expire — if iCloud sync starts failing, it's usua
 
 Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, and so on. iCloud is just a CalDAV server with a fixed address, so it uses the same engine under the hood.
 
-1. In Calix, open the calendar sidebar and click **Add CalDAV** in the Accounts section.
+1. In Calix, choose **Connect an account**, then select Fastmail, Nextcloud, or **Other calendar server**.
 2. Enter the server's CalDAV address, your username, and your password:
    - **Server URL** — your provider's CalDAV endpoint, e.g. `https://caldav.fastmail.com/` or your Nextcloud address like `https://cloud.example.com/remote.php/dav`. Pasting the bare server origin usually works too; Calix falls back to the `/.well-known/caldav` bootstrap to find your account.
    - **Username / Password** — most providers want an app-specific password rather than your login password. Generate one in your provider's security settings.
-3. The password is saved to your system keyring, not to a file. Use **Sync CalDAV** to refresh all connected CalDAV accounts.
+3. The password is saved to your system keyring, not to a file. Calix verifies the connection and refreshes it automatically.
 
 Editing and deleting synced CalDAV events works the same as iCloud, including the **This event / All events** choice on recurring series.
 
@@ -132,16 +167,23 @@ Google is the one provider that needs real setup: Google requires every app to b
 2. Under **Google Auth Platform → Audience**, set the app to External, and add your own Google account under **Test users** (the app stays unverified/"Testing," which is fine for personal use — publishing for public verification is a separate, much heavier process not needed here).
 3. Under **Data Access**, add the `.../auth/calendar` scope.
 4. Under **Clients**, create an OAuth client of type **Desktop app**. Copy the Client ID and Client Secret.
-5. Create `~/.config/calix/config.toml`:
-   ```toml
-   [google]
-   client_id = "your-client-id.apps.googleusercontent.com"
-   client_secret = "your-client-secret"
-   ```
-   This file lives outside the repo and is never read by anything that gets committed — each user (or contributor) needs their own.
-6. Run Calix, open the calendar sidebar, and click **Add Google** in the Accounts section. It opens your browser for the Google consent screen; once approved, the refresh token is saved to your system keyring (via Secret Service — GNOME Keyring, KWallet, etc.), not to a file. Repeat this for each Google account you want to connect, then use **Sync Google** to refresh all connected accounts.
+5. In Calix, choose **Connect an account → Google Calendar**, paste the Client
+   ID and Client Secret, then choose **Save and sign in**. Calix writes them to
+   `~/.config/calix/config.toml` with owner-only permissions; no manual editing
+   or restart is required.
+6. Complete the browser consent screen. The refresh token is saved to your
+   system keyring (Secret Service—GNOME Keyring, KWallet, etc.), not to a file.
+   Repeat this for each Google account you want to connect; Calix refreshes them
+   automatically.
 
-If you previously connected Google before Calix had multi-account storage, **Sync Google** will try to migrate that older saved token into the new account model.
+**Important:** Google OAuth clients left in **Testing** mode can issue refresh
+tokens that expire after seven days. If Calix asks you to reconnect every week,
+this is a Google project setting rather than lost local data. Move the OAuth
+consent screen to **Production** to avoid the Testing-mode lifetime; Google may
+show an unverified-app warning and you remain responsible for the project's
+scope and access settings.
+
+If you previously connected Google before Calix had multi-account storage, the next automatic or manual refresh will migrate that older saved token into the new account model.
 
 ## Using Calendars
 
@@ -149,7 +191,7 @@ The left sidebar lists local calendars and synced Google/iCloud/CalDAV calendars
 
 **Year view** shows the twelve months as thumbnails with busy days weighted; clicking a day opens it in Day view. Swiping or the arrows move a whole year at a time.
 
-The calendar button in the header toggles the sidebar, which opens with a mini month for jumping to a date — its arrows move the calendar a month at a time, and clicking a day goes there without changing the view mode. The sidebar's Accounts section contains **Add**/**Sync** buttons for Google, iCloud, and CalDAV.
+The calendar button in the header toggles the sidebar, which opens with a mini month for jumping to a date — its arrows move the calendar a month at a time, and clicking a day goes there without changing the view mode. The sidebar has one **Connect an account** action, a refresh button, and an account center for retrying sync, updating sign-in details, and disconnecting accounts.
 
 ### Working with events
 

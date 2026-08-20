@@ -65,4 +65,6 @@ Desktop entry: $DATA_DIR/applications/$APP_ID.desktop
 Make sure $BIN_DIR is on PATH if you want to run 'calix' from a terminal.
 A running instance keeps the old binary until you restart it.
 Check for drift later with scripts/check-installed.sh.
+Re-run this script to update. Uninstall with scripts/uninstall-local.sh;
+uninstalling keeps calendars, settings, and saved account credentials.
 EOF

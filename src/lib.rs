@@ -89,11 +89,23 @@ pub fn run() -> gtk::glib::ExitCode {
     // HANDLES_COMMAND_LINE so `calix 2026-08-22` reaches the instance that is
     // already running: GApplication forwards argv to it, and the date moves
     // the window that's up rather than opening a second one beside it.
+    let non_unique = std::env::var_os("CALIX_NON_UNIQUE").is_some();
+    let mut flags = gio::ApplicationFlags::HANDLES_COMMAND_LINE;
+    // A clean-profile UX or integration test must be able to coexist with a
+    // normally running Calix while still using the real desktop/keyring bus.
+    // This opt-in is intentionally environment-only and never affects an
+    // ordinary launch from the application menu.
+    if non_unique {
+        flags = gio::ApplicationFlags::NON_UNIQUE;
+    }
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .flags(flags)
         .build();
     app.connect_startup(|_| style::load());
+    if non_unique {
+        app.connect_activate(|app| window::open(app, None));
+    }
     app.connect_command_line(|app, command_line| {
         let args: Vec<String> = command_line
             .arguments()

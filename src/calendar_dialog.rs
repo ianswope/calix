@@ -18,21 +18,21 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
         &content,
         store.clone(),
         on_changed.clone(),
-        "iCloud",
-        "icloud",
-    );
-    add_account_sections(
-        &content,
-        store.clone(),
-        on_changed.clone(),
-        "Google",
+        "Google Calendar",
         "google",
     );
     add_account_sections(
         &content,
         store.clone(),
         on_changed.clone(),
-        "CalDAV",
+        "Apple iCloud",
+        "icloud",
+    );
+    add_account_sections(
+        &content,
+        store.clone(),
+        on_changed.clone(),
+        "Other calendar accounts",
         "caldav",
     );
 
@@ -42,6 +42,7 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
         content.append(&calendar_group(
             "On My Computer",
             None,
+            "Local calendar",
             local_calendars,
             store.clone(),
             on_changed.clone(),
@@ -72,16 +73,7 @@ fn add_account_sections(
     };
 
     match accounts {
-        Ok(accounts) if accounts.is_empty() => {
-            let empty_group = adw::PreferencesGroup::builder().title(title).build();
-            let account_name = title;
-            let row = adw::ActionRow::builder()
-                .title(format!("No {account_name} accounts connected"))
-                .subtitle(format!("Use Add {account_name} to connect an account"))
-                .build();
-            empty_group.add(&row);
-            content.append(&empty_group);
-        }
+        Ok(accounts) if accounts.is_empty() => {}
         Ok(accounts) => {
             let account_count = accounts.len();
             let calendar_count = accounts
@@ -89,12 +81,11 @@ fn add_account_sections(
                 .filter_map(|account| store.calendars_for_account(account.id).ok())
                 .map(|calendars| calendars.len())
                 .sum::<usize>();
-            let account_name = title;
             let summary_group = adw::PreferencesGroup::builder().title(title).build();
             summary_group.add(
                 &adw::ActionRow::builder()
                     .title(format!(
-                        "{calendar_count} calendar{} from {account_count} {account_name} account{}",
+                        "{calendar_count} calendar{} from {account_count} account{}",
                         if calendar_count == 1 { "" } else { "s" },
                         if account_count == 1 { "" } else { "s" }
                     ))
@@ -107,6 +98,11 @@ fn add_account_sections(
                 content.append(&calendar_group(
                     "Account",
                     Some(&account.display_name),
+                    match provider {
+                        "google" => "Google Calendar",
+                        "icloud" => "Apple iCloud calendar",
+                        _ => "Online calendar",
+                    },
                     calendars,
                     store.clone(),
                     on_changed.clone(),
@@ -128,6 +124,7 @@ fn add_account_sections(
 fn calendar_group(
     title: &str,
     description: Option<&str>,
+    calendar_kind: &str,
     calendars: Vec<Calendar>,
     store: Rc<Store>,
     on_changed: Rc<dyn Fn()>,
@@ -149,26 +146,27 @@ fn calendar_group(
         );
     } else {
         for calendar in calendars {
-            group.add(&calendar_row(calendar, store.clone(), on_changed.clone()));
+            group.add(&calendar_row(
+                calendar,
+                calendar_kind,
+                store.clone(),
+                on_changed.clone(),
+            ));
         }
     }
 
     group.upcast()
 }
 
-fn calendar_row(calendar: Calendar, store: Rc<Store>, on_changed: Rc<dyn Fn()>) -> adw::ActionRow {
-    let subtitle = match (
-        calendar.google_calendar_id.as_deref(),
-        calendar.icloud_calendar_id.as_deref(),
-    ) {
-        (Some(_), _) => "Google calendar",
-        (_, Some(_)) => "iCloud calendar",
-        _ => "Local calendar",
-    };
-
+fn calendar_row(
+    calendar: Calendar,
+    calendar_kind: &str,
+    store: Rc<Store>,
+    on_changed: Rc<dyn Fn()>,
+) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(gtk::glib::markup_escape_text(calendar.name.as_str()))
-        .subtitle(subtitle)
+        .subtitle(calendar_kind)
         .build();
     row.set_title_lines(1);
     row.set_subtitle_lines(1);

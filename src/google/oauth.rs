@@ -48,7 +48,7 @@ impl std::fmt::Display for AuthError {
             AuthError::RefreshTokenRejected => {
                 write!(
                     f,
-                    "your Google sign-in expired — click Add Google to reconnect"
+                    "your Google sign-in expired — open Accounts and choose Update sign-in"
                 )
             }
             AuthError::MissingRedirectCode => {
@@ -62,7 +62,7 @@ impl std::fmt::Display for AuthError {
                 )
             }
             AuthError::RedirectTimedOut => {
-                write!(f, "Google sign-in timed out; try Add Google again")
+                write!(f, "Google sign-in timed out; connect Google Calendar again")
             }
             AuthError::Keyring(e) => write!(f, "couldn't access the system keyring: {e}"),
         }

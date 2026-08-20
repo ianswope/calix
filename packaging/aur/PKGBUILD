@@ -5,9 +5,12 @@ pkgdesc="Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
 arch=('x86_64')
 url='https://github.com/ianswope/calix'
 license=('MIT')
-depends=('gtk4' 'libadwaita')
+depends=('gtk4' 'libadwaita' 'xdg-utils')
 makedepends=('cargo' 'pkgconf')
+optdepends=('gnome-keyring: store Google, iCloud, and CalDAV credentials')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+# Release checklist: replace SKIP with the SHA-256 of the immutable tagged
+# archive before publishing this PKGBUILD to the AUR.
 sha256sums=('SKIP')
 
 build() {

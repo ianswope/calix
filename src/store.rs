@@ -100,6 +100,8 @@ pub struct Account {
     /// CalDAV server base URL for generic `caldav` accounts; `None` for
     /// google and icloud.
     pub server_url: Option<String>,
+    pub last_sync_at: Option<String>,
+    pub last_sync_error: Option<String>,
 }
 
 impl Account {
@@ -152,9 +154,13 @@ pub struct Store {
 impl Store {
     pub fn open() -> rusqlite::Result<Self> {
         let path = data_file_path();
-        std::fs::create_dir_all(path.parent().expect("data file has a parent dir"))
-            .expect("can create Calix data directory");
-        Self::from_connection(Connection::open(path)?)
+        let directory = path.parent().expect("data file has a parent dir");
+        std::fs::create_dir_all(directory).map_err(sqlite_io_error)?;
+        set_owner_only_permissions(directory, 0o700).map_err(sqlite_io_error)?;
+
+        let store = Self::from_connection(Connection::open(&path)?)?;
+        set_owner_only_permissions(&path, 0o600).map_err(sqlite_io_error)?;
+        Ok(store)
     }
 
     #[cfg(test)]
@@ -227,6 +233,8 @@ impl Store {
         // Base URL for a generic CalDAV account's server; NULL for google and
         // icloud (iCloud uses a fixed well-known root).
         ensure_column(&conn, "accounts", "server_url", "TEXT")?;
+        ensure_column(&conn, "accounts", "last_sync_at", "TEXT")?;
+        ensure_column(&conn, "accounts", "last_sync_error", "TEXT")?;
         // JSON array of `Attendee`, written only by sync. `update_event` never
         // touches it, so editing an event locally keeps the provider's list.
         ensure_column(&conn, "events", "attendees", "TEXT")?;
@@ -379,7 +387,8 @@ impl Store {
 
     pub fn accounts_for_provider(&self, provider: &str) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider, provider_account_id, display_name, token_key, server_url
+            "SELECT id, provider, provider_account_id, display_name, token_key, server_url,
+                    last_sync_at, last_sync_error
              FROM accounts
              WHERE provider = ?1
              ORDER BY display_name",
@@ -392,7 +401,8 @@ impl Store {
     /// UI. Ordered by provider then display name so the list is stable.
     pub fn all_accounts(&self) -> rusqlite::Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, provider, provider_account_id, display_name, token_key, server_url
+            "SELECT id, provider, provider_account_id, display_name, token_key, server_url,
+                    last_sync_at, last_sync_error
              FROM accounts
              ORDER BY provider, display_name",
         )?;
@@ -432,6 +442,24 @@ impl Store {
                 Err(e)
             }
         }
+    }
+
+    /// Records durable account health for the account center. A clean sync
+    /// clears an older error; no credentials are included in the message.
+    pub fn record_account_sync(
+        &self,
+        account_id: i64,
+        error: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET last_sync_at = ?1, last_sync_error = ?2 WHERE id = ?3",
+            params![
+                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                error,
+                account_id
+            ],
+        )?;
+        Ok(())
     }
 
     /// Creates or updates a Google account row. `token_key` names the
@@ -1085,6 +1113,8 @@ fn row_to_account(row: &rusqlite::Row) -> rusqlite::Result<Account> {
         display_name: row.get(3)?,
         token_key: row.get(4)?,
         server_url: row.get(5)?,
+        last_sync_at: row.get(6)?,
+        last_sync_error: row.get(7)?,
     })
 }
 
@@ -1174,6 +1204,23 @@ fn normalized_timestamp(value: &str) -> Option<String> {
 
 fn data_file_path() -> PathBuf {
     crate::xdg::data_home().join("calix").join("calix.sqlite3")
+}
+
+fn sqlite_io_error(error: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, permissions)
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &std::path::Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1305,6 +1352,8 @@ mod tests {
             display_name: display_name.to_string(),
             token_key: "token:test".to_string(),
             server_url: None,
+            last_sync_at: None,
+            last_sync_error: None,
         }
     }
 
