@@ -76,6 +76,7 @@ fn parse_ics_attendee(parameters: &str, value: &str) -> Option<Attendee> {
         email: email.to_string(),
         name,
         status,
+        is_self: false,
     })
 }
 
@@ -299,6 +300,59 @@ pub fn update_event(
     };
     put_event(credentials, &url, &ics, etag.as_deref())?;
     Ok(())
+}
+
+pub fn respond_to_event(
+    credentials: &Credentials,
+    event_href: &str,
+    attendee_email: &str,
+    response: &str,
+) -> Result<(), String> {
+    let resource_href = event_href
+        .split_once('#')
+        .map_or(event_href, |(href, _)| href);
+    let url = absolute_url(&credentials.base_url, resource_href)?;
+    let (existing_ics, etag) = fetch_event(credentials, &url)?;
+    let partstat = match response {
+        "accepted" => "ACCEPTED",
+        "declined" => "DECLINED",
+        "tentative" => "TENTATIVE",
+        _ => return Err("Unknown invitation response".to_string()),
+    };
+    let mut found = false;
+    let lines = unfold_ics(&existing_ics)
+        .into_iter()
+        .map(|line| {
+            if property_name(&line).is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"))
+                && line.rsplit_once(':').is_some_and(|(_, value)| {
+                    value
+                        .trim_start_matches("mailto:")
+                        .eq_ignore_ascii_case(attendee_email)
+                })
+            {
+                found = true;
+                let (head, value) = line.rsplit_once(':').expect("matched attendee has a value");
+                let mut parameters = head
+                    .split(';')
+                    .filter(|part| !part.to_ascii_uppercase().starts_with("PARTSTAT="))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                parameters.push(format!("PARTSTAT={partstat}"));
+                format!("{}:{value}", parameters.join(";"))
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    if !found {
+        return Err("The server did not identify your invitation on this event".to_string());
+    }
+    put_event(
+        credentials,
+        &url,
+        &(lines.join("\r\n") + "\r\n"),
+        etag.as_deref(),
+    )
 }
 
 /// Edits a whole series ("all events") from one of its occurrences, shifting the
@@ -816,6 +870,7 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
             // arrives as its own one-off VEVENT without an RRULE.
             recurrence: None,
             reminder_minutes: None,
+            attendees: attendees.clone(),
         },
         attendees,
     })
@@ -2106,6 +2161,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();
@@ -2136,6 +2192,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let updated = replace_recurrence_instance(ics, "20260709T140000Z", &draft).unwrap();
@@ -2193,6 +2250,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let updated =
@@ -2220,6 +2278,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let updated =
@@ -2252,6 +2311,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
@@ -2274,6 +2334,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let ics = new_event_ics("uid-1", &draft);
@@ -2329,6 +2390,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         }
     }
 
@@ -2413,6 +2475,7 @@ END:VCALENDAR"#;
             notes: Some("New agenda".to_string()),
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();

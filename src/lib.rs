@@ -11,6 +11,7 @@
 //! The GTK frontend lives behind `gui` (on by default) and is what the `calix`
 //! binary runs.
 
+pub mod autostart;
 pub mod build_info;
 pub mod caldav;
 pub mod config;
@@ -102,7 +103,17 @@ pub fn run() -> gtk::glib::ExitCode {
         .application_id(APP_ID)
         .flags(flags)
         .build();
-    app.connect_startup(|_| style::load());
+    // Calix is also the lightweight alert process. Closing its window leaves
+    // sync and reminder timers alive; an explicit application quit still ends it.
+    let _background_hold = app.hold();
+    app.connect_startup(|app| {
+        style::load();
+        let quit = gio::SimpleAction::new("quit", None);
+        let app_for_quit = app.clone();
+        quit.connect_activate(move |_, _| app_for_quit.quit());
+        app.add_action(&quit);
+        app.set_accels_for_action("app.quit", &["<Control>q"]);
+    });
     if non_unique {
         app.connect_activate(|app| window::open(app, None));
     }
@@ -112,9 +123,14 @@ pub fn run() -> gtk::glib::ExitCode {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        let background = args.iter().any(|arg| arg == "--gapplication-service");
         // The invoking process rejects a bad date before it forwards, so one
         // can't arrive here; opening on today beats refusing to open at all.
-        window::open(app, date_util::parse_date_arg(&args).unwrap_or(None));
+        if background && app.active_window().is_none() {
+            window::start_background(app);
+        } else {
+            window::open(app, date_util::parse_date_arg(&args).unwrap_or(None));
+        }
         glib::ExitCode::SUCCESS
     });
     app.run()

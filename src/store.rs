@@ -17,6 +17,9 @@ pub struct Attendee {
     /// say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// This attendee represents the connected account's user.
+    #[serde(default)]
+    pub is_self: bool,
 }
 
 impl Attendee {
@@ -86,6 +89,9 @@ pub struct EventDraft {
     pub notes: Option<String>,
     pub recurrence: Option<Frequency>,
     pub reminder_minutes: Option<i64>,
+    /// Invitees to send with a remote event. Local calendars retain these as
+    /// event metadata but cannot deliver invitations.
+    pub attendees: Vec<Attendee>,
 }
 
 #[derive(Clone)]
@@ -710,6 +716,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_event_attendees(&self, id: i64, attendees: &[Attendee]) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE events SET attendees = ?1 WHERE id = ?2",
+            params![attendees_to_json(attendees), id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_event(&self, id: i64) -> rusqlite::Result<()> {
         self.conn
             .execute("DELETE FROM events WHERE id = ?1", params![id])?;
@@ -1243,6 +1257,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         }
     }
 
@@ -1483,11 +1498,13 @@ mod tests {
                 email: "ada@example.com".to_string(),
                 name: Some("Ada Lovelace".to_string()),
                 status: Some("accepted".to_string()),
+                is_self: false,
             },
             Attendee {
                 email: "bob@example.com".to_string(),
                 name: None,
                 status: None,
+                is_self: false,
             },
         ];
 

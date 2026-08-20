@@ -9,11 +9,17 @@
 //! The wording logic lives here as pure functions; the widget assembly below
 //! it is thin enough to verify by looking at it.
 
+use crate::event_dialog::RemoteEvent;
+use crate::store::Store;
 use crate::store::{Attendee, Event};
 use chrono::{Duration, NaiveDate};
 use gtk::gdk;
+use gtk::glib;
+use gtk::glib::clone;
 use gtk::prelude::*;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration as StdDuration;
 
 /// `Mon, Aug 10, 2026`
 const DATE_FORMAT: &str = "%a, %b %-d, %Y";
@@ -116,7 +122,14 @@ const POPOVER_WIDTH_CHARS: i32 = 34;
 /// one occurrence or a whole series, with a remote round trip either way — and
 /// that logic lives in the dialog. A second, simpler delete path would be the
 /// one that quietly gets a series wrong.
-pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, event: &Event, on_edit: Rc<dyn Fn(Event)>) {
+pub(crate) fn open(
+    anchor: &impl IsA<gtk::Widget>,
+    event: &Event,
+    on_edit: Rc<dyn Fn(Event)>,
+    store: Rc<Store>,
+    remote: Option<RemoteEvent>,
+    on_changed: Rc<dyn Fn()>,
+) {
     let popover = gtk::Popover::new();
     popover.set_autohide(true);
     popover.set_position(gtk::PositionType::Right);
@@ -183,6 +196,95 @@ pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, event: &Event, on_edit: Rc<dy
         if let Some(row) = detail_row("Attendees", Some(&names.join("\n"))) {
             content.append(&row);
         }
+    }
+
+    if remote
+        .as_ref()
+        .is_some_and(|remote| remote.can_respond(event))
+    {
+        let response_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let error = gtk::Label::new(None);
+        error.add_css_class("error");
+        error.set_wrap(true);
+        error.set_visible(false);
+        for (label, response) in [
+            ("Accept", "accepted"),
+            ("Maybe", "tentative"),
+            ("Decline", "declined"),
+        ] {
+            let button = gtk::Button::with_label(label);
+            let remote = remote
+                .clone()
+                .expect("response controls require a remote event");
+            let event = event.clone();
+            button.connect_clicked(clone!(
+                #[strong]
+                store,
+                #[strong]
+                on_changed,
+                #[strong]
+                error,
+                #[weak]
+                response_box,
+                move |_| {
+                    response_box.set_sensitive(false);
+                    error.set_visible(false);
+                    let event_for_worker = event.clone();
+                    let remote_for_worker = remote.clone();
+                    let (tx, rx) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = remote_for_worker.respond(&event_for_worker, response);
+                        let _ = tx.send(result);
+                    });
+                    let event = event.clone();
+                    glib::timeout_add_local(
+                        StdDuration::from_millis(100),
+                        clone!(
+                            #[strong]
+                            store,
+                            #[strong]
+                            on_changed,
+                            #[strong]
+                            error,
+                            #[strong]
+                            response_box,
+                            move || match rx.try_recv() {
+                                Ok(Ok(())) => {
+                                    let mut attendees = event.attendees.clone();
+                                    if let Some(me) = attendees.iter_mut().find(|attendee| {
+                                        attendee.is_self
+                                            || attendee.email.eq_ignore_ascii_case(
+                                                event.account_provider_id.as_deref().unwrap_or(""),
+                                            )
+                                    }) {
+                                        me.status = Some(response.to_string());
+                                    }
+                                    let _ = store.update_event_attendees(event.id, &attendees);
+                                    on_changed();
+                                    glib::ControlFlow::Break
+                                }
+                                Ok(Err(message)) => {
+                                    error.set_label(&message);
+                                    error.set_visible(true);
+                                    response_box.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                                Err(_) => {
+                                    error.set_label("The response stopped unexpectedly");
+                                    error.set_visible(true);
+                                    response_box.set_sensitive(true);
+                                    glib::ControlFlow::Break
+                                }
+                            }
+                        ),
+                    );
+                }
+            ));
+            response_box.append(&button);
+        }
+        content.append(&response_box);
+        content.append(&error);
     }
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -282,6 +384,7 @@ mod tests {
             email: email.to_string(),
             name: name.map(str::to_string),
             status: status.map(str::to_string),
+            is_self: false,
         }
     }
 

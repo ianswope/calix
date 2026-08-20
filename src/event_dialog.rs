@@ -172,6 +172,49 @@ fn caldav_credentials(
 }
 
 impl RemoteEvent {
+    pub fn can_respond(&self, event: &Event) -> bool {
+        match self {
+            Self::Google { .. } => event.attendees.iter().any(|attendee| attendee.is_self),
+            Self::Caldav { username, .. } => event
+                .attendees
+                .iter()
+                .any(|attendee| attendee.email.eq_ignore_ascii_case(username)),
+            Self::Unavailable(_) => false,
+        }
+    }
+
+    pub fn respond(&self, event: &Event, response: &str) -> Result<(), String> {
+        match self {
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                event_id,
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "Google account is not connected".to_string())?;
+                google::calendar_api::respond_to_event(
+                    &token,
+                    calendar_id,
+                    event_id,
+                    &event.attendees,
+                    response,
+                )
+            }
+            Self::Caldav {
+                base_url,
+                username,
+                token_key,
+                event_href,
+            } => {
+                let credentials = caldav_credentials(base_url, username, token_key)?;
+                caldav::respond_to_event(&credentials, event_href, username, response)
+            }
+            Self::Unavailable(error) => Err(error.clone()),
+        }
+    }
+
     pub fn update(&self, draft: &EventDraft) -> Result<(), String> {
         match self {
             Self::Unavailable(error) => Err(error.clone()),
@@ -339,6 +382,9 @@ pub fn open(
     let end_row = adw::EntryRow::new();
     let location_row = adw::EntryRow::builder().title("Location").build();
     let notes_row = adw::EntryRow::builder().title("Notes").build();
+    let invitees_row = adw::EntryRow::builder()
+        .title("Invitees (email addresses, comma separated)")
+        .build();
     // "Does not repeat" at index 0, then Frequency::ALL — matching
     // Frequency::picker_index / from_picker_index.
     let repeat_labels: Vec<&str> = std::iter::once("Does not repeat")
@@ -484,6 +530,9 @@ pub fn open(
     group.add(&alert_row);
     group.add(&location_row);
     group.add(&notes_row);
+    if editing.is_none() {
+        group.add(&invitees_row);
+    }
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_margin_top(18);
@@ -677,6 +726,16 @@ pub fn open(
                 notes: non_empty(notes_row.text().to_string()),
                 recurrence: Frequency::from_picker_index(repeat_row.selected()),
                 reminder_minutes: notify::from_picker_index(alert_row.selected()),
+                attendees: match editing.as_ref() {
+                    Some(event) => event.attendees.clone(),
+                    None => match parse_invitees(&invitees_row.text()) {
+                        Ok(invitees) => invitees,
+                        Err(message) => {
+                            error_label.set_label(&message);
+                            return;
+                        }
+                    },
+                },
             };
 
             let Some(event) = editing.as_ref() else {
@@ -689,6 +748,10 @@ pub fn open(
                     error_label.set_label("Choose a calendar");
                     return;
                 };
+                if !draft.attendees.is_empty() && !matches!(target, CreateTarget::Google { .. }) {
+                    error_label.set_label("Sending invitations is currently supported for Google calendars");
+                    return;
+                }
                 save_button.set_sensitive(false);
                 let remote_draft = draft.clone();
                 let (tx, rx) = mpsc::channel();
@@ -728,7 +791,12 @@ pub fn open(
                                 // A just-created event has no invitees — Calix
                                 // has no flow for sending invites.
                                 let result = if is_google {
-                                    store.upsert_google_event(target.calendar_id(), &remote_id, &draft, &[])
+                                    store.upsert_google_event(
+                                        target.calendar_id(),
+                                        &remote_id,
+                                        &draft,
+                                        &draft.attendees,
+                                    )
                                 } else {
                                     store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
                                 };
@@ -801,7 +869,10 @@ pub fn open(
                         #[strong]
                         error_label,
                         move || match rx.try_recv() {
-                            Ok(Ok(())) => match store.update_event(event_id, &draft) {
+                            Ok(Ok(())) => match store
+                                .update_event(event_id, &draft)
+                                .and_then(|()| store.update_event_attendees(event_id, &draft.attendees))
+                            {
                                 Ok(()) => {
                                     // "All events" moved every occurrence on the
                                     // server; only the clicked row moved locally.
@@ -943,6 +1014,35 @@ fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_invitees(value: &str) -> Result<Vec<crate::store::Attendee>, String> {
+    let mut invitees = Vec::new();
+    for address in value
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let valid = address.contains('@')
+            && !address.starts_with('@')
+            && !address.ends_with('@')
+            && !address.chars().any(char::is_whitespace);
+        if !valid {
+            return Err(format!("{address} is not a valid email address"));
+        }
+        if !invitees
+            .iter()
+            .any(|attendee: &crate::store::Attendee| attendee.email.eq_ignore_ascii_case(address))
+        {
+            invitees.push(crate::store::Attendee {
+                email: address.to_string(),
+                name: None,
+                status: Some("pending".to_string()),
+                is_self: false,
+            });
+        }
+    }
+    Ok(invitees)
 }
 
 fn event_links(event: &Event) -> Vec<String> {
@@ -1120,5 +1220,18 @@ mod tests {
                 "https://zoom.us/j/123"
             ]
         );
+    }
+
+    #[test]
+    fn invitee_addresses_are_trimmed_and_deduplicated() {
+        let invitees = parse_invitees("Ada@example.com, bob@example.com; ada@example.com").unwrap();
+        assert_eq!(invitees.len(), 2);
+        assert_eq!(invitees[0].email, "Ada@example.com");
+        assert_eq!(invitees[1].email, "bob@example.com");
+    }
+
+    #[test]
+    fn malformed_invitee_addresses_are_rejected() {
+        assert!(parse_invitees("not-an-address").is_err());
     }
 }

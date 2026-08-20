@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Invitations identified as belonging to the connected account can be accepted,
+  declined, or marked tentative from the event popover. Responses are written
+  back to Google Calendar and to CalDAV resources that expose a matching attendee.
+- New Google events can invite email addresses and ask Google to send updates.
+- Calix can start in the background at login so automatic sync and local event
+  alerts continue after its window closes. The option lives in the account center.
+
 ## 0.5.1 — 2026-08-20
 
 A fix release. In 0.5.0, Calix stopped syncing online accounts after the

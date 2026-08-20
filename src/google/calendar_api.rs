@@ -91,6 +91,8 @@ pub struct EventAttendee {
     /// invitee list.
     #[serde(default)]
     pub resource: bool,
+    #[serde(default, rename = "self")]
+    pub is_self: bool,
 }
 
 /// Maps Google's `responseStatus` onto the vocabulary [`Attendee`] stores, so
@@ -155,6 +157,7 @@ impl EventItem {
                         .filter(|name| !name.is_empty())
                         .map(str::to_owned),
                     status: normalize_response_status(attendee.response_status.as_deref()),
+                    is_self: attendee.is_self,
                 })
             })
             .collect()
@@ -273,14 +276,55 @@ pub fn update_event(
     event_id: &str,
     draft: &crate::store::EventDraft,
 ) -> Result<(), String> {
-    let url = event_url(calendar_id, event_id)?;
-    let body = GoogleEventPatch::from_draft(draft);
+    let mut url = event_url(calendar_id, event_id)?;
+    if !draft.attendees.is_empty() {
+        url.query_pairs_mut().append_pair("sendUpdates", "all");
+    }
+    let body = GoogleEventPatch::from_draft(draft, false);
     request_json(
         access_token,
         reqwest::Method::PATCH,
         url.as_str(),
         Some(&body),
     )
+}
+
+/// Changes only the signed-in user's reply while preserving every invitee.
+pub fn respond_to_event(
+    access_token: &str,
+    calendar_id: &str,
+    event_id: &str,
+    attendees: &[Attendee],
+    response: &str,
+) -> Result<(), String> {
+    let mut attendees = attendees.to_vec();
+    let Some(me) = attendees.iter_mut().find(|attendee| attendee.is_self) else {
+        return Err("Google did not identify your invitation on this event".to_string());
+    };
+    me.status = Some(response.to_string());
+    let url = event_url(calendar_id, event_id)?;
+    let body = serde_json::json!({
+        "attendees": attendees.iter().map(|attendee| serde_json::json!({
+            "email": attendee.email,
+            "displayName": attendee.name,
+            "responseStatus": attendee.status.as_deref().map(google_response_status).unwrap_or("needsAction")
+        })).collect::<Vec<_>>()
+    });
+    request_json(
+        access_token,
+        reqwest::Method::PATCH,
+        url.as_str(),
+        Some(&body),
+    )
+}
+
+fn google_response_status(status: &str) -> &str {
+    match status {
+        "accepted" => "accepted",
+        "declined" => "declined",
+        "tentative" => "tentative",
+        _ => "needsAction",
+    }
 }
 
 pub fn create_event(
@@ -294,9 +338,12 @@ pub fn create_event(
         .map_err(|_| "invalid calendar API base URL".to_string())?
         .push(calendar_id)
         .push("events");
+    if !draft.attendees.is_empty() {
+        url.query_pairs_mut().append_pair("sendUpdates", "all");
+    }
     let client = crate::http::client()?;
-    let body =
-        serde_json::to_string(&GoogleEventPatch::from_draft(draft)).map_err(|e| e.to_string())?;
+    let body = serde_json::to_string(&GoogleEventPatch::from_draft(draft, true))
+        .map_err(|e| e.to_string())?;
     let response = client
         .post(url)
         .bearer_auth(access_token)
@@ -367,10 +414,17 @@ struct GoogleEventPatch {
     // PATCH untouched). A recurring event sends `["RRULE:FREQ=…"]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     recurrence: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attendees: Vec<GoogleEventAttendeePatch>,
+}
+
+#[derive(Serialize)]
+struct GoogleEventAttendeePatch {
+    email: String,
 }
 
 impl GoogleEventPatch {
-    fn from_draft(draft: &crate::store::EventDraft) -> Self {
+    fn from_draft(draft: &crate::store::EventDraft, include_attendees: bool) -> Self {
         Self {
             summary: draft.title.clone(),
             location: draft.location.clone(),
@@ -380,6 +434,15 @@ impl GoogleEventPatch {
             recurrence: draft
                 .recurrence
                 .map(|freq| vec![format!("RRULE:{}", freq.to_rrule())]),
+            attendees: draft
+                .attendees
+                .iter()
+                .filter(|_| include_attendees)
+                .filter(|attendee| !attendee.is_self)
+                .map(|attendee| GoogleEventAttendeePatch {
+                    email: attendee.email.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -542,9 +605,10 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
-        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
 
         assert!(json["location"].is_null());
         assert!(json["description"].is_null());
@@ -562,14 +626,15 @@ mod tests {
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            attendees: Vec::new(),
         };
 
-        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
         assert_eq!(json["recurrence"], serde_json::json!(["RRULE:FREQ=WEEKLY"]));
 
         // A one-off event omits the field so its payload is unchanged.
         draft.recurrence = None;
-        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft)).unwrap();
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
         assert!(json.get("recurrence").is_none());
     }
 

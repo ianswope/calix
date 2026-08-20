@@ -849,8 +849,18 @@ impl Ui {
         };
         let on_edit: EditFn = {
             let open_dialog = open_dialog.clone();
+            let ui = self.clone();
             Rc::new(move |event: Event, anchor: gtk::Widget| {
-                event_popover::open(&anchor, &event, open_dialog.clone());
+                let remote = remote_event_handler(&ui, &event);
+                let ui_for_changed = ui.clone();
+                event_popover::open(
+                    &anchor,
+                    &event,
+                    open_dialog.clone(),
+                    ui.store.clone(),
+                    remote,
+                    Rc::new(move || ui_for_changed.reset()),
+                );
             })
         };
         let on_move = move_handler(self, events);
@@ -1012,12 +1022,18 @@ pub fn open(app: &adw::Application, date: Option<NaiveDate>) {
         }
         None => {
             LIVE_UI.with(|live| live.replace(None));
-            build(app, date);
+            build(app, date, true);
         }
     }
 }
 
-fn build(app: &adw::Application, date: Option<NaiveDate>) {
+pub fn start_background(app: &adw::Application) {
+    if LIVE_UI.with(|live| live.borrow().is_none()) {
+        build(app, None, false);
+    }
+}
+
+fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // Register the keyring store on the main thread before any sync worker
     // spawns, so the concurrent launch/resync threads don't race its lazy
     // initialization. See `icloud::credentials::prime_keyring_store`.
@@ -1477,17 +1493,20 @@ fn build(app: &adw::Application, date: Option<NaiveDate>) {
     ));
     window.add_breakpoint(compact);
 
-    window.present();
+    if show_window {
+        window.present();
+    }
 
     // With no remote accounts, make the next step visible without requiring
     // the user to discover the calendar sidebar first. Dismissing this leaves
     // local calendars fully usable; it returns on a later launch while there
     // are still no online accounts, matching the actual account state without
     // adding a speculative onboarding flag to storage.
-    if ui
-        .store
-        .all_accounts()
-        .is_ok_and(|accounts| accounts.is_empty())
+    if show_window
+        && ui
+            .store
+            .all_accounts()
+            .is_ok_and(|accounts| accounts.is_empty())
     {
         glib::idle_add_local_once(clone!(
             #[strong]
@@ -2101,6 +2120,7 @@ fn event_to_draft(event: &Event) -> EventDraft {
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        attendees: event.attendees.clone(),
     }
 }
 
@@ -2151,6 +2171,7 @@ fn moved_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        attendees: event.attendees.clone(),
     }
 }
 
@@ -2180,6 +2201,7 @@ fn resized_start_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        attendees: event.attendees.clone(),
     })
 }
 
@@ -2207,6 +2229,7 @@ fn resized_end_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        attendees: event.attendees.clone(),
     })
 }
 
@@ -2693,7 +2716,7 @@ fn show_startup_error(app: &adw::Application, error: &str, date: Option<NaiveDat
         app,
         move |_| {
             window.close();
-            build(&app, date);
+            build(&app, date, true);
         }
     ));
     open_folder.connect_clicked(move |_| {
@@ -2754,6 +2777,36 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
     content.set_margin_bottom(18);
     content.set_margin_start(18);
     content.set_margin_end(18);
+
+    let behavior = adw::PreferencesGroup::builder()
+        .title("Background behavior")
+        .build();
+    let background_alerts = adw::SwitchRow::builder()
+        .title("Start Calix when you sign in")
+        .subtitle("Keep calendar sync and event alerts working after the window is closed")
+        .active(crate::autostart::enabled())
+        .build();
+    let reverting_background_alerts = Rc::new(Cell::new(false));
+    background_alerts.connect_active_notify(clone!(
+        #[strong]
+        ui,
+        #[strong]
+        reverting_background_alerts,
+        move |row| {
+            if reverting_background_alerts.replace(false) {
+                return;
+            }
+            if let Err(error) = crate::autostart::set_enabled(row.is_active()) {
+                reverting_background_alerts.set(true);
+                row.set_active(!row.is_active());
+                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Could not update background startup: {error}"
+                )));
+            }
+        }
+    ));
+    behavior.add(&background_alerts);
+    content.append(&behavior);
 
     let accounts = ui.store.all_accounts().unwrap_or_default();
     if accounts.is_empty() {
