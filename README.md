@@ -1,20 +1,60 @@
 # Calix
 
 [![CI](https://github.com/ianswope/calix/actions/workflows/ci.yml/badge.svg)](https://github.com/ianswope/calix/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/ianswope/calix)](https://github.com/ianswope/calix/releases/latest)
 
-A calendar app for Linux, built after moving to [Omarchy](https://omarchy.org/) and wanting the kind of native calendar experience I had on a Mac. [GNOME Calendar](https://apps.gnome.org/Calendar/) doesn't cut it, and Apple Calendar isn't an option here. Native GTK4 + libadwaita, swipeable month/week views, and direct sync with Google, Apple/iCloud, and any CalDAV calendar.
+A fast, native calendar for Linux with a clean GTK4 interface and direct sync
+for Google Calendar, Apple iCloud, Fastmail, Nextcloud, and other CalDAV
+services.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/month-dark.png">
   <img alt="Calix month view" src="docs/screenshots/month.png">
 </picture>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/week-dark.png">
-  <img alt="Calix week view" src="docs/screenshots/week.png">
-</picture>
+Calix keeps the essentials close: year, month, week, and day views; local and
+synced calendars; quick event creation; search; reminders; and direct
+drag-to-move or resize. On [Omarchy](https://omarchy.org/), it automatically
+adopts the active theme's colors.
 
-**Status: early days.** The swipeable month/week/day grid works, events are stored locally (SQLite) with create/edit/delete, and Google, iCloud, and generic CalDAV sync can pull calendars from multiple accounts into the grid. Connected calendars can be shown/hidden from the calendar sidebar. Events can be created by clicking or right-clicking anywhere on the grid, on local, Google, iCloud, or CalDAV calendars; synced events can be edited or deleted. Events drag to another day in the month grid, and move or resize directly in the week/day grid with a snapped live preview — including synced events, which push the change back to the source. Grid text steps down a size when the window is narrow. On [Omarchy](https://omarchy.org/), Calix picks up the active theme's colors automatically, so it matches the rest of the desktop.
+## Connect your calendars without editing config files
+
+Choose your service inside Calix. Known providers ask only for the details they
+need, credentials stay in your system keyring, and calendars refresh
+automatically after connection.
+
+![Calix welcome screen with choices for Google Calendar, Apple iCloud, Fastmail, Nextcloud, and other calendar servers](docs/ux-audit/01-first-launch.png)
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/ux-audit/02-google-setup.png" alt="Google Calendar setup inside Calix">
+    </td>
+    <td width="50%">
+      <img src="docs/ux-audit/04-icloud-setup.png" alt="Apple iCloud setup inside Calix">
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Google setup stays in the app</strong></td>
+    <td align="center"><strong>iCloud includes the steps you need</strong></td>
+  </tr>
+</table>
+
+Connected accounts have visible sync health and straightforward actions to
+retry, update credentials, or disconnect. If local storage cannot be opened,
+Calix protects the data and offers recovery and diagnostic actions instead of
+silently failing.
+
+<details>
+  <summary><strong>See the week view</strong></summary>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/week-dark.png">
+    <img alt="Calix week view" src="docs/screenshots/week.png">
+  </picture>
+</details>
+
+See [what changed in Calix 0.5.0](CHANGELOG.md).
 
 ## Install (recommended)
 
