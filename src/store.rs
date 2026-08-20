@@ -158,9 +158,13 @@ impl Store {
         std::fs::create_dir_all(directory).map_err(sqlite_io_error)?;
         set_owner_only_permissions(directory, 0o700).map_err(sqlite_io_error)?;
 
-        let store = Self::from_connection(Connection::open(&path)?)?;
+        let connection = Connection::open(&path)?;
+        // Tightened before the first write, not after it: SQLite copies the
+        // database file's mode onto the -wal and -shm it creates, and those hold
+        // real event data. Chmodding after `from_connection` ran the migrations
+        // left both of them at whatever the umask allowed.
         set_owner_only_permissions(&path, 0o600).map_err(sqlite_io_error)?;
-        Ok(store)
+        Self::from_connection(connection)
     }
 
     #[cfg(test)]

@@ -56,33 +56,12 @@ impl Provider {
         }
     }
 
-    pub fn add_label(&self) -> String {
-        format!("Add {}", self.label)
-    }
-
-    pub fn sync_label(&self) -> String {
-        format!("Sync {}", self.label)
-    }
-
-    /// The sync button's tooltip. Before any account is connected the first
-    /// sync is what discovers the calendars, so it's described differently.
-    pub fn sync_tooltip(&self, has_accounts: bool) -> String {
-        if has_accounts {
-            format!(
-                "Fetch the latest events from connected {} accounts",
-                self.label
-            )
-        } else {
-            format!("Fetch calendars from connected {} accounts", self.label)
-        }
-    }
-
-    /// Shown when Sync is pressed with nothing connected.
+    /// Shown when a sync is asked for with nothing connected. There is one
+    /// account entry point now, so it is named rather than a per-provider Add.
     pub fn none_connected(&self) -> String {
         format!(
-            "No {} accounts connected. Use {} first.",
-            self.label,
-            self.add_label()
+            "No {} accounts connected. Use Connect an account first.",
+            self.label
         )
     }
 
@@ -111,36 +90,16 @@ mod tests {
     }
 
     #[test]
-    fn the_button_labels_read_as_they_always_have() {
-        assert_eq!(GOOGLE.add_label(), "Add Google");
-        assert_eq!(GOOGLE.sync_label(), "Sync Google");
-        assert_eq!(ICLOUD.add_label(), "Add iCloud");
-        assert_eq!(ICLOUD.sync_label(), "Sync iCloud");
-        assert_eq!(CALDAV.add_label(), "Add CalDAV");
-        assert_eq!(CALDAV.sync_label(), "Sync CalDAV");
-    }
-
-    #[test]
-    fn the_sync_tooltip_distinguishes_a_first_sync_from_a_refresh() {
-        assert_eq!(
-            GOOGLE.sync_tooltip(true),
-            "Fetch the latest events from connected Google accounts"
-        );
-        assert_eq!(
-            GOOGLE.sync_tooltip(false),
-            "Fetch calendars from connected Google accounts"
-        );
-    }
-
-    #[test]
-    fn the_nothing_connected_message_points_at_the_add_button_by_name() {
+    fn the_nothing_connected_message_points_at_the_one_connect_action() {
+        // The per-provider Add buttons these used to name are gone; a message
+        // telling someone to press a button that isn't there is worse than none.
         assert_eq!(
             ICLOUD.none_connected(),
-            "No iCloud accounts connected. Use Add iCloud first."
+            "No iCloud accounts connected. Use Connect an account first."
         );
         assert_eq!(
             CALDAV.none_connected(),
-            "No CalDAV accounts connected. Use Add CalDAV first."
+            "No CalDAV accounts connected. Use Connect an account first."
         );
     }
 
