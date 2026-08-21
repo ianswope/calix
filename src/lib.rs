@@ -103,9 +103,12 @@ pub fn run() -> gtk::glib::ExitCode {
         .application_id(APP_ID)
         .flags(flags)
         .build();
-    // Calix is also the lightweight alert process. Closing its window leaves
-    // sync and reminder timers alive; an explicit application quit still ends it.
-    let _background_hold = app.hold();
+    // Calix doubles as the lightweight alert process, but only when it was
+    // asked to: a login launch, or the autostart option being on, keeps sync
+    // and reminder timers alive after the window closes. An ordinary launch
+    // still exits with its window, and `app.quit` ends either one.
+    let _background_hold =
+        autostart::keeps_running_without_a_window(&args, autostart::enabled()).then(|| app.hold());
     app.connect_startup(|app| {
         style::load();
         let quit = gio::SimpleAction::new("quit", None);
@@ -123,7 +126,7 @@ pub fn run() -> gtk::glib::ExitCode {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let background = args.iter().any(|arg| arg == "--gapplication-service");
+        let background = autostart::is_background_launch(&args);
         // The invoking process rejects a bad date before it forwards, so one
         // can't arrive here; opening on today beats refusing to open at all.
         if background && app.active_window().is_none() {
