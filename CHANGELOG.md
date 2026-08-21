@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-08-21
+
+Calix can now answer invitations, invite people to new Google events,
+and keep syncing and alerting after its window closes.
 
 ### Added
 

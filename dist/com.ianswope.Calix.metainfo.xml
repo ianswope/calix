@@ -54,6 +54,20 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.6.0" date="2026-08-21">
+      <description>
+        <p>
+          Invitations can be accepted, declined, or marked tentative from the
+          event popover. The response is written back to Google Calendar and to
+          CalDAV servers that expose a matching attendee.
+        </p>
+        <p>
+          New Google events can invite email addresses, and Calix can start in
+          the background at login so automatic sync and event alerts continue
+          after its window closes.
+        </p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-08-20">
       <description>
         <p>
