@@ -25,6 +25,7 @@ pub mod provider;
 pub mod recurrence;
 pub mod store;
 pub mod sync;
+pub mod undo;
 pub mod xdg;
 
 #[cfg(feature = "gui")]

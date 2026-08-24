@@ -79,7 +79,10 @@ pub struct Event {
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
 /// separately since callers building this don't yet know or can't change
 /// them.
-#[derive(Clone)]
+///
+/// `PartialEq` is what lets undo tell "the row still holds what I wrote" from
+/// "something changed it since" — see [`crate::undo`].
+#[derive(Clone, Debug, PartialEq)]
 pub struct EventDraft {
     pub title: String,
     pub start: DateTime<Local>,
@@ -92,6 +95,25 @@ pub struct EventDraft {
     /// Invitees to send with a remote event. Local calendars retain these as
     /// event metadata but cannot deliver invitations.
     pub attendees: Vec<Attendee>,
+}
+
+impl Event {
+    /// This event's editable fields, as a draft that would rewrite it
+    /// unchanged. The seam between a stored row and a write of that row: undo
+    /// compares against it, and an edit starts from it.
+    pub fn draft(&self) -> EventDraft {
+        EventDraft {
+            title: self.title.clone(),
+            start: self.start,
+            end: self.end,
+            all_day: self.all_day,
+            location: self.location.clone(),
+            notes: self.notes.clone(),
+            recurrence: self.recurrence,
+            reminder_minutes: self.reminder_minutes,
+            attendees: self.attendees.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -174,7 +196,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn open_in_memory() -> rusqlite::Result<Self> {
+    pub(crate) fn open_in_memory() -> rusqlite::Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
@@ -745,12 +767,15 @@ impl Store {
         google_event_id: &str,
         draft: &EventDraft,
         attendees: &[Attendee],
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
+    ) -> rusqlite::Result<i64> {
+        // `RETURNING` rather than `last_insert_rowid`, which says nothing useful
+        // when the upsert took the update branch.
+        self.conn.query_row(
             "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id, attendees, reminder_minutes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(calendar_id, google_event_id) WHERE google_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9
+             RETURNING id",
             params![
                 calendar_id,
                 draft.title,
@@ -763,8 +788,8 @@ impl Store {
                 attendees_to_json(attendees),
                 draft.reminder_minutes,
             ],
-        )?;
-        Ok(())
+            |row| row.get(0),
+        )
     }
 
     /// Creates or updates a CalDAV-sourced event by its href. Handles
@@ -776,12 +801,13 @@ impl Store {
         icloud_event_id: &str,
         draft: &EventDraft,
         attendees: &[Attendee],
-    ) -> rusqlite::Result<()> {
-        self.conn.execute(
+    ) -> rusqlite::Result<i64> {
+        self.conn.query_row(
             "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id, attendees, reminder_minutes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9
+             RETURNING id",
             params![
                 calendar_id,
                 draft.title,
@@ -794,8 +820,8 @@ impl Store {
                 attendees_to_json(attendees),
                 draft.reminder_minutes,
             ],
-        )?;
-        Ok(())
+            |row| row.get(0),
+        )
     }
 
     /// Removes previously-synced events for `calendar_id` that are no
@@ -1476,6 +1502,65 @@ mod tests {
         // race itself if the dialog is reopened.
         store.delete_account(id).unwrap();
         assert!(store.all_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upserting_a_synced_event_reports_the_row_it_wrote() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account("me@example.com", "me@example.com", "token-key")
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-1", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 8, 24, 9, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        let written = draft("Standup", start, start + Duration::hours(1));
+
+        // Undo needs the row id of an event created on a provider, or taking
+        // back that create would reach for some older change instead.
+        let id = store
+            .upsert_google_event(calendar_id, "evt-1", &written, &[])
+            .expect("the event to store");
+        assert_eq!(
+            store.event_by_id(id).unwrap().map(|event| event.title),
+            Some("Standup".to_string())
+        );
+
+        let again = store
+            .upsert_google_event(calendar_id, "evt-1", &written, &[])
+            .expect("the upsert to run again");
+        assert_eq!(again, id, "the second upsert updates the same row");
+    }
+
+    #[test]
+    fn a_draft_taken_back_off_a_stored_event_matches_what_was_written() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 8, 24, 9, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        let mut written = draft("Standup", start, start + Duration::hours(1));
+        written.location = Some("Room 2".to_string());
+        written.notes = Some("bring the laptop".to_string());
+        written.reminder_minutes = Some(15);
+        written.recurrence = Some(Frequency::Weekly);
+        // Attendees are deliberately left out: they are written separately by
+        // `update_event_attendees` so that editing an event can't wipe what a
+        // provider synced. See the attendee round-trip test below.
+
+        let id = store.create_event(1, &written).expect("the event to store");
+        let stored = store
+            .event_by_id(id)
+            .expect("the query to run")
+            .expect("the row just written");
+
+        // Undo decides whether a row still holds what it wrote by comparing
+        // the fields an edit owns, so a round trip that changed any of them
+        // would make every undo refuse itself as stale.
+        assert_eq!(stored.draft(), written);
     }
 
     #[test]

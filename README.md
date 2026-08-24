@@ -297,6 +297,8 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - [x] Drag across empty grid space to create an event spanning that range
 - [x] Right-click to create an event at a specific spot
 - [x] Event inspector popover on click, with the edit dialog one button away
+- [x] Undo/redo for creating, editing, moving and deleting a single event (Ctrl+Z, Ctrl+Shift+Z)
+- [ ] Undo for restoring an event deleted from a synced calendar, and for whole-series edits
 - [x] Keyboard shortcuts for view switching, navigation, today, and new event
 - [x] Match the active Omarchy theme's colors automatically
 - [x] Recurring event creation (daily/weekly/monthly/yearly), expanded on the grid

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Undo and redo. **Ctrl+Z** takes back creating, editing, moving, resizing or
+  deleting an event; **Ctrl+Shift+Z** (or Ctrl+Y) puts it back. Changes on
+  synced calendars are undone on the provider too, so the next sync doesn't
+  quietly reverse them.
+- An undo only applies while the event still holds what the change wrote. If
+  something else has edited it since — including a sync, or an invitation
+  response arriving — Calix says so and leaves the newer version alone.
+
+### Known gaps
+
+- An event deleted from a synced calendar can't be restored yet; Calix says so
+  rather than putting back a local row the next sync would delete again.
+- Whole-series operations ("All events", and creating a repeating event) are not
+  recorded, since reversing one means rewriting the provider's recurrence rule.
+
 ## 0.6.0 — 2026-08-21
 
 Calix can now answer invitations, invite people to new Google events,

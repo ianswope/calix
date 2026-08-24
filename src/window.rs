@@ -13,6 +13,7 @@ use crate::provider::{self, Provider};
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
+use crate::undo;
 use crate::views::{drag::DragKind, month_view, week_view, year_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
@@ -32,6 +33,8 @@ use std::time::Duration;
 /// display to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyCommand {
+    Undo,
+    Redo,
     Today,
     Previous,
     Next,
@@ -64,6 +67,18 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
         return None;
     }
     match key {
+        // Shift is meaningful for exactly this pair, because Ctrl+Shift+Z is
+        // the redo chord everyone arrives with. It is read off the modifier
+        // rather than the uppercase keyval so a stuck Lock key can't reverse
+        // the command — see `caps_lock_does_not_turn_an_undo_into_a_redo`.
+        gdk::Key::z | gdk::Key::Z => {
+            if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                Some(KeyCommand::Redo)
+            } else {
+                Some(KeyCommand::Undo)
+            }
+        }
+        gdk::Key::y | gdk::Key::Y => Some(KeyCommand::Redo),
         // Numbered left-to-right as the header's toggles read, so the digit
         // matches what the eye sees. Apple numbers by its View menu instead,
         // which would put Day on Ctrl+1 while Month sits leftmost on screen.
@@ -430,6 +445,190 @@ struct Ui {
     // plumbing reports in-flight state through it, and because a widget the
     // `Ui` owns is a widget that is still alive when a callback runs.
     refresh_accounts_button: gtk::Button,
+    // What the user has done and can take back, for this window's lifetime.
+    // Not persisted: an undo describes a write against a row as it stood, and
+    // after a restart the provider has usually moved on.
+    history: Rc<RefCell<undo::History>>,
+    // A remote undo is a round trip, and the change stays on the stack until it
+    // lands. Without this a second Ctrl+Z during that window would try the same
+    // change again and double-write it.
+    history_busy: Rc<Cell<bool>>,
+}
+
+/// Which way through the history one keypress goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryStep {
+    Undo,
+    Redo,
+}
+
+impl HistoryStep {
+    fn nothing_to_do(self) -> &'static str {
+        match self {
+            Self::Undo => "Nothing to undo",
+            Self::Redo => "Nothing to redo",
+        }
+    }
+
+    /// What to say when the row no longer holds what the change wrote.
+    fn changed_since(self) -> &'static str {
+        match self {
+            Self::Undo => "That event has changed since — there's nothing to take back",
+            Self::Redo => "That event has changed since — that change can't be put back",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Undo => "undo that",
+            Self::Redo => "redo that",
+        }
+    }
+}
+
+impl Ui {
+    fn toast(&self, message: &str) {
+        self.toast_overlay.add_toast(adw::Toast::new(message));
+    }
+
+    /// Takes back the last change the user made, or puts it back again.
+    ///
+    /// The decisions all live in [`undo`]: this reads the row as it stands,
+    /// asks for the write that reverses the change, and carries it out — on the
+    /// provider first when the event lives on one, because a local-only undo
+    /// would be quietly reverted by the next sync.
+    fn step_history(self: &Rc<Self>, step: HistoryStep) {
+        if self.history_busy.get() {
+            return;
+        }
+        let change = {
+            let history = self.history.borrow();
+            match step {
+                HistoryStep::Undo => history.peek_undo().cloned(),
+                HistoryStep::Redo => history.peek_redo().cloned(),
+            }
+        };
+        let Some(change) = change else {
+            self.toast(step.nothing_to_do());
+            return;
+        };
+        let current = change
+            .id
+            .and_then(|id| self.store.event_by_id(id).ok().flatten());
+        let current_draft = current.as_ref().map(store::Event::draft);
+        let write = match step {
+            HistoryStep::Undo => change.undo(current_draft.as_ref()),
+            HistoryStep::Redo => change.redo(current_draft.as_ref()),
+        };
+        let Ok(write) = write else {
+            self.discard(step);
+            self.toast(step.changed_since());
+            return;
+        };
+        if undo::needs_a_remote_create(&write, self.calendar_is_local(change.calendar_id)) {
+            self.discard(step);
+            self.toast("Calix can't put a synced event back on its calendar yet");
+            return;
+        }
+        self.apply_history_write(step, write, current);
+    }
+
+    /// Drops a change that can no longer be applied, so the next keypress
+    /// reaches the one behind it instead of retrying this one forever.
+    fn discard(self: &Rc<Self>, step: HistoryStep) {
+        let mut history = self.history.borrow_mut();
+        match step {
+            HistoryStep::Undo => history.discard_undo(),
+            HistoryStep::Redo => history.discard_redo(),
+        }
+    }
+
+    fn calendar_is_local(&self, calendar_id: i64) -> bool {
+        self.store
+            .local_calendars()
+            .is_ok_and(|calendars| calendars.iter().any(|calendar| calendar.id == calendar_id))
+    }
+
+    /// Sends the write to the provider when there is one, then to SQLite.
+    fn apply_history_write(
+        self: &Rc<Self>,
+        step: HistoryStep,
+        write: undo::Write,
+        current: Option<Event>,
+    ) {
+        let remote = current
+            .as_ref()
+            .and_then(|event| remote_event_handler(self, event));
+        let remote = match remote {
+            // The account is in no state to be written to. Leave the change on
+            // the stack: reconnecting makes it applicable again.
+            Some(event_dialog::RemoteEvent::Unavailable(error)) => {
+                self.toast(&error);
+                return;
+            }
+            Some(remote) => remote,
+            None => {
+                self.commit_history_write(step, &write);
+                return;
+            }
+        };
+        let call: Box<dyn FnOnce() -> Result<(), String> + Send> = match &write {
+            undo::Write::Update { draft, .. } => {
+                let draft = draft.clone();
+                Box::new(move || remote.update(&draft))
+            }
+            undo::Write::Delete { .. } => Box::new(move || remote.delete()),
+            // Refused before we got here — restoring onto a provider would
+            // need a remote create.
+            undo::Write::Insert { .. } => return,
+        };
+        self.history_busy.set(true);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(call());
+        });
+        let ui = self.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+            Ok(Ok(())) => {
+                ui.history_busy.set(false);
+                ui.commit_history_write(step, &write);
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                ui.history_busy.set(false);
+                ui.toast(&format!("Couldn't {}: {error}", step.verb()));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                ui.history_busy.set(false);
+                ui.toast("That change stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
+    /// Writes to SQLite and moves the change to the other stack, carrying the
+    /// id the row has now — a restored row comes back with a new one.
+    fn commit_history_write(self: &Rc<Self>, step: HistoryStep, write: &undo::Write) {
+        match undo::apply(&self.store, write) {
+            Ok(id) => {
+                let mut history = self.history.borrow_mut();
+                match step {
+                    HistoryStep::Undo => history.commit_undo(id),
+                    HistoryStep::Redo => history.commit_redo(id),
+                }
+                drop(history);
+                self.reset();
+            }
+            Err(error) => self.toast(&format!("Couldn't {}: {error}", step.verb())),
+        }
+    }
+
+    /// Remembers a change the user just made, so it can be taken back.
+    fn record(&self, change: undo::Change) {
+        self.history.borrow_mut().record(change);
+    }
 }
 
 impl Ui {
@@ -800,6 +999,7 @@ impl Ui {
             Rc::new(
                 move |start: DateTime<Local>, end: Option<DateTime<Local>>| {
                     let ui_for_saved = ui.clone();
+                    let ui_for_change = ui.clone();
                     event_dialog::open(
                         &ui.carousel,
                         ui.store.clone(),
@@ -808,6 +1008,7 @@ impl Ui {
                         start,
                         end,
                         move |saved| ui_for_saved.apply_saved(saved),
+                        move |change| ui_for_change.record(change),
                         None,
                     );
                 },
@@ -834,6 +1035,7 @@ impl Ui {
                 };
                 let start = event.start;
                 let ui_for_saved = ui.clone();
+                let ui_for_change = ui.clone();
                 let remote_event = remote_event_handler(&ui, &event);
                 event_dialog::open(
                     &ui.carousel,
@@ -843,6 +1045,7 @@ impl Ui {
                     start,
                     None,
                     move |saved| ui_for_saved.apply_saved(saved),
+                    move |change| ui_for_change.record(change),
                     remote_event,
                 );
             })
@@ -1093,6 +1296,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         zoom_dirty: Rc::new(Cell::new(false)),
         activity: Rc::new(AccountActivity::default()),
         refresh_accounts_button: refresh_accounts_button.clone(),
+        history: Rc::new(RefCell::new(undo::History::default())),
+        history_busy: Rc::new(Cell::new(false)),
     });
 
     LIVE_UI.with(|live| live.replace(Some(ui.clone())));
@@ -1253,6 +1458,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         move |_| {
             let start = next_half_hour();
             let ui2 = ui.clone();
+            let ui_for_change = ui.clone();
             event_dialog::open(
                 &ui.carousel,
                 ui.store.clone(),
@@ -1261,6 +1467,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 start,
                 None,
                 move |saved| ui2.apply_saved(saved),
+                move |change| ui_for_change.record(change),
                 None,
             );
         }
@@ -1432,6 +1639,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // The controller stays on the default (bubble) phase, so a focused entry
     // sees the key first and only unclaimed presses reach here.
     let key_controller = gtk::EventControllerKey::new();
+    let ui_for_keys = ui.clone();
     key_controller.connect_key_pressed(clone!(
         #[strong]
         today_button,
@@ -1456,6 +1664,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 return glib::Propagation::Proceed;
             };
             match command {
+                KeyCommand::Undo => ui_for_keys.step_history(HistoryStep::Undo),
+                KeyCommand::Redo => ui_for_keys.step_history(HistoryStep::Redo),
                 KeyCommand::Today => today_button.emit_clicked(),
                 KeyCommand::Previous => prev_button.emit_clicked(),
                 KeyCommand::Next => next_button.emit_clicked(),
@@ -2012,7 +2222,7 @@ fn move_handler(
             ));
             return;
         };
-        let original = event_to_draft(&event);
+        let original = event.draft();
         match remote_event_handler(&ui, &event) {
             Some(event_dialog::RemoteEvent::Unavailable(error)) => {
                 ui.toast_overlay.add_toast(adw::Toast::new(&error));
@@ -2037,7 +2247,15 @@ fn move_handler(
                         #[strong]
                         ui,
                         move || match rx.try_recv() {
-                            Ok(Ok(())) => glib::ControlFlow::Break,
+                            Ok(Ok(())) => {
+                                ui.record(undo::Change::edited(
+                                    event.calendar_id,
+                                    event.id,
+                                    original.clone(),
+                                    draft.clone(),
+                                ));
+                                glib::ControlFlow::Break
+                            }
                             Ok(Err(error)) => {
                                 undo_failed_drag(&ui, event.id, &draft, &original);
                                 ui.toast_overlay.add_toast(adw::Toast::new(&format!(
@@ -2061,6 +2279,12 @@ fn move_handler(
                     ui.toast_overlay
                         .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
                 } else {
+                    ui.record(undo::Change::edited(
+                        event.calendar_id,
+                        event.id,
+                        original,
+                        draft,
+                    ));
                     ui.reset();
                 }
             }
@@ -2106,22 +2330,8 @@ fn undo_drag(
         start: original.start,
         end: original.end,
         all_day: original.all_day,
-        ..event_to_draft(current)
+        ..current.draft()
     })
-}
-
-fn event_to_draft(event: &Event) -> EventDraft {
-    EventDraft {
-        title: event.title.clone(),
-        start: event.start,
-        end: event.end,
-        all_day: event.all_day,
-        location: event.location.clone(),
-        notes: event.notes.clone(),
-        recurrence: event.recurrence,
-        reminder_minutes: event.reminder_minutes,
-        attendees: event.attendees.clone(),
-    }
 }
 
 fn drag_draft(
@@ -3944,6 +4154,32 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_z_undoes_and_the_two_usual_redo_chords_redo() {
+        assert_eq!(key_command(gdk::Key::z, CTRL), Some(KeyCommand::Undo));
+        assert_eq!(
+            key_command(gdk::Key::Z, CTRL | gdk::ModifierType::SHIFT_MASK),
+            Some(KeyCommand::Redo),
+            "Ctrl+Shift+Z is the chord people arrive with"
+        );
+        assert_eq!(
+            key_command(gdk::Key::y, CTRL),
+            Some(KeyCommand::Redo),
+            "and Ctrl+Y is the other one"
+        );
+    }
+
+    #[test]
+    fn caps_lock_does_not_turn_an_undo_into_a_redo() {
+        // Lock produces the uppercase keyval with no Shift held, so reading the
+        // case instead of the modifier would let a stuck lock key silently
+        // reverse the command.
+        assert_eq!(
+            key_command(gdk::Key::Z, CTRL | gdk::ModifierType::LOCK_MASK),
+            Some(KeyCommand::Undo)
+        );
+    }
+
+    #[test]
     fn a_chord_carrying_alt_or_super_is_not_ours() {
         for extra in [gdk::ModifierType::ALT_MASK, gdk::ModifierType::SUPER_MASK] {
             assert_eq!(
@@ -3972,7 +4208,7 @@ mod tests {
     #[test]
     fn an_unbound_key_is_ignored() {
         assert_eq!(key_command(gdk::Key::_9, CTRL), None);
-        assert_eq!(key_command(gdk::Key::z, CTRL), None);
+        assert_eq!(key_command(gdk::Key::k, CTRL), None);
     }
 
     fn local_midnight(year: i32, month: u32, day: u32) -> DateTime<Local> {
@@ -4016,16 +4252,9 @@ mod tests {
 
     /// A drag from 09:00 to 11:00, with the row as it stands afterwards.
     fn drag_fixture() -> (EventDraft, EventDraft, Event) {
-        let original = event_to_draft(&test_event(
-            local_at(2026, 7, 9, 9),
-            local_at(2026, 7, 9, 10),
-            false,
-        ));
-        let optimistic = event_to_draft(&test_event(
-            local_at(2026, 7, 9, 11),
-            local_at(2026, 7, 9, 12),
-            false,
-        ));
+        let original = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 10), false).draft();
+        let optimistic =
+            test_event(local_at(2026, 7, 9, 11), local_at(2026, 7, 9, 12), false).draft();
         let current = test_event(local_at(2026, 7, 9, 11), local_at(2026, 7, 9, 12), false);
         (original, optimistic, current)
     }

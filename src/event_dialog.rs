@@ -5,6 +5,7 @@ use crate::icloud;
 use crate::notify;
 use crate::recurrence::Frequency;
 use crate::store::{Event, EventDraft, Store};
+use crate::undo;
 use adw::prelude::*;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use gtk::glib;
@@ -270,7 +271,7 @@ impl RemoteEvent {
         }
     }
 
-    fn delete(&self) -> Result<(), String> {
+    pub fn delete(&self) -> Result<(), String> {
         match self {
             Self::Unavailable(error) => Err(error.clone()),
             Self::Google {
@@ -338,9 +339,13 @@ pub fn open(
     // Called once a save, delete or create has landed, with what the local cache
     // is worth afterwards — see [`Saved`].
     on_saved: impl Fn(Saved) + 'static,
+    // Called with the change the user just made, for the undo history. Only
+    // single-event operations report one: see [`crate::undo`].
+    on_change: impl Fn(undo::Change) + 'static,
     remote_event: Option<RemoteEvent>,
 ) {
     let on_saved = Rc::new(on_saved);
+    let on_change = Rc::new(on_change);
 
     // The calendar picker starts with just the default set (sidebar-visible
     // calendars) and expands via a trailing "Show all calendars…" item.
@@ -553,6 +558,8 @@ pub fn open(
 
     if let Some(event) = &editing {
         let event_id = event.id;
+        // What deleting takes away, kept so an undo can put it back.
+        let deleted = undo::Change::deleted(event.calendar_id, event.draft());
         let delete_button = gtk::Button::builder()
             .label("Delete Event")
             .css_classes(["destructive-action"])
@@ -564,6 +571,10 @@ pub fn open(
             store,
             #[strong]
             on_saved,
+            #[strong]
+            on_change,
+            #[strong]
+            deleted,
             #[strong]
             remote_event,
             #[strong]
@@ -597,12 +608,19 @@ pub fn open(
                             #[strong]
                             on_saved,
                             #[strong]
+                            on_change,
+                            #[strong]
+                            deleted,
+                            #[strong]
                             delete_button,
                             #[strong]
                             error_label,
                             move || match rx.try_recv() {
                                 Ok(Ok(())) => match store.delete_event(event_id) {
                                     Ok(()) => {
+                                        if !all_events {
+                                            on_change(deleted.clone());
+                                        }
                                         // Deleting a whole remote series takes one
                                         // cached occurrence with it; the rest are
                                         // separate rows only a sync can prune.
@@ -635,6 +653,7 @@ pub fn open(
                 } else {
                     match store.delete_event(event_id) {
                         Ok(()) => {
+                            on_change(deleted.clone());
                             on_saved(Saved::Cached);
                             dialog.close();
                         }
@@ -769,12 +788,19 @@ pub fn open(
                         #[strong]
                         on_saved,
                         #[strong]
+                        on_change,
+                        #[strong]
                         save_button,
                         #[strong]
                         error_label,
                         move || match rx.try_recv() {
                             Ok(Ok(None)) => match store.create_event(target.calendar_id(), &draft) {
-                                Ok(_) => {
+                                Ok(id) => {
+                                    on_change(undo::Change::created(
+                                        target.calendar_id(),
+                                        id,
+                                        draft.clone(),
+                                    ));
                                     on_saved(Saved::Cached);
                                     dialog.close();
                                     glib::ControlFlow::Break
@@ -801,7 +827,19 @@ pub fn open(
                                     store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
                                 };
                                 match result {
-                                    Ok(()) => {
+                                    Ok(id) => {
+                                        // A repeat is a series operation: the
+                                        // cached row is one occurrence of what
+                                        // the server built, so taking it back is
+                                        // not a single-row write and isn't
+                                        // recorded.
+                                        if draft.recurrence.is_none() {
+                                            on_change(undo::Change::created(
+                                                target.calendar_id(),
+                                                id,
+                                                draft.clone(),
+                                            ));
+                                        }
                                         // A recurring event was created on the
                                         // server as a series; the row just cached
                                         // is one occurrence of it.
@@ -841,6 +879,8 @@ pub fn open(
             if let Some(remote_event) = remote_event.clone() {
                 save_button.set_sensitive(false);
                 let event_id = event.id;
+                let edited_from = event.draft();
+                let edited_calendar = event.calendar_id;
                 // "All events" shifts the series by however far this occurrence's
                 // start moved; anything else edits just this occurrence.
                 let all_events = scope_row.selected() == 1;
@@ -865,6 +905,8 @@ pub fn open(
                         #[strong]
                         on_saved,
                         #[strong]
+                        on_change,
+                        #[strong]
                         save_button,
                         #[strong]
                         error_label,
@@ -874,6 +916,14 @@ pub fn open(
                                 .and_then(|()| store.update_event_attendees(event_id, &draft.attendees))
                             {
                                 Ok(()) => {
+                                    if !all_events {
+                                        on_change(undo::Change::edited(
+                                            edited_calendar,
+                                            event_id,
+                                            edited_from.clone(),
+                                            draft.clone(),
+                                        ));
+                                    }
                                     // "All events" moved every occurrence on the
                                     // server; only the clicked row moved locally.
                                     on_saved(saved_state(true, all_events));
@@ -905,6 +955,12 @@ pub fn open(
             } else {
                 match store.update_event(event.id, &draft) {
                     Ok(()) => {
+                        on_change(undo::Change::edited(
+                            event.calendar_id,
+                            event.id,
+                            event.draft(),
+                            draft.clone(),
+                        ));
                         on_saved(Saved::Cached);
                         dialog.close();
                     }
