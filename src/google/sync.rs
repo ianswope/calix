@@ -82,9 +82,10 @@ pub fn sync_account(
         }
         for pending in &reconciliation.upserts {
             store
-                .upsert_google_event(
+                .upsert_google_event_from_series(
                     local_calendar_id,
                     pending.event_id,
+                    pending.series_id.as_deref(),
                     &pending.draft,
                     &pending.attendees,
                 )
@@ -104,23 +105,24 @@ pub fn sync_account(
     Ok(outcome)
 }
 
+/// One event ready to write: its Google id, the draft, and the invitee list.
+/// Attendees ride alongside the draft rather than inside it, so the local edit
+/// path (which builds drafts by hand) cannot blank them.
+struct PendingUpsert<'a> {
+    event_id: &'a str,
+    series_id: Option<String>,
+    draft: EventDraft,
+    attendees: Vec<Attendee>,
+}
+
 struct Reconciliation<'a> {
     upserts: Vec<PendingUpsert<'a>>,
     keep_ids: Vec<String>,
     skipped: Vec<&'a str>,
 }
 
-/// One event ready to write: its Google id, the draft, and the invitee list.
-/// Attendees ride alongside the draft rather than inside it, so the local edit
-/// path (which builds drafts by hand) can't blank them.
-struct PendingUpsert<'a> {
-    event_id: &'a str,
-    draft: EventDraft,
-    attendees: Vec<Attendee>,
-}
-
 /// Splits fetched events into the drafts to upsert and the full set of ids to
-/// keep. Every returned event's id is kept — even one we can't turn into a
+/// keep. Every returned event's id is kept — even one we cannot turn into a
 /// draft — so a transient parse failure never lets pruning delete an event that
 /// Google still returned.
 fn reconcile_events(events: &[calendar_api::EventItem]) -> Reconciliation<'_> {
@@ -132,6 +134,7 @@ fn reconcile_events(events: &[calendar_api::EventItem]) -> Reconciliation<'_> {
         match event_draft(event) {
             Some(draft) => upserts.push(PendingUpsert {
                 event_id: event.id.as_str(),
+                series_id: event.recurring_event_id.clone(),
                 draft,
                 attendees: event.invitees(),
             }),
@@ -227,7 +230,25 @@ mod tests {
             attendees: Vec::new(),
             start,
             end,
+            recurring_event_id: None,
         }
+    }
+
+    #[test]
+    fn reconcile_passes_the_series_id_of_an_expanded_instance() {
+        let mut item = event(
+            "occ-1",
+            timed("2026-01-17T09:00:00Z"),
+            timed("2026-01-17T10:00:00Z"),
+        );
+        item.recurring_event_id = Some("series-1".to_string());
+        let events = [item];
+        let reconciliation = reconcile_events(&events);
+        assert_eq!(reconciliation.upserts.len(), 1);
+        assert_eq!(
+            reconciliation.upserts[0].series_id.as_deref(),
+            Some("series-1")
+        );
     }
 
     #[test]

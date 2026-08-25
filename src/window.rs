@@ -1,3 +1,4 @@
+use crate::autostart;
 use crate::caldav;
 use crate::calendar_dialog;
 use crate::config::Config;
@@ -999,10 +1000,43 @@ impl Ui {
 }
 
 thread_local! {
-    /// The window that's up, so a forwarded `calix <date>` can move it. Only
-    /// ever read back through `open`, which drops it if the window it belongs
-    /// to has since gone.
+    /// The window that's up, so a forwarded `calix <date>` can move it.
+    /// One `Ui` per process: `open` reuses this instead of building a second
+    /// set of timers when the window was only hidden.
     static LIVE_UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
+    /// The logind resume subscription is process-wide; a second `build`
+    /// must not `mem::forget` another one.
+    static LOGIND_SUBSCRIBED: Cell<bool> = const { Cell::new(false) };
+    /// Set when this process started as the background alert process, so
+    /// closing the window hides it rather than destroying the session.
+    static BACKGROUND_SESSION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this process already has a `Ui` and should reuse it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionAction {
+    Reuse,
+    Build,
+}
+
+fn session_action(live_exists: bool) -> SessionAction {
+    if live_exists {
+        SessionAction::Reuse
+    } else {
+        SessionAction::Build
+    }
+}
+
+fn hide_window_instead_of_destroying(keep_running: bool) -> bool {
+    keep_running
+}
+
+fn should_subscribe_to_logind(already_subscribed: bool) -> bool {
+    !already_subscribed
+}
+
+fn session_keeps_running() -> bool {
+    BACKGROUND_SESSION.with(Cell::get) || autostart::enabled()
 }
 
 /// Shows Calix on `date`, or wherever it already was when no date was asked
@@ -1010,25 +1044,24 @@ thread_local! {
 /// `calix` invocation moves the one on screen instead of opening another.
 pub fn open(app: &adw::Application, date: Option<NaiveDate>) {
     let live = LIVE_UI.with(|live| live.borrow().clone());
-    match live.filter(|_| app.active_window().is_some()) {
-        Some(ui) => {
+    match session_action(live.is_some()) {
+        SessionAction::Reuse => {
+            let ui = live.expect("Reuse requires a live session");
             if let Some(date) = date {
                 ui.state.borrow_mut().current_date = date;
                 ui.reset();
             }
-            if let Some(window) = app.active_window() {
+            if let Some(window) = app.windows().into_iter().next() {
                 window.present();
             }
         }
-        None => {
-            LIVE_UI.with(|live| live.replace(None));
-            build(app, date, true);
-        }
+        SessionAction::Build => build(app, date, true),
     }
 }
 
 pub fn start_background(app: &adw::Application) {
-    if LIVE_UI.with(|live| live.borrow().is_none()) {
+    BACKGROUND_SESSION.with(|flag| flag.set(true));
+    if session_action(LIVE_UI.with(|live| live.borrow().is_some())) == SessionAction::Build {
         build(app, None, false);
     }
 }
@@ -1102,7 +1135,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // reasonably fresh while the app is awake. This timer is frozen during
     // suspend (GLib's monotonic clock stops), so recovery from an overnight
     // sleep comes from the logind resume listener below, not from this tick.
-    glib::timeout_add_seconds_local(
+    let clock_source = Cell::new(Some(glib::timeout_add_seconds_local(
         30,
         clone!(
             #[weak]
@@ -1114,7 +1147,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 glib::ControlFlow::Continue
             }
         ),
-    );
+    )));
 
     // Surface event alerts as desktop notifications. Each tick checks the
     // window since the previous one — contiguous half-open windows, so an
@@ -1122,8 +1155,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // then fires late rather than silently dropping). The two-day query
     // horizon comfortably covers the longest lead time, one day.
     let notify_app = app.clone();
-    let last_alert_check = Cell::new(Local::now());
-    glib::timeout_add_seconds_local(
+    sweep_due_alerts(&ui, &notify_app);
+    let alert_source = Cell::new(Some(glib::timeout_add_seconds_local(
         60,
         clone!(
             #[weak]
@@ -1131,29 +1164,11 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
             #[upgrade_or]
             glib::ControlFlow::Break,
             move || {
-                let now = Local::now();
-                let since = last_alert_check.replace(now);
-                let Ok(events) = ui
-                    .store
-                    .events_between(since, now + ChronoDuration::days(2))
-                else {
-                    return glib::ControlFlow::Continue;
-                };
-                for event in crate::notify::due_alerts(&events, since, now) {
-                    let notification = gio::Notification::new(&event.title);
-                    notification.set_body(Some(&crate::notify::notification_body(&event, now)));
-                    // Id'd by occurrence so a repeated send replaces instead
-                    // of stacking, and each occurrence of a series alerts
-                    // separately.
-                    notify_app.send_notification(
-                        Some(&format!("event-{}-{}", event.id, event.start.timestamp())),
-                        &notification,
-                    );
-                }
+                sweep_due_alerts(&ui, &notify_app);
                 glib::ControlFlow::Continue
             }
         ),
-    );
+    )));
 
     // Tooltips carry the accelerator: with no menu bar and no shortcuts
     // window yet, the control itself is the only place a binding can be
@@ -1313,15 +1328,15 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // don't nag; `sync_connected_accounts` touches only providers that have an
     // account and aren't already mid-sync. The launch pass is deferred a beat
     // so the window paints first.
-    glib::timeout_add_local_once(
+    let launch_sync = Cell::new(Some(glib::timeout_add_local_once(
         Duration::from_millis(100),
         clone!(
             #[strong]
             ui,
             move || sync_connected_accounts(&ui)
         ),
-    );
-    glib::timeout_add_seconds_local(
+    )));
+    let periodic_sync = Cell::new(Some(glib::timeout_add_seconds_local(
         15 * 60,
         clone!(
             #[weak]
@@ -1333,7 +1348,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 glib::ControlFlow::Continue
             }
         ),
-    );
+    )));
 
     // The periodic timers above run on GLib's monotonic clock, which is frozen
     // while the machine is suspended — so after an overnight sleep they don't
@@ -1345,17 +1360,17 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // a background sync. gio speaks D-Bus, so this needs no new dependency; the
     // shared system-bus connection is kept alive by gio for the process's life,
     // which keeps the subscription live.
-    if let Ok(system_bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
-        let subscription = system_bus.subscribe_to_signal(
-            Some("org.freedesktop.login1"),
-            Some("org.freedesktop.login1.Manager"),
-            Some("PrepareForSleep"),
-            Some("/org/freedesktop/login1"),
-            None,
-            gio::DBusSignalFlags::NONE,
-            clone!(
-                #[weak]
-                ui,
+    if should_subscribe_to_logind(LOGIND_SUBSCRIBED.with(Cell::get)) {
+        LOGIND_SUBSCRIBED.with(|flag| flag.set(true));
+        if let Ok(system_bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
+            let resume_app = app.clone();
+            let subscription = system_bus.subscribe_to_signal(
+                Some("org.freedesktop.login1"),
+                Some("org.freedesktop.login1.Manager"),
+                Some("PrepareForSleep"),
+                Some("/org/freedesktop/login1"),
+                None,
+                gio::DBusSignalFlags::NONE,
                 move |signal| {
                     // PrepareForSleep(b): `true` just before sleep, `false`
                     // right after resume. Only the resume edge matters; treat an
@@ -1369,14 +1384,18 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                     {
                         return;
                     }
+                    let Some(ui) = LIVE_UI.with(|live| live.borrow().clone()) else {
+                        return;
+                    };
                     ui.tick_clock();
                     sync_connected_accounts(&ui);
-                }
-            ),
-        );
-        // The subscription unsubscribes when dropped; there is exactly one, for
-        // the whole process, so leak it to keep the resume listener alive.
-        std::mem::forget(subscription);
+                    sweep_due_alerts(&ui, &resume_app);
+                },
+            );
+            // The subscription unsubscribes when dropped. Installed once per
+            // process and leaked so a later rebuild cannot stack another.
+            std::mem::forget(subscription);
+        }
     }
 
     let calendars_button = gtk::ToggleButton::new();
@@ -1422,6 +1441,30 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         .default_height(750)
         .content(&ui.toast_overlay)
         .build();
+
+    window.connect_close_request(|window| {
+        if hide_window_instead_of_destroying(session_keeps_running()) {
+            window.set_visible(false);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.connect_destroy(move |_| {
+        LIVE_UI.with(|live| live.replace(None));
+        if let Some(id) = clock_source.take() {
+            id.remove();
+        }
+        if let Some(id) = alert_source.take() {
+            id.remove();
+        }
+        if let Some(id) = launch_sync.take() {
+            id.remove();
+        }
+        if let Some(id) = periodic_sync.take() {
+            id.remove();
+        }
+    });
 
     // Each command re-triggers the control that already performs it rather
     // than repeating its body, so a shortcut can't drift from the button it
@@ -1612,6 +1655,32 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
             glib::ControlFlow::Break
         }
     ));
+}
+
+fn sweep_due_alerts(ui: &Ui, app: &impl IsA<gio::Application>) {
+    let now = Local::now();
+    let stored = ui.store.last_alert_check().ok().flatten();
+    let since = crate::notify::alert_window(stored, now);
+    let Ok(events) = ui
+        .store
+        .events_between(since, now + ChronoDuration::days(2))
+    else {
+        return;
+    };
+    for event in crate::notify::due_alerts(&events, since, now) {
+        let notification = gio::Notification::new(&event.title);
+        notification.set_body(Some(&crate::notify::notification_body(&event, now)));
+        // Id'd by occurrence so a repeated send replaces instead
+        // of stacking, and each occurrence of a series alerts
+        // separately.
+        app.send_notification(
+            Some(&format!("event-{}-{}", event.id, event.start.timestamp())),
+            &notification,
+        );
+    }
+    let _ = ui
+        .store
+        .set_last_alert_check(crate::notify::next_checkpoint(true, since, now));
 }
 
 fn sidebar_actions(
@@ -2024,6 +2093,7 @@ fn move_handler(
                     )));
                     return;
                 }
+                let _ = ui.store.mark_local_edit(event.id);
                 ui.reset();
 
                 let (tx, rx) = mpsc::channel();
@@ -2037,7 +2107,10 @@ fn move_handler(
                         #[strong]
                         ui,
                         move || match rx.try_recv() {
-                            Ok(Ok(())) => glib::ControlFlow::Break,
+                            Ok(Ok(())) => {
+                                let _ = ui.store.clear_local_edit(event.id);
+                                glib::ControlFlow::Break
+                            }
                             Ok(Err(error)) => {
                                 undo_failed_drag(&ui, event.id, &draft, &original);
                                 ui.toast_overlay.add_toast(adw::Toast::new(&format!(
@@ -2078,6 +2151,7 @@ fn undo_failed_drag(ui: &Rc<Ui>, event_id: i64, optimistic: &EventDraft, origina
         return;
     };
     if ui.store.update_event(event_id, &undo).is_ok() {
+        let _ = ui.store.clear_local_edit(event_id);
         ui.reset();
     }
 }
@@ -3874,6 +3948,25 @@ mod tests {
         activity.finish_sign_in();
         assert!(activity.start_sign_in());
     }
+
+    #[test]
+    fn a_live_session_is_reused_instead_of_starting_a_second_alert_loop() {
+        assert_eq!(session_action(true), SessionAction::Reuse);
+        assert_eq!(session_action(false), SessionAction::Build);
+    }
+
+    #[test]
+    fn the_window_hides_on_close_only_when_the_process_must_keep_running() {
+        assert!(hide_window_instead_of_destroying(true));
+        assert!(!hide_window_instead_of_destroying(false));
+    }
+
+    #[test]
+    fn logind_is_subscribed_once_per_process() {
+        assert!(should_subscribe_to_logind(false));
+        assert!(!should_subscribe_to_logind(true));
+    }
+
     use chrono::TimeZone;
 
     const CTRL: gdk::ModifierType = gdk::ModifierType::CONTROL_MASK;
