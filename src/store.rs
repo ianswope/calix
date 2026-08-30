@@ -248,6 +248,10 @@ impl Store {
         // JSON array of `Attendee`, written only by sync. `update_event` never
         // touches it, so editing an event locally keeps the provider's list.
         ensure_column(&conn, "events", "attendees", "TEXT")?;
+        // Set by a local create/edit that has not yet been confirmed by a
+        // successful remote write. Sync upserts and prunes skip these rows so
+        // an in-flight drag cannot be overwritten by a concurrent pull.
+        ensure_column(&conn, "events", "local_edit", "INTEGER NOT NULL DEFAULT 0")?;
 
         conn.execute_batch(
             "
@@ -325,6 +329,23 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    /// The last wall-clock instant an alert sweep completed, if one has.
+    pub fn last_alert_check(&self) -> rusqlite::Result<Option<DateTime<Local>>> {
+        let Some(value) = self.setting(crate::notify::CHECKPOINT_SETTING_KEY)? else {
+            return Ok(None);
+        };
+        Ok(DateTime::parse_from_rfc3339(&value)
+            .ok()
+            .map(|timestamp| timestamp.with_timezone(&Local)))
+    }
+
+    pub fn set_last_alert_check(&self, when: DateTime<Local>) -> rusqlite::Result<()> {
+        self.set_setting(
+            crate::notify::CHECKPOINT_SETTING_KEY,
+            &stored_timestamp(&when),
+        )
     }
 
     pub fn local_calendars(&self) -> rusqlite::Result<Vec<Calendar>> {
@@ -716,6 +737,27 @@ impl Store {
         Ok(())
     }
 
+    /// Marks `id` as holding an unpushed local change. Sync upserts and prunes
+    /// skip the row until [`Self::clear_local_edit`].
+    pub fn mark_local_edit(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE events SET local_edit = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Clears the local-edit flag after a remote write succeeds, or after a
+    /// failed remote write has been rolled back, so a later sync may apply
+    /// server-side changes again.
+    pub fn clear_local_edit(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE events SET local_edit = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_event_attendees(&self, id: i64, attendees: &[Attendee]) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE events SET attendees = ?1 WHERE id = ?2",
@@ -734,11 +776,13 @@ impl Store {
     ///
     /// `reminder_minutes` is written on INSERT but deliberately left out of the
     /// `DO UPDATE`: an alert is Calix-local — nothing sends it to Google, and
-    /// nothing reads one back — so the row created right after the user adds an
-    /// event is the only chance to keep the alert they picked, while every later
-    /// sync must leave the column alone rather than blank it. (An alert on a
-    /// *recurring* remote event still can't outlive the first sync, which
-    /// replaces the series row with the provider's expanded instances.)
+    /// nothing reads one back — so a later sync must leave the column alone
+    /// rather than blank it. A newly expanded occurrence of a series copies
+    /// the reminder from `inherit_reminder_from` (the series id) so an alert
+    /// set at create time survives the first sync replacing the master row.
+    ///
+    /// Rows marked `local_edit` are not overwritten: an in-flight local change
+    /// waiting on a remote push must not lose to a concurrent pull.
     pub fn upsert_google_event(
         &self,
         calendar_id: i64,
@@ -746,30 +790,38 @@ impl Store {
         draft: &EventDraft,
         attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, google_event_id, attendees, reminder_minutes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(calendar_id, google_event_id) WHERE google_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
-            params![
-                calendar_id,
-                draft.title,
-                stored_timestamp(&draft.start),
-                stored_timestamp(&draft.end),
-                draft.all_day as i64,
-                draft.location,
-                draft.notes,
-                google_event_id,
-                attendees_to_json(attendees),
-                draft.reminder_minutes,
-            ],
-        )?;
-        Ok(())
+        self.upsert_synced_event(
+            calendar_id,
+            "google_event_id",
+            google_event_id,
+            None,
+            draft,
+            attendees,
+        )
+    }
+
+    pub fn upsert_google_event_from_series(
+        &self,
+        calendar_id: i64,
+        google_event_id: &str,
+        inherit_reminder_from: Option<&str>,
+        draft: &EventDraft,
+        attendees: &[Attendee],
+    ) -> rusqlite::Result<()> {
+        self.upsert_synced_event(
+            calendar_id,
+            "google_event_id",
+            google_event_id,
+            inherit_reminder_from,
+            draft,
+            attendees,
+        )
     }
 
     /// Creates or updates a CalDAV-sourced event by its href. Handles
-    /// `reminder_minutes` exactly as [`Self::upsert_google_event`] does, and for
-    /// the same reason.
+    /// `reminder_minutes` and `local_edit` exactly as
+    /// [`Self::upsert_google_event`] does. Expanded instances (`href#id`)
+    /// inherit the reminder stored on the bare href.
     pub fn upsert_caldav_event(
         &self,
         calendar_id: i64,
@@ -777,11 +829,47 @@ impl Store {
         draft: &EventDraft,
         attendees: &[Attendee],
     ) -> rusqlite::Result<()> {
+        self.upsert_synced_event(
+            calendar_id,
+            "icloud_event_id",
+            icloud_event_id,
+            icloud_event_id.split_once('#').map(|(href, _)| href),
+            draft,
+            attendees,
+        )
+    }
+
+    fn upsert_synced_event(
+        &self,
+        calendar_id: i64,
+        id_column: &str,
+        remote_id: &str,
+        inherit_reminder_from: Option<&str>,
+        draft: &EventDraft,
+        attendees: &[Attendee],
+    ) -> rusqlite::Result<()> {
+        debug_assert!(
+            id_column == "google_event_id" || id_column == "icloud_event_id",
+            "id_column is a trusted SQL identifier"
+        );
+        let inherit = inherit_reminder_from.unwrap_or(remote_id);
+        let sql = format!(
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, {id_column}, attendees, reminder_minutes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                COALESCE(
+                    (SELECT reminder_minutes FROM events
+                     WHERE calendar_id = ?1
+                       AND {id_column} = ?11
+                       AND reminder_minutes IS NOT NULL
+                     LIMIT 1),
+                    ?10
+                ))
+             ON CONFLICT(calendar_id, {id_column}) WHERE {id_column} IS NOT NULL
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9
+             WHERE local_edit = 0"
+        );
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, icloud_event_id, attendees, reminder_minutes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9",
+            &sql,
             params![
                 calendar_id,
                 draft.title,
@@ -790,9 +878,10 @@ impl Store {
                 draft.all_day as i64,
                 draft.location,
                 draft.notes,
-                icloud_event_id,
+                remote_id,
                 attendees_to_json(attendees),
                 draft.reminder_minutes,
+                inherit,
             ],
         )?;
         Ok(())
@@ -812,7 +901,8 @@ impl Store {
             self.conn.execute(
                 "DELETE FROM events
                  WHERE calendar_id = ?1 AND google_event_id IS NOT NULL
-                   AND start_at < ?2 AND end_at > ?3",
+                   AND start_at < ?2 AND end_at > ?3
+                   AND local_edit = 0",
                 params![
                     calendar_id,
                     stored_timestamp(&range_end),
@@ -827,6 +917,7 @@ impl Store {
             "DELETE FROM events
              WHERE calendar_id = ? AND google_event_id IS NOT NULL
                AND start_at < ? AND end_at > ?
+               AND local_edit = 0
                AND google_event_id NOT IN ({placeholders})"
         );
         let range_end = stored_timestamp(&range_end);
@@ -855,7 +946,8 @@ impl Store {
         let mut sql = String::from(
             "DELETE FROM events
              WHERE calendar_id = ? AND icloud_event_id IS NOT NULL
-               AND start_at < ? AND end_at > ?",
+               AND start_at < ? AND end_at > ?
+               AND local_edit = 0",
         );
         let range_end = stored_timestamp(&range_end);
         let range_start = stored_timestamp(&range_start);
@@ -2207,6 +2299,237 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].reminder_minutes, Some(5));
+    }
+
+    #[test]
+    fn last_alert_check_round_trips_through_settings() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.last_alert_check().unwrap().is_none());
+        let when = Local
+            .with_ymd_and_hms(2026, 8, 21, 9, 0, 0)
+            .single()
+            .unwrap();
+        store.set_last_alert_check(when).unwrap();
+        let stored = store.last_alert_check().unwrap().unwrap();
+        assert_eq!(stored.timestamp(), when.timestamp());
+    }
+
+    #[test]
+    fn a_sync_upsert_does_not_clobber_an_unpushed_local_edit() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account(
+                "person@example.com",
+                "person@example.com",
+                "google-refresh-token:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 12, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        store
+            .upsert_google_event(calendar_id, "evt-1", &draft("Lunch", start, end), &[])
+            .unwrap();
+        let id = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap()[0]
+            .id;
+        let moved = start + Duration::hours(1);
+        store
+            .update_event(id, &draft("Lunch", moved, moved + Duration::hours(1)))
+            .unwrap();
+        store.mark_local_edit(id).unwrap();
+
+        store
+            .upsert_google_event(
+                calendar_id,
+                "evt-1",
+                &draft("Lunch (from server)", start, end),
+                &[],
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(start - Duration::hours(1), moved + Duration::hours(2))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Lunch");
+        assert_eq!(events[0].start, moved);
+
+        store.clear_local_edit(id).unwrap();
+        store
+            .upsert_google_event(
+                calendar_id,
+                "evt-1",
+                &draft("Lunch (from server)", start, end),
+                &[],
+            )
+            .unwrap();
+        let events = store
+            .events_between(start - Duration::hours(1), end + Duration::hours(1))
+            .unwrap();
+        assert_eq!(events[0].title, "Lunch (from server)");
+        assert_eq!(events[0].start, start);
+    }
+
+    #[test]
+    fn prune_preserves_an_unpushed_local_edit() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account(
+                "person@example.com",
+                "person@example.com",
+                "google-refresh-token:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 12, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        store
+            .upsert_google_event(calendar_id, "evt-1", &draft("Lunch", start, end), &[])
+            .unwrap();
+        let id = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap()[0]
+            .id;
+        store.mark_local_edit(id).unwrap();
+        store
+            .prune_google_events(
+                calendar_id,
+                &["other".to_string()],
+                start - Duration::hours(1),
+                end + Duration::hours(1),
+            )
+            .unwrap();
+        let events = store
+            .events_between(start - Duration::hours(1), end)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Lunch");
+    }
+
+    #[test]
+    fn expanded_caldav_instances_inherit_the_masters_reminder() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_icloud_account(
+                "person@example.com",
+                "person@example.com",
+                "icloud-app-password:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_caldav_calendar(account_id, "/calendars/work/", "Work", "#ff9500", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 9, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        let mut with_alert = draft("Standup", start, end);
+        with_alert.reminder_minutes = Some(10);
+        store
+            .upsert_caldav_event(calendar_id, "/calendars/work/standup.ics", &with_alert, &[])
+            .unwrap();
+
+        let occurrence = start + Duration::days(7);
+        store
+            .upsert_caldav_event(
+                calendar_id,
+                "/calendars/work/standup.ics#20260727T090000Z",
+                &draft("Standup", occurrence, occurrence + Duration::hours(1)),
+                &[],
+            )
+            .unwrap();
+        store
+            .prune_caldav_events(
+                calendar_id,
+                &["/calendars/work/standup.ics#20260727T090000Z".to_string()],
+                &[],
+                start - Duration::hours(1),
+                occurrence + Duration::hours(2),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(
+                occurrence - Duration::hours(1),
+                occurrence + Duration::hours(2),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(10));
+        assert_eq!(
+            events[0].icloud_event_id.as_deref(),
+            Some("/calendars/work/standup.ics#20260727T090000Z")
+        );
+    }
+
+    #[test]
+    fn expanded_google_instances_inherit_the_series_reminder() {
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store
+            .upsert_google_account(
+                "person@example.com",
+                "person@example.com",
+                "google-refresh-token:person@example.com",
+            )
+            .unwrap();
+        let calendar_id = store
+            .upsert_google_calendar(account_id, "cal-abc", "Work", "#ff0000", true)
+            .unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 20, 9, 0, 0)
+            .single()
+            .unwrap();
+        let end = start + Duration::hours(1);
+        let mut with_alert = draft("Standup", start, end);
+        with_alert.reminder_minutes = Some(15);
+        store
+            .upsert_google_event(calendar_id, "series-1", &with_alert, &[])
+            .unwrap();
+
+        let occurrence = start + Duration::days(7);
+        store
+            .upsert_google_event_from_series(
+                calendar_id,
+                "series-1_20260727T130000Z",
+                Some("series-1"),
+                &draft("Standup", occurrence, occurrence + Duration::hours(1)),
+                &[],
+            )
+            .unwrap();
+        store
+            .prune_google_events(
+                calendar_id,
+                &["series-1_20260727T130000Z".to_string()],
+                start - Duration::hours(1),
+                occurrence + Duration::hours(2),
+            )
+            .unwrap();
+
+        let events = store
+            .events_between(
+                occurrence - Duration::hours(1),
+                occurrence + Duration::hours(2),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reminder_minutes, Some(15));
+        assert_eq!(
+            events[0].google_event_id.as_deref(),
+            Some("series-1_20260727T130000Z")
+        );
     }
 
     #[test]

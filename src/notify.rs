@@ -4,7 +4,16 @@
 //! `gio::Notification`) lives in `window.rs`.
 
 use crate::store::Event;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration, Local};
+
+/// Setting key for the last wall-clock instant an alert sweep completed.
+/// Persisted so a login launch can catch alerts that came due while Calix
+/// was not running, without firing an unbounded backlog.
+pub const CHECKPOINT_SETTING_KEY: &str = "last_alert_check";
+
+/// Longest picker lead time is one day; looking back a little further still
+/// catches this morning's alerts after a late login, but not last week's.
+pub const CATCH_UP_LOOKBACK: Duration = Duration::hours(36);
 
 /// The reminder choices offered by the event dialog, in picker order: the
 /// label shown in the row and the alert's lead time in minutes before the
@@ -50,6 +59,29 @@ pub fn due_alerts(events: &[Event], after: DateTime<Local>, up_to: DateTime<Loca
         })
         .cloned()
         .collect()
+}
+
+/// The start of the half-open tick window `(after, now]`.
+///
+/// A stored checkpoint inside the lookback is used as-is, so adjacent ticks
+/// stay contiguous. A missing or ancient checkpoint is clamped to
+/// [`CATCH_UP_LOOKBACK`] before `now`, so a first launch or a long gap cannot
+/// dump every historical reminder. A checkpoint in the future (clock jumped
+/// backwards) collapses to `now`, producing an empty window rather than
+/// re-firing.
+pub fn alert_window(stored: Option<DateTime<Local>>, now: DateTime<Local>) -> DateTime<Local> {
+    let floor = now - CATCH_UP_LOOKBACK;
+    stored.unwrap_or(floor).clamp(floor, now)
+}
+
+/// The checkpoint to persist after a sweep. A failed query must keep the
+/// previous value so that window is retried instead of skipped forever.
+pub fn next_checkpoint(
+    query_succeeded: bool,
+    previous: DateTime<Local>,
+    now: DateTime<Local>,
+) -> DateTime<Local> {
+    if query_succeeded { now } else { previous }
 }
 
 /// Body text for an event alert, e.g. "Today at 9:05 AM — Suite 210" or
@@ -195,6 +227,41 @@ mod tests {
         event.all_day = true;
         let body = notification_body(&event, at(2026, 7, 20, 0, 0));
         assert_eq!(body, "Tomorrow, all day");
+    }
+
+    #[test]
+    fn a_recent_checkpoint_is_used_as_the_window_start() {
+        let now = at(2026, 8, 21, 9, 0);
+        let stored = at(2026, 8, 21, 8, 59);
+        assert_eq!(alert_window(Some(stored), now), stored);
+    }
+
+    #[test]
+    fn a_missing_checkpoint_looks_back_only_a_bounded_window() {
+        let now = at(2026, 8, 21, 9, 0);
+        assert_eq!(alert_window(None, now), now - CATCH_UP_LOOKBACK);
+    }
+
+    #[test]
+    fn an_ancient_checkpoint_is_clamped_to_the_lookback() {
+        let now = at(2026, 8, 21, 9, 0);
+        let stored = at(2026, 7, 1, 9, 0);
+        assert_eq!(alert_window(Some(stored), now), now - CATCH_UP_LOOKBACK);
+    }
+
+    #[test]
+    fn a_checkpoint_in_the_future_collapses_to_an_empty_window() {
+        let now = at(2026, 8, 21, 9, 0);
+        let stored = at(2026, 8, 21, 10, 0);
+        assert_eq!(alert_window(Some(stored), now), now);
+    }
+
+    #[test]
+    fn a_failed_query_does_not_advance_the_checkpoint() {
+        let previous = at(2026, 8, 21, 8, 0);
+        let now = at(2026, 8, 21, 9, 0);
+        assert_eq!(next_checkpoint(false, previous, now), previous);
+        assert_eq!(next_checkpoint(true, previous, now), now);
     }
 
     #[test]

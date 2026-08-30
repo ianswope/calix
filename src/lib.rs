@@ -129,12 +129,31 @@ pub fn run() -> gtk::glib::ExitCode {
         let background = autostart::is_background_launch(&args);
         // The invoking process rejects a bad date before it forwards, so one
         // can't arrive here; opening on today beats refusing to open at all.
-        if background && app.active_window().is_none() {
-            window::start_background(app);
-        } else {
+        // Do not key this off `active_window()`: hide-on-close leaves the
+        // window present but not active, and a second `--background` must
+        // reuse that Ui rather than present it (or build another).
+        if command_line_presents_window(background) {
             window::open(app, date_util::parse_date_arg(&args).unwrap_or(None));
+        } else {
+            window::start_background(app);
         }
         glib::ExitCode::SUCCESS
     });
     app.run()
+}
+
+/// A `--background` command line attaches to the running process without
+/// presenting a window. Any other command line opens or re-presents the UI.
+#[cfg(feature = "gui")]
+fn command_line_presents_window(background_launch: bool) -> bool {
+    !background_launch
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod tests {
+    #[test]
+    fn a_background_command_line_does_not_present_a_window() {
+        assert!(!super::command_line_presents_window(true));
+        assert!(super::command_line_presents_window(false));
+    }
 }

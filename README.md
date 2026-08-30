@@ -205,7 +205,12 @@ Google is the one provider that needs real setup: Google requires every app to b
 
 1. Create a project at [console.cloud.google.com](https://console.cloud.google.com) and enable the **Google Calendar API** for it.
 2. Under **Google Auth Platform → Audience**, set the app to External, and add your own Google account under **Test users** (the app stays unverified/"Testing," which is fine for personal use — publishing for public verification is a separate, much heavier process not needed here).
-3. Under **Data Access**, add the `.../auth/calendar` scope.
+3. Under **Data Access**, add these scopes:
+   - `https://www.googleapis.com/auth/calendar.events`
+   - `https://www.googleapis.com/auth/calendar.calendarlist.readonly`
+
+   Calix requests exactly those two at sign-in; the broader `.../auth/calendar`
+   scope is not used.
 4. Under **Clients**, create an OAuth client of type **Desktop app**. Copy the Client ID and Client Secret.
 5. In Calix, choose **Connect an account → Google Calendar**, paste the Client
    ID and Client Secret, then choose **Save and sign in**. Calix writes them to
@@ -239,7 +244,7 @@ The calendar button in the header toggles the sidebar, which opens with a mini m
 - **Drag out a new event**: in week/day view, press on empty grid space and drag to draw the event's span, with a live preview snapped to 15 minutes. The dialog opens pre-filled with exactly the range you drew instead of the default hour. Dragging upward works the same as downward, and the span stops at midnight rather than spilling into the next day.
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
-- **Inspect and RSVP**: click any event for a popover with its time, calendar, location, notes, and attendee replies. Invitations identified as yours offer **Accept**, **Maybe**, and **Decline** without leaving Calix. **Edit** opens the full dialog.
+- **Inspect and RSVP**: click any event for a popover with its time, calendar, location, notes, and attendee replies. Invitations identified as yours offer **Accept**, **Maybe**, and **Decline** without leaving Calix. Google notifies the organizer of the reply. CalDAV writes the new status onto the event on the server; whether that notifies the organizer depends on the server (many, including iCloud, keep it as a local PARTSTAT change). **Edit** opens the full dialog.
 - **Invite**: add comma-separated email addresses while creating an event on Google Calendar. Google delivers updates to invitees; attendee lists remain read-only afterward so ordinary event edits cannot accidentally rewrite the guest list.
 - **Search**: the magnifier in the header (`Ctrl+F`) matches event titles, locations, and notes across every visible calendar. Picking a result jumps the grid to that day. Results are capped, and the popover says so when the cap bites rather than passing a truncated list off as the whole answer.
 - **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts are local to this machine and continue after the window is closed. In **Calendars → Manage**, enable **Start Calix when you sign in** to make them reliable across login sessions.

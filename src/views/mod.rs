@@ -108,3 +108,88 @@ fn show_new_event_menu(
     });
     popover.popup();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Event;
+    use chrono::{Duration, TimeZone};
+
+    fn event_on(
+        start: chrono::DateTime<Local>,
+        end: chrono::DateTime<Local>,
+        all_day: bool,
+    ) -> Event {
+        Event {
+            id: 1,
+            calendar_id: 1,
+            calendar_name: "Local".into(),
+            calendar_color: "#3584e4".into(),
+            account_provider: None,
+            account_provider_id: None,
+            account_token_key: None,
+            google_calendar_id: None,
+            title: "Event".into(),
+            start,
+            end,
+            all_day,
+            location: None,
+            notes: None,
+            google_event_id: None,
+            icloud_event_id: None,
+            account_server_url: None,
+            attendees: Vec::new(),
+            recurrence: None,
+            reminder_minutes: None,
+        }
+    }
+
+    fn at(y: i32, m: u32, d: u32) -> chrono::DateTime<Local> {
+        Local.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn a_timed_event_occurs_on_its_start_day() {
+        let start = Local.with_ymd_and_hms(2026, 8, 21, 9, 0, 0).unwrap();
+        let event = event_on(start, start + Duration::hours(1), false);
+        assert!(event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()
+        ));
+        assert!(!event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 22).unwrap()
+        ));
+    }
+
+    #[test]
+    fn an_all_day_event_does_not_include_its_exclusive_end_date() {
+        // All-day on the 21st is stored as [21st 00:00, 22nd 00:00).
+        let event = event_on(at(2026, 8, 21), at(2026, 8, 22), true);
+        assert!(event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()
+        ));
+        assert!(!event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 22).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_multi_day_all_day_event_covers_each_inclusive_day() {
+        let event = event_on(at(2026, 8, 21), at(2026, 8, 24), true);
+        assert!(event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 21).unwrap()
+        ));
+        assert!(event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 23).unwrap()
+        ));
+        assert!(!event_occurs_on_day(
+            &event,
+            NaiveDate::from_ymd_opt(2026, 8, 24).unwrap()
+        ));
+    }
+}

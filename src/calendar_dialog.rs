@@ -204,12 +204,39 @@ fn calendar_row(
         #[strong]
         on_changed,
         move |_, state| {
-            if store.set_calendar_visible(calendar_id, state).is_ok() {
+            let write_ok = store.set_calendar_visible(calendar_id, state).is_ok();
+            if write_ok {
                 on_changed();
             }
-            glib::Propagation::Proceed
+            visibility_toggle_applies(write_ok)
         }
     ));
 
     row
+}
+
+/// GTK applies a Switch's new state unless `state-set` stops emission. A
+/// failed store write must stop, so the switch stays on the value SQLite
+/// still has rather than looking flipped while the grid disagrees.
+fn visibility_toggle_applies(write_succeeded: bool) -> glib::Propagation {
+    if write_succeeded {
+        glib::Propagation::Proceed
+    } else {
+        glib::Propagation::Stop
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_successful_visibility_write_lets_gtk_apply_the_new_state() {
+        assert_eq!(visibility_toggle_applies(true), glib::Propagation::Proceed);
+    }
+
+    #[test]
+    fn a_failed_visibility_write_keeps_the_switch_on_the_stored_value() {
+        assert_eq!(visibility_toggle_applies(false), glib::Propagation::Stop);
+    }
 }

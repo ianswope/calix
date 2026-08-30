@@ -308,6 +308,14 @@ pub fn respond_to_event(
     attendee_email: &str,
     response: &str,
 ) -> Result<(), String> {
+    // CalDAV has no equivalent of Google's `sendUpdates=all`. This writes the
+    // new PARTSTAT onto the attendee's copy of the resource and PUTs it back.
+    // Servers that honour scheduling (scheduling outbox / iTIP METHOD:REPLY)
+    // may then notify the organizer; iCloud, Fastmail, and many personal
+    // servers treat the PUT as a local status change only. Calix does not
+    // POST an iTIP REPLY: that needs an organizer address, a scheduling
+    // inbox/outbox pair, and per-server support we cannot assume. The popover
+    // still records the reply locally and on any server that stores PARTSTAT.
     let resource_href = event_href
         .split_once('#')
         .map_or(event_href, |(href, _)| href);
@@ -828,12 +836,26 @@ fn xml_unescape(s: &str) -> String {
 fn parse_resource(href: &str, ics: &str) -> (Vec<RemoteEvent>, bool) {
     let components = ics_event_properties(ics);
     let total = components.len();
-    let events = components
-        .into_iter()
-        .filter_map(|component| parse_event(href, component, total))
-        .collect::<Vec<_>>();
-    let complete = events.len() == total;
+    let mut skipped_cancelled = 0usize;
+    let mut events = Vec::new();
+    for component in components {
+        if ics_status_is_cancelled(&component) {
+            skipped_cancelled += 1;
+            continue;
+        }
+        if let Some(event) = parse_event(href, component, total) {
+            events.push(event);
+        }
+    }
+    let complete = events.len() + skipped_cancelled == total;
     (events, complete)
+}
+
+fn ics_status_is_cancelled(component: &IcsEvent) -> bool {
+    component
+        .props
+        .get("STATUS")
+        .is_some_and(|property| property.value.eq_ignore_ascii_case("CANCELLED"))
 }
 
 fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Option<RemoteEvent> {
@@ -1853,6 +1875,50 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(attendees[1].email, "bob@example.com");
         assert_eq!(attendees[1].name, None);
         assert_eq!(attendees[1].status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn a_lowercase_cancelled_status_is_still_dropped() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:gone\r\nSUMMARY:Cancelled\r\n\
+DTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\nSTATUS:cancelled\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (events, complete) = parse_resource("/calendars/work/gone.ics", ics);
+        assert!(events.is_empty());
+        assert!(complete);
+    }
+
+    #[test]
+    fn cancelled_vevents_are_dropped_rather_than_shown() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:gone\r\nSUMMARY:Cancelled\r\n\
+DTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\nSTATUS:CANCELLED\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (events, complete) = parse_resource("/calendars/work/gone.ics", ics);
+        assert!(events.is_empty());
+        assert!(
+            complete,
+            "a cancelled VEVENT is a successful skip, not an unreadable resource"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_instance_does_not_protect_the_resource_from_prune() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\nSUMMARY:Keep\r\nDTSTART:20260709T140000Z\r\nDTEND:20260709T143000Z\r\n\
+RECURRENCE-ID:20260709T140000Z\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nSUMMARY:Gone\r\nDTSTART:20260716T140000Z\r\nDTEND:20260716T143000Z\r\n\
+RECURRENCE-ID:20260716T140000Z\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let xml = format!(
+            "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\
+             <D:response><D:href>/calendars/work/series.ics</D:href><D:propstat><D:prop>\
+             <C:calendar-data>{}</C:calendar-data>\
+             </D:prop></D:propstat></D:response></D:multistatus>",
+            ics.replace('&', "&amp;").replace('<', "&lt;")
+        );
+        let synced = reconcile_calendar_query(&xml);
+        assert_eq!(synced.events.len(), 1);
+        assert!(synced.unreadable.is_empty());
+        assert!(synced.prunable);
     }
 
     #[test]

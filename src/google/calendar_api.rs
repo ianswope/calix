@@ -76,6 +76,11 @@ pub struct EventItem {
     pub attendees: Vec<EventAttendee>,
     pub start: EventDateTime,
     pub end: EventDateTime,
+    /// Present on expanded instances (`singleEvents=true`); names the series
+    /// the occurrence belongs to so a local reminder on the master can be
+    /// copied onto the new row.
+    #[serde(default, rename = "recurringEventId")]
+    pub recurring_event_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -302,7 +307,7 @@ pub fn respond_to_event(
         return Err("Google did not identify your invitation on this event".to_string());
     };
     me.status = Some(response.to_string());
-    let url = event_url(calendar_id, event_id)?;
+    let url = event_url_notifying(calendar_id, event_id)?;
     let body = serde_json::json!({
         "attendees": attendees.iter().map(|attendee| serde_json::json!({
             "email": attendee.email,
@@ -377,6 +382,12 @@ fn event_url(calendar_id: &str, event_id: &str) -> Result<Url, String> {
         .push(calendar_id)
         .push("events")
         .push(event_id);
+    Ok(url)
+}
+
+fn event_url_notifying(calendar_id: &str, event_id: &str) -> Result<Url, String> {
+    let mut url = event_url(calendar_id, event_id)?;
+    url.query_pairs_mut().append_pair("sendUpdates", "all");
     Ok(url)
 }
 
@@ -562,6 +573,7 @@ mod tests {
                 date_time: None,
                 time_zone: None,
             },
+            recurring_event_id: None,
         };
 
         assert!(!event.is_displayable_calendar_event());
@@ -588,6 +600,7 @@ mod tests {
             },
             conference_data: None,
             attendees: Vec::new(),
+            recurring_event_id: None,
         };
 
         assert!(event.is_displayable_calendar_event());
@@ -652,6 +665,16 @@ mod tests {
         assert_eq!(
             local.with_timezone(&chrono::Utc),
             chrono::Utc.with_ymd_and_hms(2026, 7, 9, 13, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_rsvp_url_asks_google_to_notify_everyone() {
+        let url = event_url_notifying("primary", "evt-1").unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "sendUpdates" && value == "all"),
+            "RSVP must send sendUpdates=all so the organizer is notified: {url}"
         );
     }
 }
