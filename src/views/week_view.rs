@@ -1,7 +1,7 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
 use crate::views::{
-    EditFn, MoveFn, PageActions, add_slot_menu,
+    EditFn, EventSelection, MoveFn, PageActions, Slot, SlotGrain, add_slot_menu,
     drag::{BlockPlacement, TimedGrid, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
@@ -36,8 +36,9 @@ pub enum InitialScroll {
 /// Builds a full week page: day-of-week header plus a scrollable 24-hour
 /// grid, with a "now" indicator line on today's column if it's in view.
 /// `events` should already be scoped to (at least) the visible week.
-/// Clicking an empty hour slot calls `on_create` with that moment; clicking
-/// an event block calls `on_edit` with that event.
+/// Clicking an empty hour slot selects it — that is where Ctrl+V pastes — and
+/// double-clicking calls `on_create` with that moment; clicking an event block
+/// calls `on_edit` with that event.
 pub fn build(
     anchor: NaiveDate,
     events: &[Event],
@@ -83,6 +84,7 @@ fn build_days(
         events,
         actions.on_edit.clone(),
         actions.on_move.clone(),
+        actions.events.clone(),
         &gutter_size_group,
     ));
 
@@ -211,6 +213,7 @@ fn all_day_row(
     events: &[Event],
     on_edit: EditFn,
     on_move: MoveFn,
+    selected: EventSelection,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
     let row = row_with_days(gutter_size_group, |day_area| {
@@ -235,6 +238,7 @@ fn all_day_row(
                 let ev = event.clone();
                 let on_edit = on_edit.clone();
                 chip.connect_clicked(move |btn| on_edit(ev.clone(), btn.clone().upcast()));
+                selected.restore(event.id, &chip);
                 cell.append(&chip);
             }
 
@@ -352,6 +356,8 @@ fn day_column(
         on_edit,
         on_move,
         paste,
+        slots,
+        events: event_selection,
     } = actions;
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
@@ -365,9 +371,22 @@ fn day_column(
         cell.set_size_request(-1, hour_row_height);
         cell.add_css_class("hour-cell");
 
+        // The selectable unit here is the hour that is drawn, not the quarter
+        // the pointer happens to be in: the highlight has to mean exactly
+        // where a paste will land.
+        let slot = Slot {
+            day,
+            time: NaiveTime::from_hms_opt(hour, 0, 0),
+        };
         let click = gtk::GestureClick::new();
         let on_create = on_create.clone();
-        click.connect_released(move |_, _, _, _| {
+        let cell_for_click = cell.clone();
+        let slots_for_click = slots.clone();
+        click.connect_released(move |_, presses, _, _| {
+            slots_for_click.select(slot, &cell_for_click);
+            if presses < 2 {
+                return;
+            }
             let start = day
                 .and_time(NaiveTime::from_hms_opt(hour, 0, 0).expect("hour is always 0..24"))
                 .and_local_timezone(Local)
@@ -377,6 +396,7 @@ fn day_column(
             }
         });
         cell.add_controller(click);
+        slots.restore(slot, &cell);
 
         col.append(&cell);
     }
@@ -410,7 +430,7 @@ fn day_column(
     // day, which keeps the copied event's own time rather than the spot.
     add_slot_menu(
         &overlay,
-        day,
+        SlotGrain::Hour,
         move |_, y| {
             let quarter = ((y / hour_row_height as f64) * 4.0)
                 .floor()
@@ -505,6 +525,7 @@ fn day_column(
                     starts_here,
                     ends_here,
                 },
+                &event_selection,
             );
             block.set_valign(gtk::Align::Start);
             block.set_halign(gtk::Align::Fill);

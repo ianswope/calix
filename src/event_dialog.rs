@@ -587,84 +587,38 @@ pub fn open(
             #[weak]
             error_label,
             move |_| {
-                if let Some(remote_event) = remote_event.clone() {
-                    delete_button.set_sensitive(false);
-                    // "All events" removes the whole series; otherwise just this
-                    // occurrence (the picker only shows for a series instance).
-                    let all_events = scope_row.selected() == 1;
-                    let (tx, rx) = mpsc::channel();
-                    std::thread::spawn(move || {
-                        let result = if all_events {
-                            remote_event.delete_all_events()
-                        } else {
-                            remote_event.delete()
-                        };
-                        let _ = tx.send(result);
-                    });
-                    glib::timeout_add_local(
-                        Duration::from_millis(100),
-                        clone!(
-                            #[strong]
-                            dialog,
-                            #[strong]
-                            store,
-                            #[strong]
-                            on_saved,
-                            #[strong]
-                            on_change,
-                            #[strong]
-                            deleted,
-                            #[strong]
-                            delete_button,
-                            #[strong]
-                            error_label,
-                            move || match rx.try_recv() {
-                                Ok(Ok(())) => match store.delete_event(event_id) {
-                                    Ok(()) => {
-                                        if !all_events {
-                                            on_change(deleted.clone());
-                                        }
-                                        // Deleting a whole remote series takes one
-                                        // cached occurrence with it; the rest are
-                                        // separate rows only a sync can prune.
-                                        on_saved(saved_state(true, all_events));
-                                        dialog.close();
-                                        glib::ControlFlow::Break
-                                    }
-                                    Err(error) => {
-                                        error_label.set_label(&format!(
-                                            "Remote event deleted, but the local cache could not be updated: {error}"
-                                        ));
-                                        delete_button.set_sensitive(true);
-                                        glib::ControlFlow::Break
-                                    }
-                                },
-                                Ok(Err(error)) => {
-                                    error_label.set_label(&error);
-                                    delete_button.set_sensitive(true);
-                                    glib::ControlFlow::Break
-                                }
-                                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    error_label.set_label("Remote delete stopped unexpectedly");
-                                    delete_button.set_sensitive(true);
-                                    glib::ControlFlow::Break
-                                }
+                delete_button.set_sensitive(false);
+                delete_event_async(
+                    store.clone(),
+                    remote_event.clone(),
+                    event_id,
+                    deleted.clone(),
+                    on_change.clone(),
+                    // "All events" removes the whole series; otherwise just
+                    // this occurrence (the picker only shows for a series
+                    // instance).
+                    scope_row.selected() == 1,
+                    clone!(
+                        #[strong]
+                        dialog,
+                        #[strong]
+                        on_saved,
+                        #[strong]
+                        delete_button,
+                        #[weak]
+                        error_label,
+                        move |outcome| match outcome {
+                            Ok(saved) => {
+                                on_saved(saved);
+                                dialog.close();
                             }
-                        ),
-                    );
-                } else {
-                    match store.delete_event(event_id) {
-                        Ok(()) => {
-                            on_change(deleted.clone());
-                            on_saved(Saved::Cached);
-                            dialog.close();
+                            Err(message) => {
+                                error_label.set_label(&message);
+                                delete_button.set_sensitive(true);
+                            }
                         }
-                        Err(error) => {
-                            error_label.set_label(&format!("Couldn't delete event: {error}"))
-                        }
-                    }
-                }
+                    ),
+                );
             }
         ));
         content.append(&delete_button);
@@ -1123,6 +1077,73 @@ pub(crate) fn attendee_status_label(status: &str) -> &str {
 /// isn't idempotent and there is no key to repeat it under, so pressing Save
 /// again produces a second event on the server. The remote copy is already
 /// what the user asked for, so the local cache catches up at the next sync.
+/// Deletes an event: the provider first when it lives on one — on a worker
+/// thread the main loop polls — and then this device's copy. `on_done` fires
+/// exactly once, on the main thread.
+///
+/// `all_events` chooses between removing a whole series and dropping the one
+/// occurrence. Both the dialog's Delete and Ctrl+X come through here, so
+/// there is still only one delete path that knows what a series is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_event_async(
+    store: Rc<Store>,
+    remote_event: Option<RemoteEvent>,
+    event_id: i64,
+    deleted: undo::Change,
+    on_change: Rc<dyn Fn(undo::Change)>,
+    all_events: bool,
+    on_done: impl Fn(Result<Saved, String>) + 'static,
+) {
+    let Some(remote_event) = remote_event else {
+        on_done(match store.delete_event(event_id) {
+            Ok(()) => {
+                on_change(deleted);
+                Ok(Saved::Cached)
+            }
+            Err(error) => Err(format!("Couldn't delete event: {error}")),
+        });
+        return;
+    };
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = if all_events {
+            remote_event.delete_all_events()
+        } else {
+            remote_event.delete()
+        };
+        let _ = tx.send(result);
+    });
+    glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+        Ok(Ok(())) => {
+            on_done(match store.delete_event(event_id) {
+                Ok(()) => {
+                    if !all_events {
+                        on_change(deleted.clone());
+                    }
+                    // Deleting a whole remote series takes one cached
+                    // occurrence with it; the rest are separate rows only a
+                    // sync can prune.
+                    Ok(saved_state(true, all_events))
+                }
+                Err(error) => Err(format!(
+                    "Remote event deleted, but the local cache could not be updated: {error}"
+                )),
+            });
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            on_done(Err(error));
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            on_done(Err("Remote delete stopped unexpectedly".to_string()));
+            glib::ControlFlow::Break
+        }
+    });
+}
+
 /// Creates `draft` on `target`: the provider first — on a worker thread that
 /// the main loop polls, the way every other provider call here runs — and then
 /// this device's copy. `on_done` fires exactly once, on the main thread.

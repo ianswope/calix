@@ -121,6 +121,22 @@ row:selected {
     border-bottom: 1px solid @borders;
 }
 
+.selected-slot {
+    /* The paste target, and the only thing on the grid that says where Ctrl+V
+       will land. Drawn as a filled wash with an inset outline so it reads on
+       both the month grid and an hour row, and so it survives sitting next to
+       the today highlight. */
+    background-color: alpha(@accent_bg_color, 0.16);
+    box-shadow: inset 0 0 0 2px alpha(@accent_bg_color, 0.85);
+}
+
+.selected-event {
+    /* The event Ctrl+C copies and Ctrl+X cuts. A ring rather than a fill: the
+       block already carries its calendar's color, and filling it would hide
+       which calendar it is on. */
+    box-shadow: inset 0 0 0 2px @accent_bg_color;
+}
+
 .today-cell {
     background-color: alpha(@accent_bg_color, 0.08);
 }

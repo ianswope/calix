@@ -4,14 +4,21 @@
 
 ### Added
 
-- Copy an event and paste it onto another day. **Copy** in the event popover or
-  **Ctrl+C** takes the event last clicked; **Paste Event** in the right-click
-  menu drops it on that day, and **Ctrl+V** drops it on the day the view is
-  anchored to. The copy keeps its time of day and length, goes back to the
-  calendar it came from — pushed to Google/iCloud/CalDAV when that calendar is
-  synced — and can be taken back with Ctrl+Z. A repeat rule and a guest list are
-  left behind, so a paste is one ordinary event rather than a second series or
-  an unsent invitation.
+- Copy, cut and paste events. **Ctrl+C** copies the selected event and
+  **Ctrl+X** cuts it (**Copy** in the event popover does the same); **Ctrl+V**
+  pastes onto the selected slot, and **Paste Event** in the right-click menu
+  pastes where you clicked. Pasting onto an hour in week or day view puts the
+  event at that hour; pasting onto a month cell keeps its own time of day. The
+  copy goes back to the calendar it came from — pushed to Google/iCloud/CalDAV
+  when that calendar is synced — and every part of it can be taken back with
+  Ctrl+Z. A repeat rule and a guest list are left behind, so a paste is one
+  ordinary event rather than a second series or an unsent invitation, and
+  cutting a repeating event is refused rather than guessed at.
+- A visible selection. Clicking an event rings it; clicking empty calendar
+  space highlights that slot — the day in month view, the hour in week or day
+  view — and that highlight is where Ctrl+V will paste. **Esc** clears both and
+  leaves the clipboard alone. Both survive the redraws that follow a sync or an
+  edit.
 - Location suggestions while typing. The **Location** field offers places this
   calendar has already used, then addresses from the Photon geocoder
   (OpenStreetMap data, no API key). Arrow keys and Enter pick one. Only the
@@ -19,7 +26,6 @@
   `[places] enabled = false` in `config.toml` turns that half off and leaves the
   local suggestions working offline, while `[places] endpoint` points it at a
   self-hosted geocoder instead.
-
 - Undo and redo. **Ctrl+Z** takes back creating, editing, moving, resizing or
   deleting an event; **Ctrl+Shift+Z** (or Ctrl+Y) puts it back. Changes on
   synced calendars are undone on the provider too, so the next sync doesn't
@@ -27,6 +33,14 @@
 - An undo only applies while the event still holds what the change wrote. If
   something else has edited it since — including a sync, or an invitation
   response arriving — Calix says so and leaves the newer version alone.
+
+### Changed
+
+- A single click on empty calendar space now selects that slot instead of
+  opening the new-event dialog; **double-click** creates. A calendar with no
+  way to point at an empty day has nowhere for a paste to land, and every other
+  way of creating an event — double-click, drag across the grid, the right-click
+  menu, the **+** button, Ctrl+N — is unchanged.
 
 ### Known gaps
 

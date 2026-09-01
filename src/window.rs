@@ -14,7 +14,10 @@ use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
 use crate::undo;
-use crate::views::{PageActions, PasteAction, drag::DragKind, month_view, week_view, year_view};
+use crate::views::{
+    EventSelection, PageActions, PasteAction, Slot, SlotSelection, drag::DragKind, month_view,
+    week_view, year_view,
+};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
 use gtk::gdk;
@@ -45,7 +48,9 @@ enum KeyCommand {
     NewEvent,
     Search,
     CopyEvent,
+    CutEvent,
     PasteEvent,
+    ClearSelection,
 }
 
 /// Maps a keypress to the command it triggers, or `None` to let it through.
@@ -55,6 +60,15 @@ enum KeyCommand {
 /// a letter the user was typing into an event title. Requiring a modifier is
 /// what keeps a global shortcut from eating text entry.
 fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
+    // Escape is the one binding that takes no modifier. It can afford to:
+    // nothing on the grid is a text field, and an Escape meant for a popover,
+    // a menu or a dialog is claimed by that popover, menu or dialog long
+    // before it reaches the window.
+    if key == gdk::Key::Escape {
+        return (state - gdk::ModifierType::LOCK_MASK)
+            .is_empty()
+            .then_some(KeyCommand::ClearSelection);
+    }
     // Caps Lock rides along on ordinary presses and says nothing about
     // intent, so it's ignored. Alt, Super, Hyper and Meta do change intent, so
     // a chord carrying one of them belongs to some other binding, not ours.
@@ -95,6 +109,7 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
         // the focus, so Ctrl+C over the grid copies the selected event while
         // Ctrl+C inside a text field still copies text.
         gdk::Key::c | gdk::Key::C => Some(KeyCommand::CopyEvent),
+        gdk::Key::x | gdk::Key::X => Some(KeyCommand::CutEvent),
         gdk::Key::v | gdk::Key::V => Some(KeyCommand::PasteEvent),
         gdk::Key::Left | gdk::Key::KP_Left => Some(KeyCommand::Previous),
         gdk::Key::Right | gdk::Key::KP_Right => Some(KeyCommand::Next),
@@ -466,6 +481,11 @@ struct Ui {
     // a paste survive the original being edited or deleted afterwards.
     selected_event: Rc<RefCell<Option<Event>>>,
     clipboard: Rc<RefCell<Option<Event>>>,
+    // What the grid draws as picked: the slot a click landed on — where Ctrl+V
+    // pastes — and a ring around the event Ctrl+C copies. Both hold the mark
+    // itself, so a rebuilt page can put it back on the new widget.
+    slots: SlotSelection,
+    events: EventSelection,
 }
 
 /// Which way through the history one keypress goes.
@@ -670,14 +690,65 @@ impl Ui {
         self.toast(&format!("Copied \u{201c}{title}\u{201d}"));
     }
 
-    /// Writes the clipboard's event onto `target_date`, keeping its time of day
-    /// unless `target_time` names one — see [`pasted_draft`].
+    /// Cuts the selected event: the copy goes on the clipboard, then the event
+    /// is deleted the same way the dialog deletes it.
+    fn cut_selected_event(self: &Rc<Self>) {
+        let Some(event) = self.selected_event.borrow().clone() else {
+            self.toast("Click an event first, then Ctrl+X to cut it");
+            return;
+        };
+        let remote = remote_event_handler(self, &event);
+        if let Some(event_dialog::RemoteEvent::Unavailable(error)) = &remote {
+            self.toast(error);
+            return;
+        }
+        let series_instance = remote
+            .as_ref()
+            .is_some_and(event_dialog::RemoteEvent::is_series_instance);
+        if let Some(refusal) = cut_refusal(&event, series_instance) {
+            self.toast(refusal);
+            return;
+        }
+        self.copy_event(event.clone());
+        self.events.clear();
+        *self.selected_event.borrow_mut() = None;
+        let ui = self.clone();
+        let ui_for_change = self.clone();
+        event_dialog::delete_event_async(
+            self.store.clone(),
+            remote,
+            event.id,
+            undo::Change::deleted(event.calendar_id, event.draft()),
+            Rc::new(move |change| ui_for_change.record(change)),
+            // A cut takes the one event that was selected, never a series —
+            // `cut_refusal` has already turned those away.
+            false,
+            move |outcome: Result<event_dialog::Saved, String>| match outcome {
+                Ok(saved) => ui.apply_saved(saved),
+                // The copy is on the clipboard either way, so a failed cut
+                // leaves the event where it was rather than losing it.
+                Err(message) => ui.toast(&message),
+            },
+        );
+    }
+
+    /// Drops both selections — the ring around an event, and the highlighted
+    /// slot. The clipboard is deliberately untouched: Escape is for taking the
+    /// marks off the screen, not for forgetting what was copied.
+    fn clear_selection(self: &Rc<Self>) {
+        self.events.clear();
+        self.slots.clear();
+        *self.selected_event.borrow_mut() = None;
+    }
+
+    /// Writes the clipboard's event onto `target`, keeping its time of day
+    /// unless the target names one — see [`pasted_draft`].
     ///
     /// The copy goes back to the calendar it came from, so a paste never has to
     /// ask which calendar it meant. That calendar can have been disconnected or
     /// hidden since the copy, which is why the target is resolved fresh here
     /// rather than captured alongside the event.
-    fn paste_event(self: &Rc<Self>, target_date: NaiveDate, target_time: Option<NaiveTime>) {
+    fn paste_event(self: &Rc<Self>, target: Slot) {
         let Some(source) = self.clipboard.borrow().clone() else {
             self.toast("Nothing to paste yet — copy an event first");
             return;
@@ -693,7 +764,7 @@ impl Ui {
             self.toast(error);
             return;
         }
-        let draft = pasted_draft(&source, target_date, target_time);
+        let draft = pasted_draft(&source, target.day, target.time);
         let landed = draft.start;
         let ui = self.clone();
         let ui_for_change = self.clone();
@@ -1128,10 +1199,11 @@ impl Ui {
                 let remote = remote_event_handler(&ui, &event);
                 let ui_for_changed = ui.clone();
                 let ui_for_copy = ui.clone();
-                // Opening the inspector is what selects an event: Ctrl+C then
-                // has something to copy, and still does after the popover has
-                // been dismissed.
+                // Clicking an event selects it: Ctrl+C and Ctrl+X then have
+                // something to work on, and still do after the popover has been
+                // dismissed — which is why the ring stays until Escape.
                 *ui.selected_event.borrow_mut() = Some(event.clone());
+                ui.events.select(event.id, &anchor);
                 let copied = event.clone();
                 event_popover::open(
                     &anchor,
@@ -1150,6 +1222,8 @@ impl Ui {
             on_edit,
             on_move,
             paste: self.paste_action(),
+            slots: self.slots.clone(),
+            events: self.events.clone(),
         }
     }
 
@@ -1161,7 +1235,7 @@ impl Ui {
         let ui_for_paste = self.clone();
         PasteAction {
             ready: Rc::new(move || ui_for_ready.clipboard.borrow().is_some()),
-            paste: Rc::new(move |day| ui_for_paste.paste_event(day, None)),
+            paste: Rc::new(move |slot: Slot| ui_for_paste.paste_event(slot)),
         }
     }
 
@@ -1378,6 +1452,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         history_busy: Rc::new(Cell::new(false)),
         selected_event: Rc::new(RefCell::new(None)),
         clipboard: Rc::new(RefCell::new(None)),
+        slots: SlotSelection::default(),
+        events: EventSelection::default(),
     });
 
     LIVE_UI.with(|live| live.replace(Some(ui.clone())));
@@ -1758,13 +1834,16 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 KeyCommand::ViewWeek => week_toggle.set_active(true),
                 KeyCommand::ViewDay => day_toggle.set_active(true),
                 KeyCommand::CopyEvent => ui_for_keys.copy_selected_event(),
+                KeyCommand::CutEvent => ui_for_keys.cut_selected_event(),
+                KeyCommand::ClearSelection => ui_for_keys.clear_selection(),
                 // With no pointer position to read, the paste lands on the day
                 // the view is anchored to, at the copy's own time of day. The
                 // toast names the day it went to, so the rule is visible rather
                 // than something to be remembered.
                 KeyCommand::PasteEvent => {
-                    let target = ui_for_keys.state.borrow().current_date;
-                    ui_for_keys.paste_event(target, None);
+                    let anchored = ui_for_keys.state.borrow().current_date;
+                    let target = paste_target(ui_for_keys.slots.selected(), anchored);
+                    ui_for_keys.paste_event(target);
                 }
             }
             glib::Propagation::Stop
@@ -2472,6 +2551,29 @@ fn moved_draft(
         reminder_minutes: event.reminder_minutes,
         attendees: event.attendees.clone(),
     }
+}
+
+/// Where a paste goes: the slot the user clicked, or — with nothing clicked —
+/// the day the view is anchored to, at the copied event's own time of day.
+fn paste_target(selected: Option<Slot>, anchored: NaiveDate) -> Slot {
+    selected.unwrap_or(Slot {
+        day: anchored,
+        time: None,
+    })
+}
+
+/// Why this event can't be cut, if it can't.
+///
+/// Deleting part of a series is recurrence-aware and belongs to the dialog,
+/// where the "this event / all events" choice is made — a cut that guessed
+/// would be exactly the second delete path the inspector deliberately doesn't
+/// have. A local series shares one row across every occurrence drawn, and a
+/// synced instance stands for a rule on the server.
+fn cut_refusal(event: &Event, series_instance: bool) -> Option<&'static str> {
+    if event.recurrence.is_some() || series_instance {
+        return Some("Cut isn't available for a repeating event — open it to delete the series");
+    }
+    None
 }
 
 /// The event a paste writes: the copied event re-anchored on the target day.
@@ -4269,6 +4371,93 @@ mod tests {
         // Caps Lock rides along on an ordinary press and must not unbind them.
         assert_eq!(key_command(gdk::Key::C, CTRL), Some(KeyCommand::CopyEvent));
         assert_eq!(key_command(gdk::Key::V, CTRL), Some(KeyCommand::PasteEvent));
+    }
+
+    #[test]
+    fn ctrl_x_cuts_and_escape_drops_the_selection() {
+        assert_eq!(key_command(gdk::Key::x, CTRL), Some(KeyCommand::CutEvent));
+        assert_eq!(key_command(gdk::Key::X, CTRL), Some(KeyCommand::CutEvent));
+        // Escape is the one binding without Ctrl: nothing is being typed into
+        // the grid, and every other Escape belongs to a popover or a dialog
+        // that sees it first.
+        assert_eq!(
+            key_command(gdk::Key::Escape, gdk::ModifierType::empty()),
+            Some(KeyCommand::ClearSelection)
+        );
+        assert_eq!(
+            key_command(gdk::Key::Escape, gdk::ModifierType::LOCK_MASK),
+            Some(KeyCommand::ClearSelection),
+            "Caps Lock rides along and says nothing about intent"
+        );
+        // Escape with a real modifier belongs to some other binding.
+        assert_eq!(key_command(gdk::Key::Escape, CTRL), None);
+    }
+
+    #[test]
+    fn a_paste_goes_to_the_selected_slot_and_falls_back_to_the_anchored_day() {
+        let anchored = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let clicked = NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+
+        // A slot clicked in week or day view names an hour, and the paste
+        // lands on it — that highlighted cell is what the user is looking at.
+        assert_eq!(
+            paste_target(
+                Some(Slot {
+                    day: clicked,
+                    time: Some(nine)
+                }),
+                anchored
+            ),
+            Slot {
+                day: clicked,
+                time: Some(nine)
+            }
+        );
+
+        // A month cell names a day and nothing finer, so the copy keeps its
+        // own time of day — see `pasted_draft`.
+        assert_eq!(
+            paste_target(
+                Some(Slot {
+                    day: clicked,
+                    time: None
+                }),
+                anchored
+            ),
+            Slot {
+                day: clicked,
+                time: None
+            }
+        );
+
+        // Nothing clicked yet: the day the view is anchored to, at the copy's
+        // own time, which is what the toast then names.
+        assert_eq!(
+            paste_target(None, anchored),
+            Slot {
+                day: anchored,
+                time: None
+            }
+        );
+    }
+
+    #[test]
+    fn cutting_a_repeating_event_is_refused_rather_than_half_done() {
+        // Deleting a series is recurrence-aware and lives in the dialog; a cut
+        // that quietly took one occurrence (or the whole series) would be the
+        // second delete path the popover deliberately doesn't have.
+        let mut event = test_event(local_at(2026, 7, 6, 9), local_at(2026, 7, 6, 10), false);
+        assert_eq!(cut_refusal(&event, false), None);
+
+        event.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        assert!(cut_refusal(&event, false).is_some());
+
+        event.recurrence = None;
+        assert!(
+            cut_refusal(&event, true).is_some(),
+            "an occurrence of a synced series is a series operation too"
+        );
     }
 
     #[test]

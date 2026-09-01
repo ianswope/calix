@@ -1,7 +1,8 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
 use crate::views::{
-    MoveFn, PageActions, add_slot_menu, drag::parse_drag_payload, event_occurs_on_day, event_widget,
+    MoveFn, PageActions, Slot, SlotGrain, add_slot_menu, drag::parse_drag_payload,
+    event_occurs_on_day, event_widget,
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
@@ -11,9 +12,9 @@ const MAX_CHIPS_PER_CELL: usize = 3;
 
 /// Builds a full month-grid page (weekday header + 6x7 day cells) anchored
 /// on any date within the target month. `events` should already be scoped
-/// to (at least) the grid's visible range. Clicking empty cell space calls
-/// `on_create` with 9am on that date; clicking an event chip calls
-/// `on_edit` with that event.
+/// to (at least) the grid's visible range. Clicking empty cell space selects
+/// that day — the paste target — and double-clicking calls `on_create` with
+/// 9am on it; clicking an event chip calls `on_edit` with that event.
 pub fn build(anchor: NaiveDate, events: &[Event], actions: PageActions) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
@@ -71,7 +72,15 @@ fn day_cell(
         on_edit,
         on_move,
         paste,
+        slots,
+        events,
     } = actions;
+    // A month cell names a date and nothing finer, so a paste onto it keeps
+    // the copied event's own time of day.
+    let slot = Slot {
+        day: date,
+        time: None,
+    };
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
     cell.add_css_class("month-cell");
     if date == today {
@@ -97,6 +106,9 @@ fn day_cell(
         let ev = event.clone();
         let on_edit = on_edit.clone();
         chip.connect_clicked(move |btn| on_edit(ev.clone(), btn.clone().upcast()));
+        // A redraw builds a new chip for the same event, so the ring has to be
+        // put back on it rather than assumed to have survived.
+        events.restore(event.id, &chip);
         cell.append(&chip);
     }
     if day_events.len() > MAX_CHIPS_PER_CELL {
@@ -120,7 +132,7 @@ fn day_cell(
     // copied event's own time of day rather than that placeholder hour.
     add_slot_menu(
         &cell,
-        date,
+        SlotGrain::Day,
         move |_, _| {
             date.and_time(NaiveTime::from_hms_opt(9, 0, 0)?)
                 .and_local_timezone(Local)
@@ -130,8 +142,17 @@ fn day_cell(
         paste,
     );
 
+    // One click selects the day — that is what Ctrl+V pastes onto, and the
+    // highlight is the only thing on screen that says so. Two opens the
+    // new-event dialog, the way a single click used to.
     let click = gtk::GestureClick::new();
-    click.connect_released(move |_, _, _, _| {
+    let cell_for_click = cell.clone();
+    let slots_for_click = slots.clone();
+    click.connect_released(move |_, presses, _, _| {
+        slots_for_click.select(slot, &cell_for_click);
+        if presses < 2 {
+            return;
+        }
         let start = date
             .and_time(NaiveTime::from_hms_opt(9, 0, 0).expect("9:00:00 is a valid time"))
             .and_local_timezone(Local)
@@ -141,6 +162,7 @@ fn day_cell(
         }
     });
     cell.add_controller(click);
+    slots.restore(slot, &cell);
     add_drop_target(&cell, date, on_move);
 
     cell.upcast()

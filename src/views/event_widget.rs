@@ -1,6 +1,6 @@
 use crate::store::Event;
-use crate::views::EditFn;
 use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, drag_payload};
+use crate::views::{EditFn, EventSelection};
 use gtk::gdk;
 use gtk::prelude::*;
 use std::rc::Rc;
@@ -17,6 +17,7 @@ pub fn compact_event_button(event: &Event, css_class: &str, min_height: i32) -> 
 /// by `grid` (a `GestureDrag` controller with a live preview) rather than
 /// GTK's data-transfer drag-and-drop, so `placement` describes where the
 /// block currently sits in the grid.
+#[allow(clippy::too_many_arguments)]
 pub fn timed_event_widget(
     event: &Event,
     css_class: &str,
@@ -24,12 +25,16 @@ pub fn timed_event_widget(
     on_click: EditFn,
     grid: &Rc<TimedGrid>,
     placement: &BlockPlacement,
+    selected: &EventSelection,
 ) -> gtk::Widget {
     let overlay = gtk::Overlay::new();
     let button = event_button_with_padding(event, css_class, min_height, 0, false);
     let ev = event.clone();
     let click = on_click.clone();
     button.connect_clicked(move |btn| click(ev.clone(), btn.clone().upcast()));
+    // The ring goes on the button, which is also what a click hands to the
+    // selection — so a redraw puts it back exactly where it was.
+    selected.restore(event.id, &button);
     overlay.set_child(Some(&button));
 
     // A local recurring event is drawn as many occurrences sharing one id;
