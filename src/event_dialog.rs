@@ -386,6 +386,9 @@ pub fn open(
     let start_row = adw::EntryRow::new();
     let end_row = adw::EntryRow::new();
     let location_row = adw::EntryRow::builder().title("Location").build();
+    // Suggestions from this calendar's own locations and, unless it is switched
+    // off, a geocoder — see `location_completion`.
+    crate::location_completion::attach(&location_row, store.clone());
     let notes_row = adw::EntryRow::builder().title("Notes").build();
     let invitees_row = adw::EntryRow::builder()
         .title("Invitees (email addresses, comma separated)")

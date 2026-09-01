@@ -12,6 +12,13 @@
   synced — and can be taken back with Ctrl+Z. A repeat rule and a guest list are
   left behind, so a paste is one ordinary event rather than a second series or
   an unsent invitation.
+- Location suggestions while typing. The **Location** field offers places this
+  calendar has already used, then addresses from the Photon geocoder
+  (OpenStreetMap data, no API key). Arrow keys and Enter pick one. Only the
+  typed prefix leaves the machine, and only after a pause in typing;
+  `[places] enabled = false` in `config.toml` turns that half off and leaves the
+  local suggestions working offline, while `[places] endpoint` points it at a
+  self-hosted geocoder instead.
 
 - Undo and redo. **Ctrl+Z** takes back creating, editing, moving, resizing or
   deleting an event; **Ctrl+Shift+Z** (or Ctrl+Y) puts it back. Changes on

@@ -686,6 +686,36 @@ impl Store {
             .collect())
     }
 
+    /// Locations this calendar has already used, most recently scheduled first
+    /// — the offline half of the location field's type-ahead.
+    ///
+    /// `fragment` matches anywhere in the text, not just at the start: an
+    /// address is rarely recalled from its house number. An empty fragment
+    /// offers the most recent locations, which is what the picker shows before
+    /// anything has been typed.
+    ///
+    /// Unlike [`Self::search_events`] this counts every calendar, hidden ones
+    /// included. Suggesting text back to the person who typed it isn't the
+    /// same as showing them an event from a calendar they switched off.
+    pub fn recent_locations(&self, fragment: &str, limit: usize) -> rusqlite::Result<Vec<String>> {
+        let pattern = format!("%{}%", like_escape(fragment.trim()));
+        // Grouping case-insensitively while selecting the bare column leaves
+        // SQLite to take `place` from the row that produced MAX(start_at), so
+        // the most recent spelling of a place is the one offered back.
+        let mut stmt = self.conn.prepare(
+            "SELECT TRIM(events.location) AS place, MAX(events.start_at) AS last_used
+             FROM events
+             WHERE events.location IS NOT NULL
+               AND TRIM(events.location) != ''
+               AND TRIM(events.location) LIKE ?1 ESCAPE '\\'
+             GROUP BY place COLLATE NOCASE
+             ORDER BY last_used DESC
+             LIMIT ?2",
+        )?;
+        stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?
+            .collect()
+    }
+
     /// The stored event with `id`, if any. Unlike [`Self::events_between`] this
     /// returns the raw row — for a recurring event that's the series master, not
     /// an expanded occurrence.
@@ -1307,6 +1337,71 @@ mod tests {
 
     fn titles(events: &[Event]) -> Vec<&str> {
         events.iter().map(|event| event.title.as_str()).collect()
+    }
+
+    #[test]
+    fn recent_locations_suggest_places_this_calendar_has_already_used() {
+        let store = store_with(&[
+            ("Standup", Some("Suite 210"), None),
+            ("Coffee", Some("Blue Bottle, 300 Webster Street"), None),
+        ]);
+
+        // Matching anywhere, not just at the start: nobody types an address
+        // from its house number.
+        assert_eq!(
+            store.recent_locations("webster", 6).unwrap(),
+            vec!["Blue Bottle, 300 Webster Street"]
+        );
+    }
+
+    #[test]
+    fn a_location_used_twice_is_offered_once_at_its_latest_use() {
+        let store = store_with(&[
+            ("Old standup", Some("Room A"), None),
+            ("Lunch", Some("Room B"), None),
+            ("New standup", Some("Room A"), None),
+        ]);
+
+        assert_eq!(
+            store.recent_locations("room", 6).unwrap(),
+            vec!["Room A", "Room B"]
+        );
+    }
+
+    #[test]
+    fn an_empty_fragment_offers_the_most_recent_locations() {
+        // What the picker shows the moment the field is focused, before
+        // anything has been typed into it.
+        let store = store_with(&[
+            ("Standup", Some("Room A"), None),
+            ("Lunch", Some("Room B"), None),
+        ]);
+
+        assert_eq!(
+            store.recent_locations("", 6).unwrap(),
+            vec!["Room B", "Room A"]
+        );
+    }
+
+    #[test]
+    fn events_with_nothing_in_their_location_suggest_nothing() {
+        let store = store_with(&[("Standup", None, None), ("Focus", Some("   "), None)]);
+
+        assert!(store.recent_locations("", 6).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_typed_percent_sign_does_not_match_every_location() {
+        // LIKE's own wildcard, typed by a user who means the character.
+        let store = store_with(&[
+            ("Standup", Some("Suite 210"), None),
+            ("Sale", Some("50% off tent"), None),
+        ]);
+
+        assert_eq!(
+            store.recent_locations("%", 6).unwrap(),
+            vec!["50% off tent"]
+        );
     }
 
     #[test]

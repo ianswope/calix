@@ -21,6 +21,7 @@ pub mod http;
 pub mod icloud;
 pub mod notify;
 pub mod omarchy;
+pub mod places;
 pub mod provider;
 pub mod recurrence;
 pub mod store;
@@ -34,6 +35,8 @@ mod calendar_dialog;
 mod event_dialog;
 #[cfg(feature = "gui")]
 mod event_popover;
+#[cfg(feature = "gui")]
+mod location_completion;
 #[cfg(feature = "gui")]
 mod search;
 #[cfg(feature = "gui")]

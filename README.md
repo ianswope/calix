@@ -242,6 +242,7 @@ The calendar button in the header toggles the sidebar, which opens with a mini m
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
 - **Inspect and RSVP**: click any event for a popover with its time, calendar, location, notes, and attendee replies. Invitations identified as yours offer **Accept**, **Maybe**, and **Decline** without leaving Calix. **Edit** opens the full dialog.
 - **Invite**: add comma-separated email addresses while creating an event on Google Calendar. Google delivers updates to invitees; attendee lists remain read-only afterward so ordinary event edits cannot accidentally rewrite the guest list.
+- **Location suggestions**: typing in an event's **Location** field offers places this calendar has already used, and then addresses from a geocoder (Photon, over OpenStreetMap data — no API key needed). Arrow keys and Enter pick one, Escape puts the list away. Only the typed prefix is ever sent, and only after a pause in typing; `[places] enabled = false` in `config.toml` turns the geocoder half off and leaves the local suggestions working offline.
 - **Search**: the magnifier in the header (`Ctrl+F`) matches event titles, locations, and notes across every visible calendar. Picking a result jumps the grid to that day. Results are capped, and the popover says so when the cap bites rather than passing a truncated list off as the whole answer.
 - **Alerts**: pick an alert in the event dialog ("At time of event" up to "1 day before") to get a desktop notification. Alerts are local to this machine and continue after the window is closed. In **Calendars → Manage**, enable **Start Calix when you sign in** to make them reliable across login sessions.
 
@@ -275,7 +276,9 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - `src/notify.rs` — pure event-alert logic: the dialog's alert choices, which alerts come due in a tick window, and notification wording; the minute tick and `gio::Notification` wiring live in `window.rs`.
 - `src/calendar_dialog.rs` — reusable account/calendar list for the sidebar, including per-calendar visibility toggles.
 - `src/event_dialog.rs` — the create/edit event dialog (`adw::Dialog` + `EntryRow`/`SwitchRow` form); its calendar picker defaults to sidebar-visible calendars with an expandable full list.
-- `src/config.rs` — reads `~/.config/calix/config.toml` for user-supplied API credentials (currently just the Google OAuth client).
+- `src/config.rs` — reads `~/.config/calix/config.toml` for user-supplied API credentials (the Google OAuth client) and the optional `[places]` section that points location lookup at a different geocoder, or switches it off.
+- `src/places.rs` — location type-ahead: which prefixes are worth sending, the geocoder request and its response, and how a geocoder's answers merge behind the locations this calendar already knows. No GTK; unit tested against captured responses.
+- `src/location_completion.rs` — the widget half of that: the suggestion popover under the Location row, its debounce, and its keyboard handling.
 - `src/google/oauth.rs` — the OAuth2 + PKCE sign-in flow (loopback redirect, no embedded browser) and per-account refresh-token storage via the system keyring.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
@@ -311,6 +314,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - [x] Event alerts / desktop notifications (local to the machine, while Calix runs)
 - [x] Event search
 - [x] Copy and paste an event onto another day
+- [x] Location type-ahead from past events and an OpenStreetMap geocoder
 - [x] Invitation responses for Google and compatible CalDAV events
 - [x] Google invitee authoring when creating events
 - [x] Background alerts with optional XDG autostart
