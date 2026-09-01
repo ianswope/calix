@@ -4,6 +4,15 @@
 
 ### Added
 
+- Copy an event and paste it onto another day. **Copy** in the event popover or
+  **Ctrl+C** takes the event last clicked; **Paste Event** in the right-click
+  menu drops it on that day, and **Ctrl+V** drops it on the day the view is
+  anchored to. The copy keeps its time of day and length, goes back to the
+  calendar it came from — pushed to Google/iCloud/CalDAV when that calendar is
+  synced — and can be taken back with Ctrl+Z. A repeat rule and a guest list are
+  left behind, so a paste is one ordinary event rather than a second series or
+  an unsent invitation.
+
 - Undo and redo. **Ctrl+Z** takes back creating, editing, moving, resizing or
   deleting an event; **Ctrl+Shift+Z** (or Ctrl+Y) puts it back. Changes on
   synced calendars are undone on the provider too, so the next sync doesn't

@@ -1,8 +1,8 @@
 use crate::date_util::week_dates;
 use crate::store::Event;
 use crate::views::{
-    CreateFn, EditFn, add_new_event_menu,
-    drag::{BlockPlacement, DragKind, TimedGrid, parse_drag_payload},
+    EditFn, MoveFn, PageActions, add_slot_menu,
+    drag::{BlockPlacement, TimedGrid, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
@@ -41,18 +41,14 @@ pub enum InitialScroll {
 pub fn build(
     anchor: NaiveDate,
     events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
 ) -> gtk::Widget {
     build_days(
         week_dates(anchor).to_vec(),
         events,
-        on_create,
-        on_edit,
-        on_move,
+        actions,
         hour_row_height,
         initial_scroll,
     )
@@ -61,30 +57,17 @@ pub fn build(
 pub fn build_day(
     day: NaiveDate,
     events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
 ) -> gtk::Widget {
-    build_days(
-        vec![day],
-        events,
-        on_create,
-        on_edit,
-        on_move,
-        hour_row_height,
-        initial_scroll,
-    )
+    build_days(vec![day], events, actions, hour_row_height, initial_scroll)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_days(
     days: Vec<NaiveDate>,
     events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
     hour_row_height: i32,
     initial_scroll: InitialScroll,
 ) -> gtk::Widget {
@@ -98,12 +81,12 @@ fn build_days(
     root.append(&all_day_row(
         &days,
         events,
-        on_edit.clone(),
-        on_move.clone(),
+        actions.on_edit.clone(),
+        actions.on_move.clone(),
         &gutter_size_group,
     ));
 
-    let grid = build_hour_grid(&days, events, on_create, on_edit, on_move, hour_row_height);
+    let grid = build_hour_grid(&days, events, actions, hour_row_height);
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .overlay_scrolling(true)
@@ -148,9 +131,7 @@ fn initial_scroll_hours(days: &[NaiveDate], today: NaiveDate, initial: InitialSc
 pub fn build_hour_grid(
     days: &[NaiveDate],
     events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
     hour_row_height: i32,
 ) -> gtk::Widget {
     let today = Local::now().date_naive();
@@ -160,7 +141,12 @@ pub fn build_hour_grid(
     hour_grid.append(&gutter_column(hour_row_height));
 
     let day_area = day_area();
-    let timed_grid = TimedGrid::new(&day_area, days.to_vec(), hour_row_height, on_move.clone());
+    let timed_grid = TimedGrid::new(
+        &day_area,
+        days.to_vec(),
+        hour_row_height,
+        actions.on_move.clone(),
+    );
     for day in days {
         let day_events: Vec<Event> = events
             .iter()
@@ -172,9 +158,7 @@ pub fn build_hour_grid(
             *day,
             today,
             &day_events,
-            on_create.clone(),
-            on_edit.clone(),
-            on_move.clone(),
+            actions.clone(),
             &timed_grid,
             col_index as usize,
             hour_row_height,
@@ -226,7 +210,7 @@ fn all_day_row(
     days: &[NaiveDate],
     events: &[Event],
     on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    on_move: MoveFn,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
     let row = row_with_days(gutter_size_group, |day_area| {
@@ -354,18 +338,21 @@ fn gutter_column(hour_row_height: i32) -> gtk::Widget {
     col.upcast()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn day_column(
     day: NaiveDate,
     today: NaiveDate,
     day_events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
     timed_grid: &Rc<TimedGrid>,
     col_index: usize,
     hour_row_height: i32,
 ) -> gtk::Widget {
+    let PageActions {
+        on_create,
+        on_edit,
+        on_move,
+        paste,
+    } = actions;
     let col = gtk::Box::new(gtk::Orientation::Vertical, 0);
     col.set_hexpand(true);
     col.set_size_request(1, -1);
@@ -419,9 +406,11 @@ fn day_column(
     }
 
     // Right-clicking empty grid space offers a new event at that spot,
-    // snapped down to the quarter hour it lands in.
-    add_new_event_menu(
+    // snapped down to the quarter hour it lands in — and a paste onto this
+    // day, which keeps the copied event's own time rather than the spot.
+    add_slot_menu(
         &overlay,
+        day,
         move |_, y| {
             let quarter = ((y / hour_row_height as f64) * 4.0)
                 .floor()
@@ -431,6 +420,7 @@ fn day_column(
                 .single()
         },
         on_create.clone(),
+        paste,
     );
 
     // Render each overlap cluster as its own band: a homogeneous grid whose
@@ -543,7 +533,7 @@ fn add_drop_target(
     widget: &impl IsA<gtk::Widget>,
     date: NaiveDate,
     hour_height: Option<i32>,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    on_move: MoveFn,
 ) {
     let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
     drop.connect_drop(move |_, value, _, y| {

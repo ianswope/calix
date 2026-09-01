@@ -772,103 +772,28 @@ pub fn open(
                     return;
                 }
                 save_button.set_sensitive(false);
-                let remote_draft = draft.clone();
-                let (tx, rx) = mpsc::channel();
-                let remote_target = target.clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(remote_target.create(&remote_draft));
-                });
-                glib::timeout_add_local(
-                    Duration::from_millis(100),
+                create_event_async(
+                    store.clone(),
+                    target,
+                    draft,
+                    on_change.clone(),
                     clone!(
                         #[strong]
                         dialog,
                         #[strong]
-                        store,
-                        #[strong]
                         on_saved,
                         #[strong]
-                        on_change,
-                        #[strong]
                         save_button,
-                        #[strong]
+                        #[weak]
                         error_label,
-                        move || match rx.try_recv() {
-                            Ok(Ok(None)) => match store.create_event(target.calendar_id(), &draft) {
-                                Ok(id) => {
-                                    on_change(undo::Change::created(
-                                        target.calendar_id(),
-                                        id,
-                                        draft.clone(),
-                                    ));
-                                    on_saved(Saved::Cached);
-                                    dialog.close();
-                                    glib::ControlFlow::Break
-                                }
-                                Err(error) => {
-                                    let (message, retryable) =
-                                        save_failure(&error.to_string(), false);
-                                    error_label.set_label(&message);
-                                    save_button.set_sensitive(retryable);
-                                    glib::ControlFlow::Break
-                                }
-                            },
-                            Ok(Ok(Some((is_google, remote_id)))) => {
-                                // A just-created event has no invitees — Calix
-                                // has no flow for sending invites.
-                                let result = if is_google {
-                                    store.upsert_google_event(
-                                        target.calendar_id(),
-                                        &remote_id,
-                                        &draft,
-                                        &draft.attendees,
-                                    )
-                                } else {
-                                    store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
-                                };
-                                match result {
-                                    Ok(id) => {
-                                        // A repeat is a series operation: the
-                                        // cached row is one occurrence of what
-                                        // the server built, so taking it back is
-                                        // not a single-row write and isn't
-                                        // recorded.
-                                        if draft.recurrence.is_none() {
-                                            on_change(undo::Change::created(
-                                                target.calendar_id(),
-                                                id,
-                                                draft.clone(),
-                                            ));
-                                        }
-                                        // A recurring event was created on the
-                                        // server as a series; the row just cached
-                                        // is one occurrence of it.
-                                        on_saved(saved_state(
-                                            true,
-                                            draft.recurrence.is_some(),
-                                        ));
-                                        dialog.close();
-                                        glib::ControlFlow::Break
-                                    }
-                                    Err(error) => {
-                                        let (message, retryable) =
-                                            save_failure(&error.to_string(), true);
-                                        error_label.set_label(&message);
-                                        save_button.set_sensitive(retryable);
-                                        glib::ControlFlow::Break
-                                    }
-                                }
+                        move |outcome| match outcome {
+                            Ok(saved) => {
+                                on_saved(saved);
+                                dialog.close();
                             }
-                            Ok(Err(error)) => {
-                                error_label.set_label(&error);
-                                save_button.set_sensitive(true);
-                                glib::ControlFlow::Break
-                            }
-                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                error_label.set_label("Event creation stopped unexpectedly");
-                                save_button.set_sensitive(true);
-                                glib::ControlFlow::Break
+                            Err((message, retryable)) => {
+                                error_label.set_label(&message);
+                                save_button.set_sensitive(retryable);
                             }
                         }
                     ),
@@ -1195,6 +1120,92 @@ pub(crate) fn attendee_status_label(status: &str) -> &str {
 /// isn't idempotent and there is no key to repeat it under, so pressing Save
 /// again produces a second event on the server. The remote copy is already
 /// what the user asked for, so the local cache catches up at the next sync.
+/// Creates `draft` on `target`: the provider first — on a worker thread that
+/// the main loop polls, the way every other provider call here runs — and then
+/// this device's copy. `on_done` fires exactly once, on the main thread.
+///
+/// The `bool` in the error says whether the failure is worth retrying. A create
+/// that reached the server but not the local cache is not: a second attempt
+/// would create the event twice.
+///
+/// Both the dialog's Save and a paste onto another day come through here, so
+/// the two can't drift on what a half-completed create means.
+pub(crate) fn create_event_async(
+    store: Rc<Store>,
+    target: CreateTarget,
+    draft: EventDraft,
+    on_change: Rc<dyn Fn(undo::Change)>,
+    on_done: impl Fn(Result<Saved, (String, bool)>) + 'static,
+) {
+    let (tx, rx) = mpsc::channel();
+    let remote_draft = draft.clone();
+    let remote_target = target.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(remote_target.create(&remote_draft));
+    });
+    glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+        Ok(Ok(None)) => {
+            match store.create_event(target.calendar_id(), &draft) {
+                Ok(id) => {
+                    on_change(undo::Change::created(
+                        target.calendar_id(),
+                        id,
+                        draft.clone(),
+                    ));
+                    on_done(Ok(Saved::Cached));
+                }
+                Err(error) => on_done(Err(save_failure(&error.to_string(), false))),
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(Some((is_google, remote_id)))) => {
+            // A just-created event has no invitees — Calix has no flow for
+            // sending invites.
+            let result = if is_google {
+                store.upsert_google_event(
+                    target.calendar_id(),
+                    &remote_id,
+                    &draft,
+                    &draft.attendees,
+                )
+            } else {
+                store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
+            };
+            match result {
+                Ok(id) => {
+                    // A repeat is a series operation: the cached row is one
+                    // occurrence of what the server built, so taking it back is
+                    // not a single-row write and isn't recorded.
+                    if draft.recurrence.is_none() {
+                        on_change(undo::Change::created(
+                            target.calendar_id(),
+                            id,
+                            draft.clone(),
+                        ));
+                    }
+                    // A recurring event was created on the server as a series;
+                    // the row just cached is one occurrence of it.
+                    on_done(Ok(saved_state(true, draft.recurrence.is_some())));
+                }
+                Err(error) => on_done(Err(save_failure(&error.to_string(), true))),
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            on_done(Err((error, true)));
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            on_done(Err((
+                "Event creation stopped unexpectedly".to_string(),
+                true,
+            )));
+            glib::ControlFlow::Break
+        }
+    });
+}
+
 fn save_failure(error: &str, created_remotely: bool) -> (String, bool) {
     if created_remotely {
         return (

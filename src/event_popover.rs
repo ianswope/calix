@@ -129,6 +129,7 @@ pub(crate) fn open(
     store: Rc<Store>,
     remote: Option<RemoteEvent>,
     on_changed: Rc<dyn Fn()>,
+    on_copy: Rc<dyn Fn()>,
 ) {
     let popover = gtk::Popover::new();
     popover.set_autohide(true);
@@ -289,10 +290,23 @@ pub(crate) fn open(
 
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     buttons.set_halign(gtk::Align::End);
+    // Copy is the discoverable half of the clipboard pair: Ctrl+C does the same
+    // thing, but nothing on screen would otherwise say the pair exists.
+    let copy_button = gtk::Button::with_label("Copy");
+    copy_button.set_tooltip_text(Some(
+        "Copy this event, then right-click another day to paste it",
+    ));
+    buttons.append(&copy_button);
     let edit_button = gtk::Button::with_label("Edit");
     edit_button.add_css_class("suggested-action");
     buttons.append(&edit_button);
     content.append(&buttons);
+
+    let popover_for_copy = popover.clone();
+    copy_button.connect_clicked(move |_| {
+        popover_for_copy.popdown();
+        on_copy();
+    });
 
     popover.set_child(Some(&content));
     popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());

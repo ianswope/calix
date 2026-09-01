@@ -20,6 +20,34 @@ pub(crate) type CreateFn = Rc<dyn Fn(DateTime<Local>, Option<DateTime<Local>>)>;
 /// nowhere meaningful to point.
 pub(crate) type EditFn = Rc<dyn Fn(Event, gtk::Widget)>;
 
+/// Commits a finished move or resize: which edge was dragged, which event, and
+/// the day and (in a timed view) the time it was dropped on.
+pub(crate) type MoveFn = Rc<dyn Fn(drag::DragKind, i64, NaiveDate, Option<NaiveTime>)>;
+
+/// The clipboard half of a page's right-click menu: whether an event is on
+/// Calix's clipboard at this moment, and dropping a copy of it onto a day.
+///
+/// Readiness is a callback rather than a flag because a menu is built when its
+/// page is — usually well before the copy it will go on to offer.
+#[derive(Clone)]
+pub(crate) struct PasteAction {
+    pub ready: Rc<dyn Fn() -> bool>,
+    pub paste: Rc<dyn Fn(NaiveDate)>,
+}
+
+/// Everything a page does when it is clicked, in one bundle.
+///
+/// Every view threads the identical set down to its day cells, so they travel
+/// together rather than as four positional arguments that each hop has to
+/// repeat in the right order.
+#[derive(Clone)]
+pub(crate) struct PageActions {
+    pub on_create: CreateFn,
+    pub on_edit: EditFn,
+    pub on_move: MoveFn,
+    pub paste: PasteAction,
+}
+
 /// Whether an event's half-open time range includes a calendar date.
 pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
     let start = event.start.date_naive();
@@ -30,14 +58,18 @@ pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
     start <= day && day <= end
 }
 
-/// Attach a right-click "New Event" context menu to `widget`. `moment_at`
-/// maps the press position (in `widget` coordinates) to the start time the
-/// menu offers. Presses that land on event chips/blocks (buttons) are left
-/// alone — those may grow a context menu of their own someday.
-pub(crate) fn add_new_event_menu(
+/// Attach the right-click menu for empty calendar space to `widget`: New Event
+/// always, and Paste Event whenever something has been copied. `day` is the
+/// date this widget stands for, and `moment_at` maps the press position (in
+/// `widget` coordinates) to the start time a new event would get. Presses that
+/// land on event chips/blocks (buttons) are left alone — those may grow a
+/// context menu of their own someday.
+pub(crate) fn add_slot_menu(
     widget: &impl IsA<gtk::Widget>,
+    day: NaiveDate,
     moment_at: impl Fn(f64, f64) -> Option<DateTime<Local>> + 'static,
     on_create: CreateFn,
+    paste: PasteAction,
 ) {
     let target = widget.clone().upcast::<gtk::Widget>();
     let gesture = gtk::GestureClick::new();
@@ -50,7 +82,7 @@ pub(crate) fn add_new_event_menu(
             return;
         };
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        show_new_event_menu(&target, x, y, start, on_create.clone());
+        show_slot_menu(&target, x, y, day, start, on_create.clone(), paste.clone());
     });
     widget.add_controller(gesture);
 }
@@ -71,12 +103,14 @@ pub(crate) fn press_hits_button(root: &gtk::Widget, x: f64, y: f64) -> bool {
     false
 }
 
-fn show_new_event_menu(
+fn show_slot_menu(
     parent: &gtk::Widget,
     x: f64,
     y: f64,
+    day: NaiveDate,
     start: DateTime<Local>,
     on_create: CreateFn,
+    paste: PasteAction,
 ) {
     let popover = gtk::Popover::new();
     popover.set_parent(parent);
@@ -84,20 +118,31 @@ fn show_new_event_menu(
     popover.add_css_class("menu");
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
 
-    let item = gtk::Button::with_label("New Event");
-    item.add_css_class("flat");
-    if let Some(label) = item.child().and_downcast::<gtk::Label>() {
-        label.set_halign(gtk::Align::Start);
-    }
-    popover.set_child(Some(&item));
-
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let new_item = menu_item("New Event");
     let weak = popover.downgrade();
-    item.connect_clicked(move |_| {
+    new_item.connect_clicked(move |_| {
         if let Some(popover) = weak.upgrade() {
             popover.popdown();
         }
         on_create(start, None);
     });
+    items.append(&new_item);
+
+    // Offered only when there is something to paste: a permanently dead menu
+    // entry teaches nothing, and the clipboard is empty for most of a session.
+    if (paste.ready)() {
+        let paste_item = menu_item("Paste Event");
+        let weak = popover.downgrade();
+        paste_item.connect_clicked(move |_| {
+            if let Some(popover) = weak.upgrade() {
+                popover.popdown();
+            }
+            (paste.paste)(day);
+        });
+        items.append(&paste_item);
+    }
+    popover.set_child(Some(&items));
 
     // A dismissed popover must be manually unparented or it (and everything
     // its closures captured) lives as long as its parent widget; deferred to
@@ -107,4 +152,13 @@ fn show_new_event_menu(
         glib::idle_add_local_once(move || popover.unparent());
     });
     popover.popup();
+}
+
+fn menu_item(label: &str) -> gtk::Button {
+    let item = gtk::Button::with_label(label);
+    item.add_css_class("flat");
+    if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+        label.set_halign(gtk::Align::Start);
+    }
+    item
 }

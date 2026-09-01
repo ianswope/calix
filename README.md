@@ -236,6 +236,7 @@ The calendar button in the header toggles the sidebar, which opens with a mini m
 ### Working with events
 
 - **Create**: click an empty slot (day cell in month view, hour cell in week/day view), right-click any empty spot for a **New Event** menu at that exact quarter-hour, or use the **+** header button (`Ctrl+N`).
+- **Copy and paste to another day**: **Copy** in the event popover (or `Ctrl+C` on the event you last clicked) puts an event on Calix's clipboard; right-click the day you want it on and choose **Paste Event**, or press `Ctrl+V` to drop it on the day the view is anchored to. The copy keeps its own time of day and length, lands back on the calendar it came from, and is undoable with `Ctrl+Z`. A repeat rule and a guest list are deliberately left behind: a paste makes one ordinary event, not a second series or an invitation nobody chose to send.
 - **Drag out a new event**: in week/day view, press on empty grid space and drag to draw the event's span, with a live preview snapped to 15 minutes. The dialog opens pre-filled with exactly the range you drew instead of the default hour. Dragging upward works the same as downward, and the span stops at midnight rather than spilling into the next day.
 - **Pick a calendar**: the new-event dialog's calendar dropdown lists only the calendars currently visible in the sidebar; **Show all calendars…** at the bottom expands it to everything. Hiding noisy subscribed calendars once keeps the picker short.
 - **Move and resize**: in week/day view, drag an event's body to move it, or its top/bottom edge to resize, with a live preview snapped to 15 minutes; dragging against the top or bottom of the grid auto-scrolls to off-screen hours. In month view, drag a chip to another day. Changes to synced events are pushed back to their source (Google/iCloud/CalDAV), and roll back if the remote update fails.
@@ -253,6 +254,8 @@ The calendar button in the header toggles the sidebar, which opens with a mini m
 | `Ctrl+T` | Jump to today |
 | `Ctrl+N` | New event |
 | `Ctrl+F` | Search events |
+| `Ctrl+C` / `Ctrl+V` | Copy the selected event / paste it onto the current day |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo a single-event change |
 | `Ctrl+Q` | Quit Calix, including background alerts |
 
 The digits follow the view toggles left-to-right as they appear in the header. Every binding takes Ctrl on purpose: an unmodified key belongs to whatever has focus, so a shortcut can never swallow a character you meant to type into an event title.
@@ -307,6 +310,7 @@ The digits follow the view toggles left-to-right as they appear in the header. E
 - [ ] Per-occurrence editing for local recurring events; whole-series edits for Google recurring events
 - [x] Event alerts / desktop notifications (local to the machine, while Calix runs)
 - [x] Event search
+- [x] Copy and paste an event onto another day
 - [x] Invitation responses for Google and compatible CalDAV events
 - [x] Google invitee authoring when creating events
 - [x] Background alerts with optional XDG autostart

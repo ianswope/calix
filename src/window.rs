@@ -14,7 +14,7 @@ use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
 use crate::undo;
-use crate::views::{drag::DragKind, month_view, week_view, year_view};
+use crate::views::{PageActions, PasteAction, drag::DragKind, month_view, week_view, year_view};
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
 use gtk::gdk;
@@ -44,6 +44,8 @@ enum KeyCommand {
     ViewDay,
     NewEvent,
     Search,
+    CopyEvent,
+    PasteEvent,
 }
 
 /// Maps a keypress to the command it triggers, or `None` to let it through.
@@ -89,6 +91,11 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
         gdk::Key::t | gdk::Key::T => Some(KeyCommand::Today),
         gdk::Key::n | gdk::Key::N => Some(KeyCommand::NewEvent),
         gdk::Key::f | gdk::Key::F => Some(KeyCommand::Search),
+        // The clipboard pair reaches this controller only when no entry has
+        // the focus, so Ctrl+C over the grid copies the selected event while
+        // Ctrl+C inside a text field still copies text.
+        gdk::Key::c | gdk::Key::C => Some(KeyCommand::CopyEvent),
+        gdk::Key::v | gdk::Key::V => Some(KeyCommand::PasteEvent),
         gdk::Key::Left | gdk::Key::KP_Left => Some(KeyCommand::Previous),
         gdk::Key::Right | gdk::Key::KP_Right => Some(KeyCommand::Next),
         _ => None,
@@ -97,7 +104,6 @@ fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
 
 use crate::views::CreateFn;
 use crate::views::EditFn;
-type MoveFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
 /// Work parked until a rebuild verifiably centers the carousel, run once.
 type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 
@@ -453,6 +459,13 @@ struct Ui {
     // lands. Without this a second Ctrl+Z during that window would try the same
     // change again and double-write it.
     history_busy: Rc<Cell<bool>>,
+    // The event whose inspector was opened last, and the one Ctrl+C put on the
+    // clipboard. Neither can live on a widget: every change rebuilds the grid,
+    // so a selection marked on a chip is gone by the next redraw. The clipboard
+    // holds the event as it stood when it was copied, which is also what makes
+    // a paste survive the original being edited or deleted afterwards.
+    selected_event: Rc<RefCell<Option<Event>>>,
+    clipboard: Rc<RefCell<Option<Event>>>,
 }
 
 /// Which way through the history one keypress goes.
@@ -640,6 +653,63 @@ impl Ui {
         if saved == event_dialog::Saved::StaleUntilSync {
             self.request_background_sync();
         }
+    }
+
+    /// Puts the event whose inspector was opened last on the clipboard.
+    fn copy_selected_event(self: &Rc<Self>) {
+        let Some(event) = self.selected_event.borrow().clone() else {
+            self.toast("Click an event first, then Ctrl+C to copy it");
+            return;
+        };
+        self.copy_event(event);
+    }
+
+    fn copy_event(&self, event: Event) {
+        let title = event.title.clone();
+        *self.clipboard.borrow_mut() = Some(event);
+        self.toast(&format!("Copied \u{201c}{title}\u{201d}"));
+    }
+
+    /// Writes the clipboard's event onto `target_date`, keeping its time of day
+    /// unless `target_time` names one — see [`pasted_draft`].
+    ///
+    /// The copy goes back to the calendar it came from, so a paste never has to
+    /// ask which calendar it meant. That calendar can have been disconnected or
+    /// hidden since the copy, which is why the target is resolved fresh here
+    /// rather than captured alongside the event.
+    fn paste_event(self: &Rc<Self>, target_date: NaiveDate, target_time: Option<NaiveTime>) {
+        let Some(source) = self.clipboard.borrow().clone() else {
+            self.toast("Nothing to paste yet — copy an event first");
+            return;
+        };
+        let Some(choice) = create_targets(self)
+            .into_iter()
+            .find(|choice| choice.target.calendar_id() == source.calendar_id)
+        else {
+            self.toast("That event's calendar isn't available any more");
+            return;
+        };
+        if let event_dialog::CreateTarget::Unavailable { error, .. } = &choice.target {
+            self.toast(error);
+            return;
+        }
+        let draft = pasted_draft(&source, target_date, target_time);
+        let landed = draft.start;
+        let ui = self.clone();
+        let ui_for_change = self.clone();
+        event_dialog::create_event_async(
+            self.store.clone(),
+            choice.target,
+            draft,
+            Rc::new(move |change| ui_for_change.record(change)),
+            move |outcome| match outcome {
+                Ok(saved) => {
+                    ui.apply_saved(saved);
+                    ui.toast(&format!("Pasted to {}", landed.format("%a, %b %-d")));
+                }
+                Err((message, _)) => ui.toast(&message),
+            },
+        );
     }
 
     /// Asks for a quiet background sync of every connected provider.
@@ -989,11 +1059,12 @@ impl Ui {
         ));
     }
 
-    /// The create/edit/move callbacks a timed or month page is wired up with:
-    /// clicking empty space opens a new-event dialog, clicking an event opens
-    /// it, and dragging commits a move/resize. `events` is this page's event
-    /// set, which the move handler needs to resolve a drag back to its event.
-    fn event_callbacks(self: &Rc<Self>, events: Vec<Event>) -> (CreateFn, EditFn, MoveFn) {
+    /// The callbacks a timed or month page is wired up with: clicking empty
+    /// space opens a new-event dialog, clicking an event opens it, dragging
+    /// commits a move/resize, and the right-click menu pastes what was copied.
+    /// `events` is this page's event set, which the move handler needs to
+    /// resolve a drag back to its event.
+    fn event_callbacks(self: &Rc<Self>, events: Vec<Event>) -> PageActions {
         let on_create: CreateFn = {
             let ui = self.clone();
             Rc::new(
@@ -1056,6 +1127,12 @@ impl Ui {
             Rc::new(move |event: Event, anchor: gtk::Widget| {
                 let remote = remote_event_handler(&ui, &event);
                 let ui_for_changed = ui.clone();
+                let ui_for_copy = ui.clone();
+                // Opening the inspector is what selects an event: Ctrl+C then
+                // has something to copy, and still does after the popover has
+                // been dismissed.
+                *ui.selected_event.borrow_mut() = Some(event.clone());
+                let copied = event.clone();
                 event_popover::open(
                     &anchor,
                     &event,
@@ -1063,11 +1140,29 @@ impl Ui {
                     ui.store.clone(),
                     remote,
                     Rc::new(move || ui_for_changed.reset()),
+                    Rc::new(move || ui_for_copy.copy_event(copied.clone())),
                 );
             })
         };
         let on_move = move_handler(self, events);
-        (on_create, on_edit, on_move)
+        PageActions {
+            on_create,
+            on_edit,
+            on_move,
+            paste: self.paste_action(),
+        }
+    }
+
+    /// The right-click menu's paste half. Both halves read the clipboard when
+    /// they run, not when the page was built, so a copy made after this page
+    /// was drawn is still offered.
+    fn paste_action(self: &Rc<Self>) -> PasteAction {
+        let ui_for_ready = self.clone();
+        let ui_for_paste = self.clone();
+        PasteAction {
+            ready: Rc::new(move || ui_for_ready.clipboard.borrow().is_some()),
+            paste: Rc::new(move |day| ui_for_paste.paste_event(day, None)),
+        }
     }
 
     /// Builds one page (month grid or week/day grid) for `date`, wired up to
@@ -1089,7 +1184,7 @@ impl Ui {
             .store
             .events_between(store::day_start(range_start), store::day_start(range_end))
             .unwrap_or_default();
-        let (on_create, on_edit, on_move) = self.event_callbacks(events.clone());
+        let actions = self.event_callbacks(events.clone());
 
         match view_mode {
             ViewMode::Year => {
@@ -1106,30 +1201,14 @@ impl Ui {
                     }),
                 )
             }
-            ViewMode::Month => month_view::build(date, &events, on_create, on_edit, on_move),
+            ViewMode::Month => month_view::build(date, &events, actions),
             ViewMode::Week => {
                 let hour_row_height = self.state.borrow().hour_row_height;
-                week_view::build(
-                    date,
-                    &events,
-                    on_create,
-                    on_edit,
-                    on_move,
-                    hour_row_height,
-                    initial_scroll,
-                )
+                week_view::build(date, &events, actions, hour_row_height, initial_scroll)
             }
             ViewMode::Day => {
                 let hour_row_height = self.state.borrow().hour_row_height;
-                week_view::build_day(
-                    date,
-                    &events,
-                    on_create,
-                    on_edit,
-                    on_move,
-                    hour_row_height,
-                    initial_scroll,
-                )
+                week_view::build_day(date, &events, actions, hour_row_height, initial_scroll)
             }
         }
     }
@@ -1181,9 +1260,8 @@ impl Ui {
             .store
             .events_between(store::day_start(range.0), store::day_start(range.1))
             .unwrap_or_default();
-        let (on_create, on_edit, on_move) = self.event_callbacks(events.clone());
-        let grid =
-            week_view::build_hour_grid(&days, &events, on_create, on_edit, on_move, new_height);
+        let actions = self.event_callbacks(events.clone());
+        let grid = week_view::build_hour_grid(&days, &events, actions, new_height);
         scrolled.set_child(Some(&grid));
 
         // Set the adjustment to the same time synchronously so the new grid
@@ -1298,6 +1376,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         refresh_accounts_button: refresh_accounts_button.clone(),
         history: Rc::new(RefCell::new(undo::History::default())),
         history_busy: Rc::new(Cell::new(false)),
+        selected_event: Rc::new(RefCell::new(None)),
+        clipboard: Rc::new(RefCell::new(None)),
     });
 
     LIVE_UI.with(|live| live.replace(Some(ui.clone())));
@@ -1677,6 +1757,15 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                 KeyCommand::ViewMonth => month_toggle.set_active(true),
                 KeyCommand::ViewWeek => week_toggle.set_active(true),
                 KeyCommand::ViewDay => day_toggle.set_active(true),
+                KeyCommand::CopyEvent => ui_for_keys.copy_selected_event(),
+                // With no pointer position to read, the paste lands on the day
+                // the view is anchored to, at the copy's own time of day. The
+                // toast names the day it went to, so the rule is visible rather
+                // than something to be remembered.
+                KeyCommand::PasteEvent => {
+                    let target = ui_for_keys.state.borrow().current_date;
+                    ui_for_keys.paste_event(target, None);
+                }
             }
             glib::Propagation::Stop
         }
@@ -2382,6 +2471,26 @@ fn moved_draft(
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
         attendees: event.attendees.clone(),
+    }
+}
+
+/// The event a paste writes: the copied event re-anchored on the target day.
+///
+/// Two things are deliberately left behind. A repeat rule would have the
+/// provider build a second series where the user asked for one event, and the
+/// guest list would turn a copy into an invitation nobody chose to send.
+fn pasted_draft(
+    event: &Event,
+    target_date: NaiveDate,
+    target_time: Option<NaiveTime>,
+) -> EventDraft {
+    // An all-day event has no time of day to place, so the slot a right-click
+    // landed on says nothing about where its copy belongs.
+    let target_time = (!event.all_day).then_some(target_time).flatten();
+    EventDraft {
+        recurrence: None,
+        attendees: Vec::new(),
+        ..moved_draft(event, target_date, target_time)
     }
 }
 
@@ -4154,6 +4263,15 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_copies_the_selected_event_and_ctrl_v_pastes_it() {
+        assert_eq!(key_command(gdk::Key::c, CTRL), Some(KeyCommand::CopyEvent));
+        assert_eq!(key_command(gdk::Key::v, CTRL), Some(KeyCommand::PasteEvent));
+        // Caps Lock rides along on an ordinary press and must not unbind them.
+        assert_eq!(key_command(gdk::Key::C, CTRL), Some(KeyCommand::CopyEvent));
+        assert_eq!(key_command(gdk::Key::V, CTRL), Some(KeyCommand::PasteEvent));
+    }
+
+    #[test]
     fn ctrl_z_undoes_and_the_two_usual_redo_chords_redo() {
         assert_eq!(key_command(gdk::Key::z, CTRL), Some(KeyCommand::Undo));
         assert_eq!(
@@ -4309,6 +4427,88 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 18).unwrap()
         );
         assert_eq!(draft.end.time(), NaiveTime::MIN);
+    }
+
+    #[test]
+    fn a_pasted_event_keeps_its_time_of_day_when_the_target_names_only_a_date() {
+        // A month cell names a day and nothing more: the copy belongs at the
+        // hour the original sat at, not at whatever time the cell invents for
+        // a brand-new event.
+        let event = test_event(local_at(2026, 7, 6, 9), local_at(2026, 7, 6, 10), false);
+
+        let target = NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let draft = pasted_draft(&event, target, None);
+
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(draft.start.time(), event.start.time());
+        assert_eq!(draft.end - draft.start, event.end - event.start);
+        assert_eq!(draft.title, event.title);
+    }
+
+    #[test]
+    fn a_pasted_event_lands_on_the_slot_the_target_names() {
+        let event = test_event(local_at(2026, 7, 6, 9), local_at(2026, 7, 6, 10), false);
+
+        let target = NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let draft = pasted_draft(&event, target, NaiveTime::from_hms_opt(14, 15, 0));
+
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(
+            draft.start.time(),
+            NaiveTime::from_hms_opt(14, 15, 0).unwrap()
+        );
+        assert_eq!(draft.end - draft.start, ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn a_pasted_all_day_event_keeps_its_calendar_day_span() {
+        // Same trap as the drag path: March 7-9 crosses spring forward, so a
+        // span measured in elapsed hours would land the copy's end off
+        // midnight and corrupt the exclusive end date.
+        let event = test_event(local_midnight(2026, 3, 7), local_midnight(2026, 3, 9), true);
+
+        let target = NaiveDate::from_ymd_opt(2026, 3, 16).unwrap();
+        let draft = pasted_draft(
+            &event,
+            target,
+            Some(NaiveTime::from_hms_opt(14, 0, 0).unwrap()),
+        );
+
+        // An all-day copy ignores the clicked time: it has no time of day.
+        assert_eq!(draft.start.time(), NaiveTime::MIN);
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(
+            draft.end.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 18).unwrap()
+        );
+        assert_eq!(draft.end.time(), NaiveTime::MIN);
+    }
+
+    #[test]
+    fn pasting_leaves_the_repeat_rule_and_the_guest_list_behind() {
+        // A paste creates one ordinary event. Carrying the rule over would
+        // build a second series on the provider, and carrying the attendees
+        // over would mail an invitation nobody asked to send.
+        let mut event = test_event(local_at(2026, 7, 6, 9), local_at(2026, 7, 6, 10), false);
+        event.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        event.attendees = vec![store::Attendee {
+            email: "friend@example.com".to_string(),
+            name: None,
+            status: None,
+            is_self: false,
+        }];
+        event.location = Some("Room 5".to_string());
+        event.notes = Some("Bring the deck".to_string());
+        event.reminder_minutes = Some(10);
+
+        let draft = pasted_draft(&event, NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(), None);
+
+        assert_eq!(draft.recurrence, None);
+        assert!(draft.attendees.is_empty());
+        // Everything that describes the event itself does come along.
+        assert_eq!(draft.location.as_deref(), Some("Room 5"));
+        assert_eq!(draft.notes.as_deref(), Some("Bring the deck"));
+        assert_eq!(draft.reminder_minutes, Some(10));
     }
 
     #[test]

@@ -1,13 +1,10 @@
 use crate::date_util::month_grid;
 use crate::store::Event;
 use crate::views::{
-    CreateFn, EditFn, add_new_event_menu,
-    drag::{DragKind, parse_drag_payload},
-    event_occurs_on_day, event_widget,
+    MoveFn, PageActions, add_slot_menu, drag::parse_drag_payload, event_occurs_on_day, event_widget,
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
-use std::rc::Rc;
 
 const WEEKDAY_LABELS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MAX_CHIPS_PER_CELL: usize = 3;
@@ -17,13 +14,7 @@ const MAX_CHIPS_PER_CELL: usize = 3;
 /// to (at least) the grid's visible range. Clicking empty cell space calls
 /// `on_create` with 9am on that date; clicking an event chip calls
 /// `on_edit` with that event.
-pub fn build(
-    anchor: NaiveDate,
-    events: &[Event],
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
-) -> gtk::Widget {
+pub fn build(anchor: NaiveDate, events: &[Event], actions: PageActions) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
@@ -60,15 +51,7 @@ pub fn build(
             .filter(|event| event_occurs_on_day(event, *date))
             .cloned()
             .collect();
-        let cell = day_cell(
-            *date,
-            current_month,
-            today,
-            day_events,
-            on_create.clone(),
-            on_edit.clone(),
-            on_move.clone(),
-        );
+        let cell = day_cell(*date, current_month, today, day_events, actions.clone());
         grid.attach(&cell, col, row, 1, 1);
     }
 
@@ -81,10 +64,14 @@ fn day_cell(
     current_month: u32,
     today: NaiveDate,
     day_events: Vec<Event>,
-    on_create: CreateFn,
-    on_edit: EditFn,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
+    actions: PageActions,
 ) -> gtk::Widget {
+    let PageActions {
+        on_create,
+        on_edit,
+        on_move,
+        paste,
+    } = actions;
     let cell = gtk::Box::new(gtk::Orientation::Vertical, 2);
     cell.add_css_class("month-cell");
     if date == today {
@@ -129,15 +116,18 @@ fn day_cell(
     cell.append(&spacer);
 
     // Right-clicking empty cell space offers a new event on that day, at
-    // the same 9 AM default a plain click uses.
-    add_new_event_menu(
+    // the same 9 AM default a plain click uses — and a paste, which keeps the
+    // copied event's own time of day rather than that placeholder hour.
+    add_slot_menu(
         &cell,
+        date,
         move |_, _| {
             date.and_time(NaiveTime::from_hms_opt(9, 0, 0)?)
                 .and_local_timezone(Local)
                 .single()
         },
         on_create.clone(),
+        paste,
     );
 
     let click = gtk::GestureClick::new();
@@ -156,11 +146,7 @@ fn day_cell(
     cell.upcast()
 }
 
-fn add_drop_target(
-    widget: &impl IsA<gtk::Widget>,
-    date: NaiveDate,
-    on_move: Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>,
-) {
+fn add_drop_target(widget: &impl IsA<gtk::Widget>, date: NaiveDate, on_move: MoveFn) {
     let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
     drop.connect_drop(move |_, value, _, _| {
         let Ok(event_id) = value.get::<String>() else {
