@@ -33,6 +33,13 @@
 - An undo only applies while the event still holds what the change wrote. If
   something else has edited it since — including a sync, or an invitation
   response arriving — Calix says so and leaves the newer version alone.
+- Two command lines for reading the calendar from something else:
+  `calix --agenda [FROM [THROUGH]]` prints the appointments in a range as JSON,
+  and `calix --calendars` prints the calendars currently shown. Both answer
+  before the window is touched, so neither opens one or keeps the app alive,
+  and both read the database read-only so a running Calix is undisturbed. Meant
+  for a status-bar widget on a refresh timer; see the README for the row shape
+  and the error codes.
 
 ### Changed
 

@@ -2,7 +2,7 @@ use crate::recurrence::Frequency;
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Someone invited to an event. Attendee lists are read-only here: they come
 /// from the remote provider, so they live outside [`EventDraft`] and a local
@@ -181,18 +181,60 @@ pub struct Store {
 
 impl Store {
     pub fn open() -> rusqlite::Result<Self> {
-        let path = data_file_path();
+        Self::open_at(&data_file_path())
+    }
+
+    pub(crate) fn open_at(path: &Path) -> rusqlite::Result<Self> {
         let directory = path.parent().expect("data file has a parent dir");
         std::fs::create_dir_all(directory).map_err(sqlite_io_error)?;
         set_owner_only_permissions(directory, 0o700).map_err(sqlite_io_error)?;
 
-        let connection = Connection::open(&path)?;
+        let connection = Connection::open(path)?;
         // Tightened before the first write, not after it: SQLite copies the
         // database file's mode onto the -wal and -shm it creates, and those hold
         // real event data. Chmodding after `from_connection` ran the migrations
         // left both of them at whatever the umask allowed.
-        set_owner_only_permissions(&path, 0o600).map_err(sqlite_io_error)?;
+        set_owner_only_permissions(path, 0o600).map_err(sqlite_io_error)?;
         Self::from_connection(connection)
+    }
+
+    /// The store opened for reading only: no migrations, no writes, and no
+    /// database created if there isn't one already.
+    ///
+    /// This is what the `--agenda` command line uses. It runs on the bar
+    /// widget's refresh timer — once a minute, against the same file a running
+    /// Calix has open — so it must never be the thing that migrates the schema
+    /// or takes a write lock behind the app's back.
+    pub fn open_read_only() -> rusqlite::Result<Self> {
+        Self::open_read_only_at(&data_file_path())
+    }
+
+    pub(crate) fn open_read_only_at(path: &Path) -> rusqlite::Result<Self> {
+        use rusqlite::OpenFlags;
+
+        // No CREATE flag: a database that isn't there is an unset-up calendar,
+        // and an empty one conjured here would answer "no meetings" forever.
+        let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let connection = Connection::open_with_flags(path, read_only)?;
+        // A read-only handle still shares the busy timeout: a concurrent
+        // checkpoint by the running app shouldn't turn into an instant
+        // `database is locked`.
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        // A read-only handle can create the -shm a WAL database needs, so long
+        // as the directory allows it — that much needs no fallback. What it
+        // cannot do is recover a -wal left behind by a crash, which SQLite
+        // reports on the first read rather than at open; hence the probe. The
+        // fallback handle can recover it, and still skips `from_connection`,
+        // which is where the migrations we're keeping out of a once-a-minute
+        // refresh live.
+        if probe_readable(&connection).is_err() {
+            let read_write = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let connection = Connection::open_with_flags(path, read_write)?;
+            connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            return Ok(Self { conn: connection });
+        }
+        Ok(Self { conn: connection })
     }
 
     #[cfg(test)]
@@ -1276,6 +1318,12 @@ fn normalized_timestamp(value: &str) -> Option<String> {
     (normalized != value).then_some(normalized)
 }
 
+/// One real read, to find out whether this connection can actually see the
+/// database's contents — see [`Store::open_read_only_at`].
+fn probe_readable(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+}
+
 fn data_file_path() -> PathBuf {
     crate::xdg::data_home().join("calix").join("calix.sqlite3")
 }
@@ -1333,10 +1381,6 @@ mod tests {
             store.create_event(1, &event).expect("the event to store");
         }
         store
-    }
-
-    fn titles(events: &[Event]) -> Vec<&str> {
-        events.iter().map(|event| event.title.as_str()).collect()
     }
 
     #[test]
@@ -1402,6 +1446,87 @@ mod tests {
             store.recent_locations("%", 6).unwrap(),
             vec!["50% off tent"]
         );
+    }
+
+    /// A database in a directory of its own, named for the test that asked for
+    /// it so parallel tests never share one. Follows `config.rs`'s temp-file
+    /// convention rather than adding a dev-dependency.
+    ///
+    /// The directory matters: `open_at` locks its parent down to 0700, the way
+    /// it does for `~/.local/share/calix`. Handed the bare temp directory it
+    /// would be trying to chmod `/tmp`.
+    fn temp_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "calix-store-test-{}-{}-{}",
+                std::process::id(),
+                label,
+                std::thread::current().name().unwrap_or("unnamed")
+            ))
+            .join("calix.sqlite3")
+    }
+
+    fn remove_db(path: &Path) {
+        let _ = std::fs::remove_dir_all(path.parent().expect("a database directory"));
+    }
+
+    #[test]
+    fn a_read_only_store_reads_what_the_writable_one_stored() {
+        let path = temp_db_path("ro-reads");
+        remove_db(&path);
+        let start = Local
+            .with_ymd_and_hms(2026, 8, 31, 9, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        {
+            let store = Store::open_at(&path).expect("a writable store");
+            store
+                .create_event(1, &draft("Standup", start, start + Duration::hours(1)))
+                .expect("the event to store");
+        }
+
+        let reader = Store::open_read_only_at(&path).expect("a read-only store");
+        let events = reader
+            .events_between(start - Duration::hours(1), start + Duration::hours(2))
+            .expect("the range to query");
+
+        assert_eq!(titles(&events), ["Standup"]);
+        remove_db(&path);
+    }
+
+    #[test]
+    fn a_read_only_store_cannot_write() {
+        let path = temp_db_path("ro-refuses");
+        remove_db(&path);
+        let start = Local
+            .with_ymd_and_hms(2026, 8, 31, 9, 0, 0)
+            .single()
+            .expect("an unambiguous local time");
+        drop(Store::open_at(&path).expect("a writable store"));
+
+        let reader = Store::open_read_only_at(&path).expect("a read-only store");
+        assert!(
+            reader
+                .create_event(1, &draft("Nope", start, start + Duration::hours(1)))
+                .is_err()
+        );
+        remove_db(&path);
+    }
+
+    #[test]
+    fn a_read_only_store_does_not_conjure_a_missing_database() {
+        // The agenda command runs whether or not Calix has ever been opened.
+        // Creating an empty database here would answer "no meetings" forever
+        // instead of saying the calendar isn't set up yet.
+        let path = temp_db_path("ro-missing");
+        remove_db(&path);
+
+        assert!(Store::open_read_only_at(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    fn titles(events: &[Event]) -> Vec<&str> {
+        events.iter().map(|event| event.title.as_str()).collect()
     }
 
     #[test]

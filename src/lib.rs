@@ -11,6 +11,7 @@
 //! The GTK frontend lives behind `gui` (on by default) and is what the `calix`
 //! binary runs.
 
+pub mod agenda;
 pub mod autostart;
 pub mod build_info;
 pub mod caldav;
@@ -78,6 +79,17 @@ pub fn run() -> gtk::glib::ExitCode {
         return glib::ExitCode::SUCCESS;
     }
 
+    // Both agenda command lines are answered here, before GTK: they exist for
+    // a status-bar widget to read on a timer, and reading the day's meetings
+    // must never be the thing that opens a window or holds the app alive.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = agenda::handle_cli(&args) {
+        return match code {
+            0 => glib::ExitCode::SUCCESS,
+            _ => glib::ExitCode::FAILURE,
+        };
+    }
+
     // Same line into the journal, so a bug report from a running instance
     // carries its provenance without anyone having to think of it.
     eprintln!("calix {}", build_info::stamp());
@@ -85,7 +97,6 @@ pub fn run() -> gtk::glib::ExitCode {
     // Checked here, in the process the user typed into, so a bad date prints
     // where they can see it. Once forwarded, stderr belongs to whichever
     // instance started first and the complaint would land in its journal.
-    let args: Vec<String> = std::env::args().collect();
     if let Err(message) = date_util::parse_date_arg(&args) {
         eprintln!("calix: {message}");
         return glib::ExitCode::FAILURE;

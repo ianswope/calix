@@ -142,6 +142,21 @@ pub fn local_day_start(date: NaiveDate) -> DateTime<Local> {
     day_start_in(&Local, date)
 }
 
+/// The last calendar day an event's `[start, end)` span covers.
+///
+/// A span ending at exactly midnight ends the day before: that's the form an
+/// all-day event arrives in from Google and CalDAV, both of which give the end
+/// date exclusive, and it's what stops a one-day event from painting over two.
+/// A zero-length span is left on its own day rather than backed off the
+/// calendar entirely.
+pub fn last_covered_day(start: DateTime<Local>, end: DateTime<Local>) -> NaiveDate {
+    let last = end.date_naive();
+    if end.time() == NaiveTime::MIN && end > start {
+        return last - chrono::Duration::days(1);
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +190,46 @@ mod tests {
         assert_eq!(shift_years(d(2026, 8, 10), 2), d(2028, 8, 10));
         assert_eq!(shift_years(d(2026, 8, 10), -3), d(2023, 8, 10));
         assert_eq!(shift_years(d(2026, 8, 10), 0), d(2026, 8, 10));
+    }
+
+    fn at(y: i32, m: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(y, m, day, hour, minute, 0)
+            .single()
+            .expect("an unambiguous local time")
+    }
+
+    #[test]
+    fn a_span_ending_at_midnight_covers_through_the_day_before() {
+        // How an all-day event is stored: Google and CalDAV both send the end
+        // date exclusive, so a single day runs midnight to midnight.
+        assert_eq!(
+            last_covered_day(at(2026, 8, 31, 0, 0), at(2026, 9, 1, 0, 0)),
+            d(2026, 8, 31)
+        );
+    }
+
+    #[test]
+    fn a_span_ending_during_a_day_covers_that_day() {
+        assert_eq!(
+            last_covered_day(at(2026, 8, 31, 9, 0), at(2026, 8, 31, 10, 30)),
+            d(2026, 8, 31)
+        );
+    }
+
+    #[test]
+    fn a_multi_day_all_day_span_covers_through_its_last_whole_day() {
+        assert_eq!(
+            last_covered_day(at(2026, 8, 31, 0, 0), at(2026, 9, 3, 0, 0)),
+            d(2026, 9, 2)
+        );
+    }
+
+    #[test]
+    fn an_empty_span_at_midnight_stays_on_its_own_day() {
+        // Backing this one off would put the event on no day at all.
+        let midnight = at(2026, 8, 31, 0, 0);
+        assert_eq!(last_covered_day(midnight, midnight), d(2026, 8, 31));
     }
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {

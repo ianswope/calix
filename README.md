@@ -263,6 +263,35 @@ The calendar button in the header toggles the sidebar, which opens with a mini m
 
 The digits follow the view toggles left-to-right as they appear in the header. Every binding but `Esc` takes Ctrl on purpose: an unmodified key belongs to whatever has focus, so a shortcut can never swallow a character you meant to type into an event title. `Esc` is safe unmodified because nothing on the grid takes typing, and a popover, menu or dialog claims its own `Esc` long before the window sees it.
 
+## Reading your agenda from something else
+
+Calix already holds your appointments, synced and recurrence-expanded, so a
+status-bar widget or a script can read them without a second sign-in of its own:
+
+```sh
+calix --agenda                          # today
+calix --agenda 2026-09-02               # one day
+calix --agenda 2026-09-02 2026-09-08    # a range, both ends included
+calix --calendars                       # the calendars currently shown
+```
+
+Both print JSON on stdout and answer before the window is touched, so neither
+opens one or keeps the app alive — which is what makes them safe on a widget's
+refresh timer. The database is opened read-only, so a running Calix is
+undisturbed.
+
+An appointment carries `start_date`, `start_time`, `end_date`, `end_time`,
+`title`, `calendar`, `location`, `description`, `attendees` and
+`conference_uri`, which is the first joinable meeting link found in the notes.
+An all-day event has empty times and an **exclusive** end date, the way Google
+and CalDAV report one. Each row's `id` is unique per occurrence, so the
+repeats of a series can be told apart.
+
+Failures print `{"error": "..."}` and exit non-zero: `not-set-up` when there is
+no calendar database yet, `bad-request` for an unreadable date, `query-failed`
+if the database can't be read. A widget can render a state from those rather
+than guessing from an empty list.
+
 ## Architecture
 
 - `src/date_util.rs` — pure date-math helpers (month grids, week ranges, month/week shifting), unit tested independent of any GTK state.

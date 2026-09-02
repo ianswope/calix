@@ -203,12 +203,8 @@ pub(crate) struct PageActions {
 
 /// Whether an event's half-open time range includes a calendar date.
 pub(crate) fn event_occurs_on_day(event: &Event, day: NaiveDate) -> bool {
-    let start = event.start.date_naive();
-    let mut end = event.end.date_naive();
-    if event.end.time() == NaiveTime::MIN && event.end > event.start {
-        end -= chrono::Duration::days(1);
-    }
-    start <= day && day <= end
+    event.start.date_naive() <= day
+        && day <= crate::date_util::last_covered_day(event.start, event.end)
 }
 
 /// Attach the right-click menu for empty calendar space to `widget`: New Event
