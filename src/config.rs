@@ -112,13 +112,22 @@ impl Config {
         // Written on top of what is already there. config.toml is hand-edited,
         // and connecting an account must not take away a section the user put
         // in it themselves.
+        let existing = Self::load_from(path.to_path_buf());
+        // A file that wouldn't parse is a file whose contents we don't know.
+        // Writing our own on top of it would silently throw away whatever else
+        // the user had in there, so say what's wrong and change nothing.
+        if let Some(error) = existing.load_error {
+            return Err(format!(
+                "{error}. Fix or remove that file, then connect the account again."
+            ));
+        }
         let config = Config {
             google: Some(GoogleConfig {
                 client_id: client_id.to_string(),
                 client_secret: client_secret.to_string(),
             }),
             load_error: None,
-            ..Self::load_from(path.to_path_buf())
+            ..existing
         };
         let directory = path
             .parent()
@@ -215,6 +224,44 @@ mod tests {
             Some("an-id")
         );
         assert_eq!(reloaded.places_endpoint(), None);
+    }
+
+    /// A config file in a directory of its own, named for the test that asked
+    /// for it. The directory matters: saving locks the config's parent down to
+    /// 0700, and handed the bare temp directory it would try to chmod /tmp.
+    fn temp_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "calix-config-{}-{}-{}",
+                std::process::id(),
+                label,
+                std::thread::current().name().unwrap_or("unnamed")
+            ))
+            .join("config.toml")
+    }
+
+    #[test]
+    fn saving_google_credentials_refuses_to_overwrite_a_file_it_cannot_read() {
+        // config.toml is hand-written. One typo in it must not cost the user
+        // everything else they put there: the parse failure means we don't know
+        // what the file says, so it isn't ours to rewrite.
+        let path = temp_config_path("malformed");
+        std::fs::create_dir_all(path.parent().expect("a config directory")).unwrap();
+        let original = "[places\nenabled = false\n";
+        std::fs::write(&path, original).unwrap();
+
+        let result = Config::save_google_at(&path, "an-id", "a-secret");
+        let after = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().expect("a config directory"));
+
+        assert_eq!(after, original, "the file must be left exactly as it was");
+        let Err(message) = result else {
+            panic!("a file we can't parse must not be rewritten");
+        };
+        assert!(
+            message.contains("config.toml"),
+            "the message should name the file to fix: {message}"
+        );
     }
 
     #[test]

@@ -78,6 +78,11 @@
   the worst case, leaking a full day grid per frame. The window's own state
   went the same way, which in background mode left a closed window's sync,
   alert and clock timers running for the life of the process.
+- A Google sign-in can no longer be left unfinishable by a browser that opens
+  a connection to the sign-in listener and sends nothing.
+- Connecting a Google account no longer overwrites a `config.toml` that Calix
+  couldn't parse. It reports the problem instead, leaving whatever else the
+  file holds intact.
 
 ### Known gaps
 

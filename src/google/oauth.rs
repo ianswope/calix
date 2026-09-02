@@ -20,6 +20,10 @@ const SCOPES: [&str; 2] = [
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://www.googleapis.com/oauth2/v3/token";
 const REDIRECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long to wait for the request line once a connection has been accepted.
+/// Generous for a local socket that has already connected, and bounded so a
+/// connection that never speaks can't hold the sign-in open.
+const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SignInTokens {
     pub access_token: String,
@@ -224,7 +228,17 @@ fn http_client() -> Result<reqwest::blocking::Client, AuthError> {
 }
 
 fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfToken), AuthError> {
-    let deadline = Instant::now() + REDIRECT_TIMEOUT;
+    receive_redirect_within(listener, REDIRECT_TIMEOUT, REDIRECT_READ_TIMEOUT)
+}
+
+/// [`receive_redirect`] with both deadlines given, so a test can drive them
+/// without waiting out the real ones.
+fn receive_redirect_within(
+    listener: &TcpListener,
+    accept_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<(AuthorizationCode, CsrfToken), AuthError> {
+    let deadline = Instant::now() + accept_timeout;
     let mut stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
@@ -237,6 +251,16 @@ fn receive_redirect(listener: &TcpListener) -> Result<(AuthorizationCode, CsrfTo
             Err(error) => return Err(AuthError::Io(error)),
         }
     };
+    // The listener is non-blocking so the accept loop above can time out; the
+    // accepted socket may inherit that, and a non-blocking read would fail
+    // instantly on a connection that hasn't sent its request yet. Blocking with
+    // a deadline is what's wanted: a browser preconnect that opens a socket and
+    // sends nothing would otherwise hang this thread — and the sign-in — for
+    // good, since the accept deadline is already behind us.
+    stream.set_nonblocking(false).map_err(AuthError::Io)?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(AuthError::Io)?;
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).map_err(AuthError::Io)?;
@@ -276,4 +300,60 @@ fn open_in_browser(url: &str) -> Result<(), AuthError> {
         .spawn()
         .map(|_| ())
         .map_err(AuthError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpStream;
+
+    /// A listener set up the way `sign_in` sets one up.
+    fn loopback() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking, as sign_in sets it");
+        let port = listener.local_addr().expect("an address").port();
+        (listener, port)
+    }
+
+    #[test]
+    fn a_redirect_carrying_the_code_and_state_is_read() {
+        let (listener, port) = loopback();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("to connect");
+            let _ = stream.write_all(b"GET /?code=abc123&state=xyz789 HTTP/1.1\r\n\r\n");
+            // Hold the connection open while the server replies.
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let (code, state) =
+            receive_redirect_within(&listener, Duration::from_secs(5), Duration::from_secs(5))
+                .expect("the redirect to be read");
+
+        assert_eq!(code.secret(), "abc123");
+        assert_eq!(state.secret(), "xyz789");
+        client.join().expect("the client thread");
+    }
+
+    #[test]
+    fn a_connection_that_never_sends_a_request_gives_up_instead_of_hanging() {
+        // What a browser's speculative preconnect looks like: the socket opens
+        // and nothing follows. Without a read deadline this blocked forever,
+        // leaving Accounts disabled and the sign-in unfinishable.
+        let (listener, port) = loopback();
+        let silent = TcpStream::connect(("127.0.0.1", port)).expect("to connect");
+
+        let started = Instant::now();
+        let result =
+            receive_redirect_within(&listener, Duration::from_secs(5), Duration::from_millis(50));
+
+        assert!(result.is_err(), "a silent connection must not be waited on");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it gave up after {:?}, which is not a deadline",
+            started.elapsed()
+        );
+        drop(silent);
+    }
 }
