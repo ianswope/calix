@@ -1,4 +1,7 @@
-use chrono::{DateTime, Datelike, Local, Months, NaiveDate, NaiveTime, TimeZone, Weekday};
+use chrono::{
+    DateTime, Datelike, Local, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone,
+    Weekday,
+};
 
 /// The day Calix was asked to open on, from its command line.
 ///
@@ -121,18 +124,35 @@ pub fn shift_days(date: NaiveDate, delta: i32) -> NaiveDate {
 /// drop the day (as `.single()?` would), resolve to the first wall-clock
 /// instant the civil day actually reached.
 pub fn day_start_in<Tz: TimeZone>(tz: &Tz, date: NaiveDate) -> DateTime<Tz> {
-    let midnight = date.and_time(NaiveTime::MIN);
-    if let Some(instant) = tz.from_local_datetime(&midnight).earliest() {
+    resolve_forward(tz, date.and_time(NaiveTime::MIN))
+}
+
+/// The instant a wall-clock reading names in `tz`, resolved forward when the
+/// clock makes that ambiguous or impossible.
+///
+/// A reading inside a repeated hour (the clocks fell back) takes its first
+/// occurrence. A reading the clocks skipped over (they sprang forward) is read
+/// with the offset that was in force just before the gap, as RFC 5545 §3.3.5
+/// prescribes: 2:30 AM in a 2–3 AM gap is the instant that shows as 3:30 AM
+/// once the clocks have moved, which is what Apple and Google display for it.
+/// Only a zone that skips more than two whole days would leave no offset to
+/// find, and then the reading is taken as UTC rather than panicking.
+pub fn resolve_forward<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> DateTime<Tz> {
+    if let Some(instant) = tz.from_local_datetime(&naive).earliest() {
         return instant;
     }
-    // Midnight itself was skipped: walk forward to the first minute this civil
-    // day (or, for a wholly skipped date, the next one) actually reached.
-    (1..=48 * 60)
-        .find_map(|minutes| {
-            tz.from_local_datetime(&(midnight + chrono::Duration::minutes(minutes)))
-                .earliest()
-        })
-        .unwrap_or_else(|| tz.from_utc_datetime(&midnight))
+    // The offset before the gap is the one the last real minute before it had.
+    let before_gap = (1..=48 * 60).find_map(|minutes| {
+        tz.from_local_datetime(&(naive - chrono::Duration::minutes(minutes)))
+            .earliest()
+    });
+    match before_gap {
+        Some(before) => {
+            let offset = chrono::Duration::seconds(before.offset().fix().local_minus_utc().into());
+            tz.from_utc_datetime(&(naive - offset))
+        }
+        None => tz.from_utc_datetime(&naive),
+    }
 }
 
 /// [`day_start_in`] specialized to the system's local timezone — turning a

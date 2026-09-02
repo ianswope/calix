@@ -248,12 +248,12 @@ impl RemoteEvent {
         matches!(self, Self::Caldav { event_href, .. } if event_href.contains('#'))
     }
 
-    /// Applies an edit to every occurrence of a series, shifting the series by
-    /// `start_delta` (how far the edited occurrence's start moved).
+    /// Applies an edit to every occurrence of a series, moving the series by
+    /// `shift` (how far the edited occurrence's start moved).
     pub fn update_all_events(
         &self,
         draft: &EventDraft,
-        start_delta: chrono::Duration,
+        shift: caldav::SeriesShift,
     ) -> Result<(), String> {
         match self {
             Self::Caldav {
@@ -263,7 +263,7 @@ impl RemoteEvent {
                 event_href,
             } => {
                 let credentials = caldav_credentials(base_url, username, token_key)?;
-                caldav::update_series(&credentials, event_href, start_delta, draft)
+                caldav::update_series(&credentials, event_href, shift, draft)
             }
             // Only CalDAV series expose the choice today; anything else edits
             // in place as usual.
@@ -766,12 +766,12 @@ pub fn open(
                 // "All events" shifts the series by however far this occurrence's
                 // start moved; anything else edits just this occurrence.
                 let all_events = scope_row.selected() == 1;
-                let start_delta = draft.start - event.start;
+                let shift = caldav::SeriesShift::between(event.start, draft.start);
                 let (tx, rx) = mpsc::channel();
                 let remote_draft = draft.clone();
                 std::thread::spawn(move || {
                     let result = if all_events {
-                        remote_event.update_all_events(&remote_draft, start_delta)
+                        remote_event.update_all_events(&remote_draft, shift)
                     } else {
                         remote_event.update(&remote_draft)
                     };

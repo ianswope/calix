@@ -49,6 +49,29 @@
   way of creating an event — double-click, drag across the grid, the right-click
   menu, the **+** button, Ctrl+N — is unchanged.
 
+### Fixed
+
+- Replying to an iCloud or CalDAV invitation no longer corrupts the event on
+  the server. The reply was being spliced into the guest's address instead of
+  replacing their response, so Accept, Maybe and Decline sent back an invalid
+  guest line.
+- CalDAV servers that write their XML with an unexpected namespace prefix are
+  read correctly. Their responses used to be missed entirely, which made a sync
+  treat every cached event — and every calendar — as deleted on the server.
+- Editing a synced event that was created with a duration rather than an end
+  time now writes a valid event; it used to carry both.
+- Editing a repeating CalDAV event that the server handed back unexpanded is
+  refused with an explanation, instead of silently re-anchoring the whole
+  series on the occurrence that was clicked and dropping its time zone.
+- **All events** edits that move a series across a daylight-saving change land
+  where they were dragged: an all-day series moves a whole day rather than
+  none, and a timed series keeps its hour rather than shifting by one.
+- A CalDAV event at a time the clocks skipped (2:30 AM on a spring-forward day)
+  is placed an hour later, the way the iCalendar standard and Apple Calendar
+  place it, instead of being left out of the sync.
+- Calendar and event names carrying `&`, `<` or an apostrophe as an XML entity
+  decode correctly, numeric entities included.
+
 ### Known gaps
 
 - An event deleted from a synced calendar can't be restored yet; Calix says so

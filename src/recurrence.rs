@@ -208,20 +208,11 @@ fn months_between(from: NaiveDate, to: NaiveDate) -> i64 {
     (to.year() - from.year()) as i64 * 12 + (to.month() as i64 - from.month() as i64)
 }
 
-/// Resolves a civil date+time to `tz`, preferring the exact instant but walking
-/// forward to the first real one if that wall-clock time was skipped by a DST
-/// spring-forward — the same policy as [`crate::date_util::day_start_in`].
+/// Resolves a civil date+time to `tz`, walking forward past a DST gap — the
+/// one policy for skipped and repeated wall-clock times, shared with
+/// [`crate::date_util::day_start_in`].
 fn resolve_forward<Tz: TimeZone>(tz: &Tz, date: NaiveDate, time: NaiveTime) -> DateTime<Tz> {
-    let naive = date.and_time(time);
-    if let Some(instant) = tz.from_local_datetime(&naive).earliest() {
-        return instant;
-    }
-    (1..=48 * 60)
-        .find_map(|minutes| {
-            tz.from_local_datetime(&(naive + Duration::minutes(minutes)))
-                .earliest()
-        })
-        .unwrap_or_else(|| tz.from_utc_datetime(&naive))
+    crate::date_util::resolve_forward(tz, date.and_time(time))
 }
 
 #[cfg(test)]

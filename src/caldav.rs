@@ -44,12 +44,7 @@ struct IcsEvent {
 /// `mailto:someone@example.com`; entries without a usable address are dropped
 /// rather than listed blank.
 fn parse_ics_attendee(parameters: &str, value: &str) -> Option<Attendee> {
-    let raw = value.trim();
-    let email = match raw.get(..7) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("mailto:") => &raw[7..],
-        _ => raw,
-    }
-    .trim();
+    let email = mailto_address(value);
     if !email.contains('@') {
         return None;
     }
@@ -319,49 +314,78 @@ pub fn respond_to_event(
         "tentative" => "TENTATIVE",
         _ => return Err("Unknown invitation response".to_string()),
     };
+    let ics = reply_to_invitation(&existing_ics, attendee_email, partstat)?;
+    put_event(credentials, &url, &ics, etag.as_deref())
+}
+
+/// The resource with `attendee_email`'s reply recorded: every `ATTENDEE` line
+/// naming that address gets `PARTSTAT={partstat}` in place of whatever reply
+/// it carried, and every other line is left exactly as it was.
+fn reply_to_invitation(ics: &str, attendee_email: &str, partstat: &str) -> Result<String, String> {
     let mut found = false;
-    let lines = unfold_ics(&existing_ics)
+    let lines = unfold_ics(ics)
         .into_iter()
         .map(|line| {
-            if property_name(&line).is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"))
-                && line.rsplit_once(':').is_some_and(|(_, value)| {
-                    value
-                        .trim_start_matches("mailto:")
-                        .eq_ignore_ascii_case(attendee_email)
-                })
-            {
-                found = true;
-                let (head, value) = line.rsplit_once(':').expect("matched attendee has a value");
-                let mut parameters = head
-                    .split(';')
-                    .filter(|part| !part.to_ascii_uppercase().starts_with("PARTSTAT="))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                parameters.push(format!("PARTSTAT={partstat}"));
-                format!("{}:{value}", parameters.join(";"))
-            } else {
-                line
+            let is_attendee =
+                property_name(&line).is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"));
+            let Some((head, value)) = split_content_line(&line).filter(|_| is_attendee) else {
+                return line;
+            };
+            if !mailto_address(value).eq_ignore_ascii_case(attendee_email) {
+                return line;
             }
+            found = true;
+            // The value — `mailto:` and all — is carried over untouched; only
+            // the PARTSTAT parameter is replaced.
+            let mut parameters = split_parameters(head)
+                .into_iter()
+                .filter(|parameter| !parameter.to_ascii_uppercase().starts_with("PARTSTAT="))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            parameters.push(format!("PARTSTAT={partstat}"));
+            format!("{}:{value}", parameters.join(";"))
         })
         .collect::<Vec<_>>();
     if !found {
         return Err("The server did not identify your invitation on this event".to_string());
     }
-    put_event(
-        credentials,
-        &url,
-        &(lines.join("\r\n") + "\r\n"),
-        etag.as_deref(),
-    )
+    Ok(lines.join("\r\n") + "\r\n")
 }
 
-/// Edits a whole series ("all events") from one of its occurrences, shifting the
-/// series by `start_delta` (the amount that occurrence's start moved).
-/// `event_href` may be either the master resource or an `href#instance`.
+/// How far an "all events" edit moves a series, in the two forms an iCalendar
+/// date-time takes. A UTC value (`…Z`) names an instant, so it moves by the
+/// exact elapsed time. A value in a named zone, a floating one, or a bare date
+/// names a wall-clock reading, so it moves by the change in that reading —
+/// which differs from the exact one by an hour whenever the move crosses a DST
+/// transition, and is what keeps a 9 AM series at 9 AM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeriesShift {
+    exact: chrono::Duration,
+    wall_clock: chrono::Duration,
+}
+
+impl SeriesShift {
+    /// The shift that takes an occurrence starting at `from` to one starting
+    /// at `to`.
+    pub fn between<Tz: TimeZone>(from: DateTime<Tz>, to: DateTime<Tz>) -> Self {
+        Self {
+            wall_clock: to.naive_local() - from.naive_local(),
+            exact: to - from,
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.exact.is_zero() && self.wall_clock.is_zero()
+    }
+}
+
+/// Edits a whole series ("all events") from one of its occurrences, moving the
+/// series by `shift` (how far that occurrence's start moved). `event_href` may
+/// be either the master resource or an `href#instance`.
 pub fn update_series(
     credentials: &Credentials,
     event_href: &str,
-    start_delta: chrono::Duration,
+    shift: SeriesShift,
     draft: &EventDraft,
 ) -> Result<(), String> {
     let resource_href = event_href
@@ -369,7 +393,7 @@ pub fn update_series(
         .map_or(event_href, |(href, _)| href);
     let url = absolute_url(&credentials.base_url, resource_href)?;
     let (existing_ics, etag) = fetch_event(credentials, &url)?;
-    let ics = edit_master_series(&existing_ics, start_delta, draft)?;
+    let ics = edit_master_series(&existing_ics, shift, draft)?;
     put_event(credentials, &url, &ics, etag.as_deref())?;
     Ok(())
 }
@@ -735,7 +759,7 @@ fn multistatus_responses(xml: &str) -> Vec<String> {
             break;
         };
         let content_start = start + open_end + 1;
-        let Some(close_start) = find_closing_response(rest, content_start) else {
+        let Some(close_start) = find_closing_tag(rest, "response", content_start) else {
             break;
         };
         let close = &rest[close_start..];
@@ -747,13 +771,6 @@ fn multistatus_responses(xml: &str) -> Vec<String> {
         }
     }
     responses
-}
-
-fn find_closing_response(xml: &str, from: usize) -> Option<usize> {
-    ["</D:response", "</d:response", "</response"]
-        .into_iter()
-        .filter_map(|tag| xml[from..].find(tag).map(|pos| from + pos))
-        .min()
 }
 
 fn child_text(xml: &str, local_name: &str) -> Option<String> {
@@ -811,12 +828,52 @@ fn find_tag_start(xml: &str, local_name: &str) -> Option<usize> {
     None
 }
 
+/// Decodes XML character references in one pass, so each `&…;` is read exactly
+/// once: a chain of `replace` calls turned `&amp;lt;` into `<` by decoding the
+/// `&amp;` and then decoding what it produced. Anything that isn't a reference
+/// this recognizes is left as written.
 fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let reference = &rest[start..];
+        let decoded = reference
+            .find(';')
+            .and_then(|end| decode_xml_entity(&reference[1..end]).map(|c| (c, end)));
+        match decoded {
+            Some((character, end)) => {
+                out.push(character);
+                rest = &reference[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &reference[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character an entity name stands for: the five XML predefines it, plus
+/// decimal and hex character references (`#39`, `#x27`).
+fn decode_xml_entity(name: &str) -> Option<char> {
+    match name {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let digits = name.strip_prefix('#')?;
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
 }
 
 /// Parses every `VEVENT` in one resource, reporting whether any was dropped.
@@ -972,6 +1029,16 @@ fn is_component_keyword(line: &str, keyword: &str) -> bool {
 }
 
 fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)> {
+    parse_ics_datetime_in(property, &Local)
+}
+
+/// [`parse_ics_datetime`] with the zone a floating value (no `Z`, no `TZID`)
+/// is read in made explicit, so the resolution can be tested against a fixed
+/// zone rather than whatever the machine running the tests is set to.
+fn parse_ics_datetime_in<Zone: TimeZone>(
+    property: &IcsProperty,
+    floating_zone: &Zone,
+) -> Option<(DateTime<Local>, bool)> {
     let value = property.value.as_str();
     if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
         let date = NaiveDate::parse_from_str(value, "%Y%m%d").ok()?;
@@ -985,13 +1052,19 @@ fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)>
     }
 
     let naive = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok()?;
-    if let Some(tzid) = &property.tzid
-        && let Ok(timezone) = tzid.parse::<Tz>()
-    {
-        let datetime = timezone.from_local_datetime(&naive).earliest()?;
-        return Some((datetime.with_timezone(&Local), false));
-    }
-    Some((Local.from_local_datetime(&naive).single()?, false))
+    // A named zone, or the floating fallback when there is none (or one this
+    // build doesn't know): either way the value is a wall-clock reading, and a
+    // reading the clocks skipped or repeated is resolved forward rather than
+    // declared unreadable — see `date_util::resolve_forward`.
+    let named_zone = property
+        .tzid
+        .as_deref()
+        .and_then(|tzid| tzid.parse::<Tz>().ok());
+    let datetime = match named_zone {
+        Some(zone) => crate::date_util::resolve_forward(&zone, naive).with_timezone(&Local),
+        None => crate::date_util::resolve_forward(floating_zone, naive).with_timezone(&Local),
+    };
+    Some((datetime, false))
 }
 
 /// An RFC 5545 `DURATION`, keeping nominal days apart from the exact time
@@ -1123,12 +1196,21 @@ fn caldav_timestamp(dt: DateTime<Local>) -> String {
 }
 
 fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String> {
-    let event_count = unfold_ics(ics)
-        .iter()
-        .filter(|line| is_component_boundary(line, "BEGIN", "VEVENT"))
-        .count();
-    if event_count != 1 {
-        return Err("Editing recurring events is not supported yet".to_string());
+    // One VEVENT with no rule of its own is the only thing this rewrites. A
+    // resource holding several is a series with overrides, and one whose single
+    // VEVENT carries an RRULE or RDATE is a series the server handed back
+    // unexpanded — its DTSTART anchors every occurrence, so rewriting it to the
+    // one that was clicked would move them all and drop the zone they repeat in.
+    let components = ics_event_properties(ics);
+    let is_series = components.len() != 1
+        || components[0].props.contains_key("RRULE")
+        || components[0].props.contains_key("RDATE");
+    if is_series {
+        return Err(
+            "Editing this repeating event isn't supported yet — the server sent the whole \
+             series as one item"
+                .to_string(),
+        );
     }
 
     let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
@@ -1179,7 +1261,15 @@ fn replace_event_fields(ics: &str, draft: &EventDraft) -> Result<String, String>
             && property_name(&line).is_some_and(|name| {
                 matches!(
                     name.to_ascii_uppercase().as_str(),
-                    "DTSTAMP" | "SUMMARY" | "DTSTART" | "DTEND" | "LOCATION" | "DESCRIPTION"
+                    // DURATION goes too: the draft's end is written as a
+                    // DTEND, and RFC 5545 forbids carrying both.
+                    "DTSTAMP"
+                        | "SUMMARY"
+                        | "DTSTART"
+                        | "DTEND"
+                        | "DURATION"
+                        | "LOCATION"
+                        | "DESCRIPTION"
                 )
             })
         {
@@ -1270,15 +1360,11 @@ fn replace_recurrence_instance(
 }
 
 /// Edits every occurrence of a series (an "all events" edit made from one
-/// occurrence): shifts the master `VEVENT`'s start/end by `start_delta` (so the
+/// occurrence): shifts the master `VEVENT`'s start/end by `shift` (so the
 /// whole series moves by however far that occurrence moved, keeping its
 /// timezone form and recurrence pattern) and replaces its summary/location/
 /// notes from `draft`. Override `VEVENT`s and everything else are left as-is.
-fn edit_master_series(
-    ics: &str,
-    start_delta: chrono::Duration,
-    draft: &EventDraft,
-) -> Result<String, String> {
+fn edit_master_series(ics: &str, shift: SeriesShift, draft: &EventDraft) -> Result<String, String> {
     let mut result = Vec::new();
     let mut component: Vec<String> = Vec::new();
     let mut in_event = false;
@@ -1303,7 +1389,7 @@ fn edit_master_series(
             });
             if is_master {
                 edited = true;
-                result.extend(rewrite_master_vevent(&component, start_delta, draft));
+                result.extend(rewrite_master_vevent(&component, shift, draft));
             } else {
                 result.append(&mut component);
             }
@@ -1318,11 +1404,11 @@ fn edit_master_series(
 
 /// Rewrites the master `VEVENT`'s lines for an "all events" edit: refreshes the
 /// summary/location/notes right after `BEGIN:VEVENT`, shifts `DTSTART`/`DTEND`
-/// by `start_delta` in place (keeping their form), and leaves the `RRULE`, any
+/// by `shift` in place (keeping their form), and leaves the `RRULE`, any
 /// nested `VALARM`, and other properties untouched.
 fn rewrite_master_vevent(
     component: &[String],
-    start_delta: chrono::Duration,
+    shift: SeriesShift,
     draft: &EventDraft,
 ) -> Vec<String> {
     let mut out = Vec::new();
@@ -1368,10 +1454,10 @@ fn rewrite_master_vevent(
                 continue;
             }
             if (name == "DTSTART" || name == "DTEND")
-                && !start_delta.is_zero()
+                && !shift.is_zero()
                 && let Some((key, value)) = line.split_once(':')
             {
-                out.push(format!("{key}:{}", shift_ics_value(value, start_delta)));
+                out.push(format!("{key}:{}", shift_ics_value(value, shift)));
                 continue;
             }
         }
@@ -1380,20 +1466,28 @@ fn rewrite_master_vevent(
     out
 }
 
-/// Shifts an iCalendar date or date-time property value by `delta`, preserving
-/// its form: `YYYYMMDDTHHMMSSZ` (UTC), `YYYYMMDDTHHMMSS` (with a TZID param on
-/// the line), or `YYYYMMDD` (all-day). An unparseable value is left untouched.
-fn shift_ics_value(value: &str, delta: chrono::Duration) -> String {
+/// Shifts an iCalendar date or date-time property value by `shift`, preserving
+/// its form. A UTC value (`YYYYMMDDTHHMMSSZ`) names an instant and moves by the
+/// exact delta; a zoned or floating one (`YYYYMMDDTHHMMSS`) and a bare date
+/// (`YYYYMMDD`) read as wall-clock time and move by the wall-clock delta, so a
+/// move across a DST change keeps the hour it was dragged to instead of landing
+/// an hour off — or, for a date, on the same day. An unparseable value is left
+/// untouched.
+fn shift_ics_value(value: &str, shift: SeriesShift) -> String {
     if let Some(naive) = value.strip_suffix('Z') {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(naive, "%Y%m%dT%H%M%S") {
-            return format!("{}Z", (dt + delta).format("%Y%m%dT%H%M%S"));
+            return format!("{}Z", (dt + shift.exact).format("%Y%m%dT%H%M%S"));
         }
     } else if value.contains('T') {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S") {
-            return (dt + delta).format("%Y%m%dT%H%M%S").to_string();
+            return (dt + shift.wall_clock).format("%Y%m%dT%H%M%S").to_string();
         }
     } else if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y%m%d") {
-        return (date + delta).format("%Y%m%d").to_string();
+        // Between two local midnights the wall-clock delta is a whole number
+        // of days; the exact one is a day give or take an hour, which a
+        // NaiveDate addition would truncate to the wrong count.
+        let days = chrono::Duration::days(shift.wall_clock.num_days());
+        return (date + days).format("%Y%m%d").to_string();
     }
     value.to_string()
 }
@@ -1561,8 +1655,53 @@ fn unfold_ics(ics: &str) -> Vec<String> {
 }
 
 fn property_name(line: &str) -> Option<&str> {
-    line.split_once(':')
-        .map(|(name, _)| name.split(';').next().unwrap_or(name))
+    split_content_line(line).map(|(head, _)| head.split(';').next().unwrap_or(head))
+}
+
+/// A content line's name-and-parameters and its value, split at the first
+/// colon outside double quotes. RFC 5545 quotes a parameter value that holds a
+/// colon (`CN="Smith: Jo"`), and the value is free to hold more — a `mailto:`
+/// address always does — so neither the first nor the last colon will do.
+fn split_content_line(line: &str) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    for (index, character) in line.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            ':' if !quoted => return Some((&line[..index], &line[index + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The `;`-separated pieces of a content line's head — the property name, then
+/// each parameter — honouring quotes the way [`split_content_line`] does.
+fn split_parameters(head: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    for (index, character) in head.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                parts.push(&head[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&head[start..]);
+    parts
+}
+
+/// The address in a `CAL-ADDRESS` value: `mailto:` in whatever case the server
+/// wrote it, then the email. A bare address is passed through as it is.
+fn mailto_address(value: &str) -> &str {
+    let raw = value.trim();
+    match raw.get(..7) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("mailto:") => raw[7..].trim(),
+        _ => raw,
+    }
 }
 
 fn escape_ics_text(value: &str) -> String {
@@ -1755,6 +1894,54 @@ mod tests {
     }
 
     #[test]
+    fn xml_entities_are_decoded_once_each() {
+        // `&amp;lt;` is the four characters `&lt;`, not a `<`: decoding `&amp;`
+        // first and then decoding again is what turned one into the other.
+        assert_eq!(xml_unescape("a &amp;lt; b"), "a &lt; b");
+        assert_eq!(
+            xml_unescape("Tom &amp; Jerry &lt;3 &quot;hi&quot; &apos;x&apos; &gt;"),
+            "Tom & Jerry <3 \"hi\" 'x' >"
+        );
+    }
+
+    #[test]
+    fn numeric_xml_entities_are_decoded_too() {
+        // Servers write an apostrophe as &#39; at least as often as &apos;.
+        assert_eq!(xml_unescape("Ian&#39;s &#x43;alendar"), "Ian's Calendar");
+    }
+
+    #[test]
+    fn text_that_is_not_an_entity_is_left_alone() {
+        assert_eq!(
+            xml_unescape("R&D; &nope; &#zz; 100% &"),
+            "R&D; &nope; &#zz; 100% &"
+        );
+    }
+
+    #[test]
+    fn multistatus_responses_are_found_whatever_namespace_prefix_the_server_picked() {
+        // Fastmail writes `D:`, Nextcloud `d:`, iCloud none — and a server is
+        // free to pick anything. Missing every response here is what would let
+        // the sync prune a whole calendar as "gone".
+        for prefix in ["ns0:", "A:", "dav:"] {
+            let xml = format!(
+                "<{prefix}multistatus xmlns:{}=\"DAV:\"><{prefix}response><{prefix}href>/cal/1.ics</{prefix}href>\
+                 </{prefix}response><{prefix}response><{prefix}href>/cal/2.ics</{prefix}href></{prefix}response>\
+                 </{prefix}multistatus>",
+                prefix.trim_end_matches(':')
+            );
+
+            let responses = multistatus_responses(&xml);
+
+            assert_eq!(responses.len(), 2, "prefix {prefix:?}: {xml}");
+            assert_eq!(
+                child_text(&responses[1], "href").as_deref(),
+                Some("/cal/2.ics")
+            );
+        }
+    }
+
+    #[test]
     fn is_calendar_response_requires_calendar_resource_type() {
         let xml = r#"
             <D:response>
@@ -1862,6 +2049,72 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
         let bare = parse_ics_attendee("ATTENDEE", "someone@example.com")
             .expect("a bare address without the mailto: scheme is still usable");
         assert_eq!(bare.email, "someone@example.com");
+    }
+
+    /// An invitation with two guests, as a server writes it: the address is a
+    /// `mailto:` URI, and PARTSTAT sits among other parameters rather than last.
+    const INVITATION: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:i\r\n\
+        ATTENDEE;CN=Ian;PARTSTAT=NEEDS-ACTION;ROLE=REQ-PARTICIPANT:mailto:ian@example.com\r\n\
+        ATTENDEE;CN=Sam;PARTSTAT=ACCEPTED:mailto:sam@example.com\r\n\
+        END:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn replying_to_an_invitation_replaces_partstat_and_keeps_the_mailto_address() {
+        let replied = reply_to_invitation(INVITATION, "ian@example.com", "ACCEPTED").unwrap();
+
+        assert!(
+            replied.contains(
+                "ATTENDEE;CN=Ian;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:ian@example.com\r\n"
+            ),
+            "the reply must stay a parameter and the address must stay a URI:\n{replied}"
+        );
+        // The other guest's line is not ours to touch.
+        assert!(replied.contains("ATTENDEE;CN=Sam;PARTSTAT=ACCEPTED:mailto:sam@example.com\r\n"));
+    }
+
+    #[test]
+    fn replying_adds_a_partstat_to_an_attendee_line_that_had_none() {
+        let ics = "BEGIN:VEVENT\r\nATTENDEE;CN=Ian:mailto:ian@example.com\r\nEND:VEVENT\r\n";
+
+        let replied = reply_to_invitation(ics, "ian@example.com", "DECLINED").unwrap();
+
+        assert!(
+            replied.contains("ATTENDEE;CN=Ian;PARTSTAT=DECLINED:mailto:ian@example.com\r\n"),
+            "{replied}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_parameter_holding_a_colon_does_not_split_the_attendee_line() {
+        // RFC 5545 quotes a parameter value that contains a colon, so the
+        // name/value separator is the first colon *outside* the quotes.
+        let ics = "BEGIN:VEVENT\r\nATTENDEE;CN=\"Ian: Work\";PARTSTAT=NEEDS-ACTION:mailto:ian@example.com\r\nEND:VEVENT\r\n";
+
+        let replied = reply_to_invitation(ics, "ian@example.com", "TENTATIVE").unwrap();
+
+        assert!(
+            replied.contains(
+                "ATTENDEE;CN=\"Ian: Work\";PARTSTAT=TENTATIVE:mailto:ian@example.com\r\n"
+            ),
+            "{replied}"
+        );
+    }
+
+    #[test]
+    fn the_mailto_scheme_matches_regardless_of_case() {
+        let ics = "BEGIN:VEVENT\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:MAILTO:Ian@Example.com\r\nEND:VEVENT\r\n";
+
+        let replied = reply_to_invitation(ics, "ian@example.com", "ACCEPTED").unwrap();
+
+        assert!(
+            replied.contains("ATTENDEE;PARTSTAT=ACCEPTED:MAILTO:Ian@Example.com\r\n"),
+            "{replied}"
+        );
+    }
+
+    #[test]
+    fn replying_when_you_are_not_a_guest_is_refused_rather_than_written() {
+        assert!(reply_to_invitation(INVITATION, "nobody@example.com", "ACCEPTED").is_err());
     }
 
     #[test]
@@ -2148,9 +2401,100 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         );
     }
 
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn a_zoned_time_the_clocks_skipped_is_read_with_the_offset_before_the_gap() {
+        // New York sprang forward at 2 AM on 2026-03-08, so 2:30 never
+        // happened. RFC 5545 reads it at the old offset — 2:30 EST, which is
+        // 3:30 EDT — and so do Apple and Google; dropping the event as
+        // unreadable would leave a stale cached copy in its place.
+        let property = IcsProperty {
+            value: "20260308T023000".to_string(),
+            tzid: Some("America/New_York".to_string()),
+        };
+
+        let (datetime, _) = parse_ics_datetime(&property).expect("a real instant");
+
+        assert_eq!(datetime.with_timezone(&chrono::Utc), utc(2026, 3, 8, 7, 30));
+    }
+
+    #[test]
+    fn a_floating_time_the_clocks_skipped_is_read_with_the_offset_before_the_gap() {
+        let property = IcsProperty {
+            value: "20260308T023000".to_string(),
+            tzid: None,
+        };
+
+        let (datetime, _) = parse_ics_datetime_in(&property, &chrono_tz::America::New_York)
+            .expect("a real instant");
+
+        assert_eq!(datetime.with_timezone(&chrono::Utc), utc(2026, 3, 8, 7, 30));
+    }
+
+    #[test]
+    fn a_floating_time_the_clocks_repeated_takes_its_first_occurrence() {
+        // 1:30 AM on 2026-11-01 happens twice in New York; the TZID branch
+        // already takes the earlier one, and a floating value should agree.
+        let property = IcsProperty {
+            value: "20261101T013000".to_string(),
+            tzid: None,
+        };
+
+        let (datetime, _) = parse_ics_datetime_in(&property, &chrono_tz::America::New_York)
+            .expect("a real instant");
+
+        assert_eq!(
+            datetime.with_timezone(&chrono::Utc),
+            utc(2026, 11, 1, 5, 30)
+        );
+    }
+
+    #[test]
+    fn editing_a_one_off_replaces_a_duration_with_the_new_end() {
+        // RFC 5545 allows DTEND or DURATION, never both; a resource authored
+        // with a DURATION must come back with just the DTEND the draft gives it.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART:20260701T140000Z\r\nDURATION:PT1H\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = replace_event_fields(ics, &series_draft("New")).unwrap();
+
+        assert!(!updated.contains("DURATION"), "{updated}");
+        assert!(updated.contains("DTEND:"), "{updated}");
+    }
+
+    #[test]
+    fn editing_an_unexpanded_series_master_is_refused_rather_than_reanchored() {
+        // A server that ignored <C:expand> hands back the master itself. Its
+        // DTSTART is the whole series' anchor: rewriting it to the occurrence
+        // that was clicked, in UTC, would move every occurrence and lose the
+        // zone the rule repeats in.
+        for rule in ["RRULE:FREQ=WEEKLY", "RDATE:20260715T130000Z"] {
+            let ics = format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:m\r\nDTSTART;TZID=America/New_York:20260701T090000\r\nDTEND;TZID=America/New_York:20260701T093000\r\n{rule}\r\nSUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            );
+
+            assert!(
+                replace_event_fields(&ics, &series_draft("Renamed")).is_err(),
+                "{rule} should have stopped the edit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alarm_trigger_does_not_make_a_one_off_look_recurring() {
+        // VALARM carries its own properties; only the VEVENT's own RRULE counts.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260701T140000Z\r\nDTEND:20260701T143000Z\r\nBEGIN:VALARM\r\nTRIGGER:-PT10M\r\nRRULE:FREQ=DAILY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        assert!(replace_event_fields(ics, &series_draft("Renamed")).is_ok());
+    }
+
     #[test]
     fn replacing_event_fields_preserves_unedited_ics_properties() {
-        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Old title\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T100000\r\nRRULE:FREQ=WEEKLY\r\nATTENDEE:mailto:friend@example.com\r\nBEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nLOCATION:Old location\r\nDESCRIPTION:Old notes\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        // A one-off: a master with an RRULE is refused outright (see
+        // `editing_an_unexpanded_series_master_is_refused_rather_than_reanchored`).
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:abc\r\nSUMMARY:Old title\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T100000\r\nCATEGORIES:Work\r\nATTENDEE:mailto:friend@example.com\r\nBEGIN:VALARM\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nLOCATION:Old location\r\nDESCRIPTION:Old notes\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let start = Local::now();
         let draft = EventDraft {
             title: "New title".to_string(),
@@ -2167,7 +2511,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let updated = replace_event_fields(ics, &draft).unwrap();
 
         assert!(updated.contains("UID:abc"));
-        assert!(updated.contains("RRULE:FREQ=WEEKLY"));
+        assert!(updated.contains("CATEGORIES:Work"));
         assert!(updated.contains("ATTENDEE:mailto:friend@example.com"));
         assert!(updated.contains("BEGIN:VALARM"));
         assert!(updated.contains("SUMMARY:New title"));
@@ -2394,13 +2738,22 @@ END:VCALENDAR"#;
         }
     }
 
+    /// A move that crosses no DST transition, so its exact and wall-clock
+    /// deltas agree.
+    fn shift_of_hours(hours: i64) -> SeriesShift {
+        let delta = chrono::Duration::hours(hours);
+        SeriesShift {
+            exact: delta,
+            wall_clock: delta,
+        }
+    }
+
     #[test]
     fn editing_all_events_shifts_the_series_start_and_end_by_the_delta() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Old title\r\nDTSTART:20260701T140000Z\r\nDTEND:20260701T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
         let updated =
-            edit_master_series(ics, chrono::Duration::hours(2), &series_draft("New title"))
-                .unwrap();
+            edit_master_series(ics, shift_of_hours(2), &series_draft("New title")).unwrap();
 
         assert!(updated.contains("DTSTART:20260701T160000Z"));
         assert!(updated.contains("DTEND:20260701T163000Z"));
@@ -2413,8 +2766,7 @@ END:VCALENDAR"#;
     fn editing_all_events_preserves_the_tzid_form_and_other_instances() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260701T090000\r\nDTEND;TZID=America/New_York:20260701T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID;TZID=America/New_York:20260708T090000\r\nSUMMARY:Moved one\r\nDTSTART;TZID=America/New_York:20260708T100000\r\nDTEND;TZID=America/New_York:20260708T103000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
-        let updated =
-            edit_master_series(ics, chrono::Duration::hours(1), &series_draft("Renamed")).unwrap();
+        let updated = edit_master_series(ics, shift_of_hours(1), &series_draft("Renamed")).unwrap();
 
         // Master shifted by an hour, in the same TZID form.
         assert!(updated.contains("DTSTART;TZID=America/New_York:20260701T100000"));
@@ -2426,6 +2778,77 @@ END:VCALENDAR"#;
         assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
     }
 
+    /// One day forward in New York, starting `day` March 2026 at `hour`, chosen
+    /// so the move crosses the 2 AM March 8 spring-forward: 23 elapsed hours.
+    fn one_day_across_spring_forward(day: u32, hour: u32) -> SeriesShift {
+        let ny = chrono_tz::America::New_York;
+        SeriesShift::between(
+            ny.with_ymd_and_hms(2026, 3, day, hour, 0, 0).unwrap(),
+            ny.with_ymd_and_hms(2026, 3, day + 1, hour, 0, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn moving_an_all_day_series_a_day_across_a_dst_change_moves_it_a_whole_day() {
+        // A bare date has no clock to lose an hour from: 23 elapsed hours from
+        // one midnight to the next is still exactly one calendar day.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:h\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20260308\r\nDTEND;VALUE=DATE:20260309\r\nRRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        // Midnight on the 8th is still before the change; midnight on the 9th
+        // is after it.
+        let updated = edit_master_series(
+            ics,
+            one_day_across_spring_forward(8, 0),
+            &series_draft("Holiday"),
+        )
+        .unwrap();
+
+        assert!(updated.contains("DTSTART;VALUE=DATE:20260309"), "{updated}");
+        assert!(updated.contains("DTEND;VALUE=DATE:20260310"), "{updated}");
+    }
+
+    #[test]
+    fn moving_a_zoned_series_across_a_dst_change_keeps_its_wall_clock_time() {
+        // A value in a named zone reads as wall-clock time: a 9 AM standup
+        // moved a day stays a 9 AM standup, even though only 23 hours passed.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260307T090000\r\nDTEND;TZID=America/New_York:20260307T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        // 9 AM Saturday the 7th is EST; 9 AM Sunday the 8th is EDT.
+        let updated = edit_master_series(
+            ics,
+            one_day_across_spring_forward(7, 9),
+            &series_draft("Standup"),
+        )
+        .unwrap();
+
+        assert!(
+            updated.contains("DTSTART;TZID=America/New_York:20260308T090000"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("DTEND;TZID=America/New_York:20260308T093000"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn moving_a_utc_series_across_a_dst_change_moves_the_instant() {
+        // Same move, but a UTC value names an instant, so it takes the exact 23
+        // hours — which is the same new 9 AM, spelled in UTC.
+        // 9 AM EST on the 7th is 14:00Z; 9 AM EDT on the 8th is 13:00Z.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART:20260307T140000Z\r\nDTEND:20260307T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = edit_master_series(
+            ics,
+            one_day_across_spring_forward(7, 9),
+            &series_draft("Standup"),
+        )
+        .unwrap();
+
+        assert!(updated.contains("DTSTART:20260308T130000Z"), "{updated}");
+        assert!(updated.contains("DTEND:20260308T133000Z"), "{updated}");
+    }
+
     #[test]
     fn editing_all_events_adds_location_and_notes_when_the_draft_has_them() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART:20260701T140000Z\r\nDTEND:20260701T143000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -2433,7 +2856,7 @@ END:VCALENDAR"#;
         draft.location = Some("Room 5".to_string());
         draft.notes = Some("Bring notes".to_string());
 
-        let updated = edit_master_series(ics, chrono::Duration::zero(), &draft).unwrap();
+        let updated = edit_master_series(ics, shift_of_hours(0), &draft).unwrap();
 
         assert!(updated.contains("LOCATION:Room 5"));
         assert!(updated.contains("DESCRIPTION:Bring notes"));
