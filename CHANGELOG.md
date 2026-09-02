@@ -71,6 +71,13 @@
   place it, instead of being left out of the sync.
 - Calendar and event names carrying `&`, `<` or an apostrophe as an XML entity
   decode correctly, numeric entities included.
+- Memory no longer grows for as long as Calix is open. Every calendar page,
+  event popover, search popover and event dialog held a reference to itself
+  from one of its own handlers, so nothing built for the grid was ever freed —
+  and the grid is rebuilt after every sync, edit and navigation. Pinch-zoom was
+  the worst case, leaking a full day grid per frame. The window's own state
+  went the same way, which in background mode left a closed window's sync,
+  alert and clock timers running for the life of the process.
 
 ### Known gaps
 

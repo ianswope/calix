@@ -131,6 +131,25 @@ pub(crate) fn open(
     on_changed: Rc<dyn Fn()>,
     on_copy: Rc<dyn Fn()>,
 ) {
+    let popover = build(event, on_edit, store, remote, on_changed, on_copy);
+    popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());
+    // A popover parented to a widget outlives its own dismissal unless it is
+    // explicitly unparented, which would leak one per click.
+    popover.connect_closed(|popover| popover.unparent());
+    popover.popup();
+}
+
+/// The inspector, built but not yet shown. Separate from [`open`] so the
+/// widget tree can be constructed — and checked for what it holds on to —
+/// without a window to anchor it in.
+pub(crate) fn build(
+    event: &Event,
+    on_edit: Rc<dyn Fn(Event)>,
+    store: Rc<Store>,
+    remote: Option<RemoteEvent>,
+    on_changed: Rc<dyn Fn()>,
+    on_copy: Rc<dyn Fn()>,
+) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.set_autohide(true);
     popover.set_position(gtk::PositionType::Right);
@@ -302,27 +321,28 @@ pub(crate) fn open(
     buttons.append(&edit_button);
     content.append(&buttons);
 
-    let popover_for_copy = popover.clone();
+    // Both buttons live inside the popover, so a closure on either that held
+    // the popover strongly would be a cycle nothing ever breaks: `unparent` on
+    // close drops the parent's reference, never these.
+    let weak_popover = popover.downgrade();
     copy_button.connect_clicked(move |_| {
-        popover_for_copy.popdown();
+        if let Some(popover) = weak_popover.upgrade() {
+            popover.popdown();
+        }
         on_copy();
     });
 
-    popover.set_child(Some(&content));
-    popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());
-
-    let popover_for_edit = popover.clone();
+    let weak_popover = popover.downgrade();
     let event_for_edit = event.clone();
     edit_button.connect_clicked(move |_| {
-        popover_for_edit.popdown();
+        if let Some(popover) = weak_popover.upgrade() {
+            popover.popdown();
+        }
         on_edit(event_for_edit.clone());
     });
 
-    // A popover parented to a widget outlives its own dismissal unless it is
-    // explicitly unparented, which would leak one per click.
-    popover.connect_closed(|popover| popover.unparent());
-
-    popover.popup();
+    popover.set_child(Some(&content));
+    popover
 }
 
 #[cfg(test)]

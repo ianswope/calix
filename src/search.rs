@@ -35,6 +35,22 @@ pub(crate) fn result_subtitle(event: &Event) -> String {
 /// `on_pick` is handed the chosen event so the caller can navigate to it;
 /// search knows how to find things, not where the calendar should go.
 pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, store: Rc<Store>, on_pick: Rc<dyn Fn(Event)>) {
+    let (popover, entry) = build(store, on_pick);
+    popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());
+    // A popover parented to a widget outlives its own dismissal unless it is
+    // explicitly unparented, which would leak one per search.
+    popover.connect_closed(|popover| popover.unparent());
+    popover.popup();
+    entry.grab_focus();
+}
+
+/// The search popover and its entry, built but not yet shown. Separate from
+/// [`open`] so the tree can be constructed — and checked for what it holds on
+/// to — without a window to anchor it in.
+pub(crate) fn build(
+    store: Rc<Store>,
+    on_pick: Rc<dyn Fn(Event)>,
+) -> (gtk::Popover, gtk::SearchEntry) {
     let popover = gtk::Popover::new();
     popover.set_autohide(true);
     popover.set_size_request(360, -1);
@@ -70,7 +86,6 @@ pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, store: Rc<Store>, on_pick: Rc
     content.append(&status);
 
     popover.set_child(Some(&content));
-    popover.set_parent(&anchor.clone().upcast::<gtk::Widget>());
 
     entry.connect_search_changed({
         let store = store.clone();
@@ -78,8 +93,13 @@ pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, store: Rc<Store>, on_pick: Rc
         let results = results.clone();
         let scroller = scroller.clone();
         let status = status.clone();
-        let popover = popover.clone();
+        // Weak: the entry is inside the popover, so holding the popover from
+        // the entry's handler would keep the whole popover alive for good.
+        let popover = popover.downgrade();
         move |entry| {
+            let Some(popover) = popover.upgrade() else {
+                return;
+            };
             while let Some(row) = results.first_child() {
                 results.remove(&row);
             }
@@ -119,12 +139,7 @@ pub(crate) fn open(anchor: &impl IsA<gtk::Widget>, store: Rc<Store>, on_pick: Rc
         }
     });
 
-    // A popover parented to a widget outlives its own dismissal unless it is
-    // explicitly unparented, which would leak one per search.
-    popover.connect_closed(|popover| popover.unparent());
-
-    popover.popup();
-    entry.grab_focus();
+    (popover, entry)
 }
 
 fn result_row(event: &Event, popover: &gtk::Popover, on_pick: &Rc<dyn Fn(Event)>) -> gtk::Button {
@@ -147,10 +162,14 @@ fn result_row(event: &Event, popover: &gtk::Popover, on_pick: &Rc<dyn Fn(Event)>
     button.set_child(Some(&text));
 
     let event = event.clone();
-    let popover = popover.clone();
+    // Weak for the same reason as the entry's handler: the row is a
+    // descendant of the popover it would otherwise pin.
+    let popover = popover.downgrade();
     let on_pick = on_pick.clone();
     button.connect_clicked(move |_| {
-        popover.popdown();
+        if let Some(popover) = popover.upgrade() {
+            popover.popdown();
+        }
         on_pick(event.clone());
     });
     button

@@ -146,10 +146,14 @@ fn day_cell(
     // highlight is the only thing on screen that says so. Two opens the
     // new-event dialog, the way a single click used to.
     let click = gtk::GestureClick::new();
-    let cell_for_click = cell.clone();
     let slots_for_click = slots.clone();
-    click.connect_released(move |_, presses, _, _| {
-        slots_for_click.select(slot, &cell_for_click);
+    click.connect_released(move |gesture, presses, _, _| {
+        // The cell comes from the gesture, not a capture: holding it here
+        // would pin every cell of every month ever drawn.
+        let Some(cell) = gesture.widget() else {
+            return;
+        };
+        slots_for_click.select(slot, &cell);
         if presses < 2 {
             return;
         }

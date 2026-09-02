@@ -861,10 +861,17 @@ impl Ui {
     /// clear the guard over a carousel sitting on the wrong page; a tick
     /// callback only runs once frames flow again.
     fn confirm_centered(self: &Rc<Self>, generation: u64, current_page: gtk::Widget) {
-        let ui = self.clone();
+        // Weak: this callback lives on the carousel, which the `Ui` owns, so a
+        // strong reference would be a cycle neither side ever breaks. The same
+        // reasoning applies to every handler below that a `Ui`-owned widget
+        // carries.
+        let ui = Rc::downgrade(self);
         // Tick callbacks are `Fn`, so this loop's own progress lives in a Cell.
         let scrolled = Cell::new(false);
         self.carousel.add_tick_callback(move |carousel, _clock| {
+            let Some(ui) = ui.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             let frame = SettleFrame {
                 owns_carousel: ui.sync.get().owns(generation),
                 page_attached: current_page.parent().as_ref() == Some(carousel.upcast_ref()),
@@ -1084,20 +1091,26 @@ impl Ui {
         header.append(&next);
 
         for (button, delta) in [(&prev, -1), (&next, 1)] {
-            let ui = self.clone();
+            let ui = Rc::downgrade(self);
             button.connect_clicked(move |_| {
+                let Some(ui) = ui.upgrade() else {
+                    return;
+                };
                 let shifted = shift_months(ui.state.borrow().current_date, delta);
                 ui.state.borrow_mut().current_date = shifted;
                 ui.reset();
             });
         }
 
-        let ui = self.clone();
+        let ui = Rc::downgrade(self);
         let thumbnail = year_view::month_thumbnail(
             month_start(anchor),
             &events,
             self.today.get(),
             Rc::new(move |picked: NaiveDate| {
+                let Some(ui) = ui.upgrade() else {
+                    return;
+                };
                 // Keeps the current view mode: the mini month answers "take me
                 // to this date", not "show me a day".
                 ui.state.borrow_mut().current_date = picked;
@@ -1117,12 +1130,15 @@ impl Ui {
             child = next;
         }
 
-        let ui = self.clone();
+        let ui = Rc::downgrade(self);
         self.calendar_list.append(&calendar_dialog::build_list(
             self.store.clone(),
             move || {
                 let ui = ui.clone();
                 glib::idle_add_local_once(move || {
+                    let Some(ui) = ui.upgrade() else {
+                        return;
+                    };
                     ui.reset();
                     ui.reset_calendar_sidebar();
                 });
@@ -1137,9 +1153,12 @@ impl Ui {
     /// resolve a drag back to its event.
     fn event_callbacks(self: &Rc<Self>, events: Vec<Event>) -> PageActions {
         let on_create: CreateFn = {
-            let ui = self.clone();
+            let ui = Rc::downgrade(self);
             Rc::new(
                 move |start: DateTime<Local>, end: Option<DateTime<Local>>| {
+                    let Some(ui) = ui.upgrade() else {
+                        return;
+                    };
                     let ui_for_saved = ui.clone();
                     let ui_for_change = ui.clone();
                     event_dialog::open(
@@ -1160,8 +1179,11 @@ impl Ui {
         // button opens. Glancing at when something is — by far the commoner
         // reason to click — no longer costs a modal to dismiss.
         let open_dialog: Rc<dyn Fn(Event)> = {
-            let ui = self.clone();
+            let ui = Rc::downgrade(self);
             Rc::new(move |event: Event| {
+                let Some(ui) = ui.upgrade() else {
+                    return;
+                };
                 // Local recurring events render as many occurrences that share
                 // the master's id; editing any of them edits the series, so open
                 // the stored master (its real start) rather than the clicked
@@ -1194,8 +1216,11 @@ impl Ui {
         };
         let on_edit: EditFn = {
             let open_dialog = open_dialog.clone();
-            let ui = self.clone();
+            let ui = Rc::downgrade(self);
             Rc::new(move |event: Event, anchor: gtk::Widget| {
+                let Some(ui) = ui.upgrade() else {
+                    return;
+                };
                 let remote = remote_event_handler(&ui, &event);
                 let ui_for_changed = ui.clone();
                 let ui_for_copy = ui.clone();
@@ -1231,11 +1256,19 @@ impl Ui {
     /// they run, not when the page was built, so a copy made after this page
     /// was drawn is still offered.
     fn paste_action(self: &Rc<Self>) -> PasteAction {
-        let ui_for_ready = self.clone();
-        let ui_for_paste = self.clone();
+        let ui_for_ready = Rc::downgrade(self);
+        let ui_for_paste = Rc::downgrade(self);
         PasteAction {
-            ready: Rc::new(move || ui_for_ready.clipboard.borrow().is_some()),
-            paste: Rc::new(move |slot: Slot| ui_for_paste.paste_event(slot)),
+            ready: Rc::new(move || {
+                ui_for_ready
+                    .upgrade()
+                    .is_some_and(|ui| ui.clipboard.borrow().is_some())
+            }),
+            paste: Rc::new(move |slot: Slot| {
+                if let Some(ui) = ui_for_paste.upgrade() {
+                    ui.paste_event(slot);
+                }
+            }),
         }
     }
 
@@ -1264,11 +1297,14 @@ impl Ui {
             ViewMode::Year => {
                 // Picking a day drops into Day view on it, which is the only
                 // reason to click a date at this zoom.
-                let ui = self.clone();
+                let ui = Rc::downgrade(self);
                 year_view::build(
                     date,
                     &events,
                     Rc::new(move |picked: NaiveDate| {
+                        let Some(ui) = ui.upgrade() else {
+                            return;
+                        };
                         ui.state.borrow_mut().current_date = picked;
                         set_view_mode(&ui, ViewMode::Day);
                         ui.reset();
@@ -1642,11 +1678,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     ));
 
     update_refresh_affordance(&ui);
-    refresh_accounts_button.connect_clicked(clone!(
-        #[strong]
-        ui,
-        move |_| sync_connected_accounts_with_reporting(&ui)
-    ));
+    connect_refresh_button(&ui);
 
     let manage_accounts_button = gtk::Button::builder()
         .label("Manage")
@@ -1911,7 +1943,10 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // live over a carousel still sitting on page 0, so startup read its own
     // uncentered position as a backward swipe and opened a week early.
     carousel.add_tick_callback(clone!(
-        #[strong]
+        // Weak, and so is the action it parks in `on_settled`: this callback
+        // sits on the carousel and that field is the `Ui`'s own, so either
+        // held strongly would keep the window's state alive for good.
+        #[weak]
         ui,
         #[strong]
         today_button,
@@ -1931,6 +1966,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         zoom_out_button,
         #[strong]
         zoom_in_button,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
         move |carousel, _clock| {
             if carousel.width() <= 0 {
                 return glib::ControlFlow::Continue;
@@ -1948,7 +1985,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
             // replacement inherits the pending action and connects instead —
             // it lives on `Ui`, not on one loop.
             ui.on_settled.replace(Some(Box::new(clone!(
-                #[strong]
+                #[weak]
                 ui,
                 #[strong]
                 today_button,
@@ -2021,6 +2058,18 @@ fn sidebar_actions(
     section.upcast()
 }
 
+/// Wires the sidebar's one Refresh control. Its own function so the leak
+/// check can wire it the same way `build` does — the button is a field of
+/// `Ui`, which makes a strong capture here a cycle rather than a mere
+/// reference.
+fn connect_refresh_button(ui: &Rc<Ui>) {
+    ui.refresh_accounts_button.connect_clicked(clone!(
+        #[weak]
+        ui,
+        move |_| sync_connected_accounts_with_reporting(&ui)
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn connect_handlers(
     ui: &Rc<Ui>,
@@ -2035,8 +2084,10 @@ fn connect_handlers(
     zoom_out_button: &gtk::Button,
     zoom_in_button: &gtk::Button,
 ) {
+    // Weak: this handler and the pinch gesture below both live on the
+    // carousel, which the `Ui` owns.
     ui.carousel.connect_page_changed(clone!(
-        #[strong]
+        #[weak]
         ui,
         move |_, index| {
             // Only a settled carousel can report a swipe. Unsettled, the
@@ -2068,7 +2119,7 @@ fn connect_handlers(
     ));
 
     today_button.connect_clicked(clone!(
-        #[strong]
+        #[weak]
         ui,
         move |_| {
             let today = Local::now().date_naive();
@@ -2078,13 +2129,13 @@ fn connect_handlers(
     ));
 
     prev_button.connect_clicked(clone!(
-        #[strong]
+        #[weak]
         ui,
         move |_| ui.navigate(-1)
     ));
 
     next_button.connect_clicked(clone!(
-        #[strong]
+        #[weak]
         ui,
         move |_| ui.navigate(1)
     ));
@@ -2096,13 +2147,13 @@ fn connect_handlers(
         (day_toggle, ViewMode::Day),
     ] {
         toggle.connect_toggled(clone!(
-            #[strong]
+            #[weak]
             ui,
-            #[strong]
+            #[weak]
             zoom_box,
-            #[strong]
+            #[weak]
             zoom_out_button,
-            #[strong]
+            #[weak]
             zoom_in_button,
             move |btn| {
                 if btn.is_active() {
@@ -2115,13 +2166,17 @@ fn connect_handlers(
     }
 
     zoom_out_button.connect_clicked(clone!(
-        #[strong]
+        // Weak throughout, and note that this button is in its own capture
+        // list: a handler that holds the widget it is attached to is a cycle
+        // GTK never breaks, which kept both zoom buttons — and through them
+        // the whole window state — alive for the life of the process.
+        #[weak]
         ui,
-        #[strong]
+        #[weak]
         zoom_box,
-        #[strong]
+        #[weak]
         zoom_out_button,
-        #[strong]
+        #[weak]
         zoom_in_button,
         move |_| {
             adjust_zoom(&ui, -1);
@@ -2130,13 +2185,17 @@ fn connect_handlers(
     ));
 
     zoom_in_button.connect_clicked(clone!(
-        #[strong]
+        // Weak throughout, and note that this button is in its own capture
+        // list: a handler that holds the widget it is attached to is a cycle
+        // GTK never breaks, which kept both zoom buttons — and through them
+        // the whole window state — alive for the life of the process.
+        #[weak]
         ui,
-        #[strong]
+        #[weak]
         zoom_box,
-        #[strong]
+        #[weak]
         zoom_out_button,
-        #[strong]
+        #[weak]
         zoom_in_button,
         move |_| {
             adjust_zoom(&ui, 1);
@@ -2154,14 +2213,14 @@ fn connect_handlers(
     let pinch = gtk::GestureZoom::new();
     let pinch_base_height = Rc::new(Cell::new(0i32));
     pinch.connect_begin(clone!(
-        #[strong]
+        #[weak]
         ui,
         #[strong]
         pinch_base_height,
         move |_, _| pinch_base_height.set(ui.state.borrow().hour_row_height)
     ));
     pinch.connect_scale_changed(clone!(
-        #[strong]
+        #[weak]
         ui,
         #[strong]
         pinch_base_height,
@@ -2184,7 +2243,7 @@ fn connect_handlers(
         }
     ));
     pinch.connect_end(clone!(
-        #[strong]
+        #[weak]
         ui,
         #[strong]
         pinch_base_height,
@@ -2199,6 +2258,103 @@ fn connect_handlers(
         }
     ));
     ui.carousel.add_controller(pinch);
+}
+
+/// A `Ui` wired the way [`build`] and [`connect_handlers`] wire one, then
+/// dropped — with a weak reference handed back so a test can ask whether
+/// anything it was attached to kept it alive.
+///
+/// Lives beside the wiring rather than in `gui_leaks` for two reasons: `Ui` is
+/// private to this module, and a copy of the wiring that drifted from the real
+/// thing would check nothing. Everything a window supplies but this doesn't —
+/// an application, a presented window, a frame clock — is beside the point
+/// here: the cycles are between `Ui` and the widgets it owns.
+///
+/// See `src/gui_leaks.rs` for why the check matters and how it is run.
+///
+/// The verdict comes back as a bool rather than the weak reference itself,
+/// which would make `Ui` part of this module's public surface for the sake of
+/// a test.
+#[cfg(test)]
+pub(crate) fn a_wired_ui_is_freed_with_its_widgets() -> bool {
+    let ui = wire_a_ui_and_drop_it();
+    // After the widgets are gone, so a queued source still holding one isn't
+    // mistaken for a cycle.
+    crate::gui_leaks::drain();
+    ui.upgrade().is_none()
+}
+
+#[cfg(test)]
+fn wire_a_ui_and_drop_it() -> std::rc::Weak<Ui> {
+    let carousel = adw::Carousel::builder().build();
+    let calendar_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let mini_month = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let refresh_accounts_button = gtk::Button::new();
+    let ui = Rc::new(Ui {
+        carousel: carousel.clone(),
+        calendar_list: calendar_list.clone(),
+        mini_month: mini_month.clone(),
+        title_label: gtk::Label::new(None),
+        toast_overlay: adw::ToastOverlay::new(),
+        state: Rc::new(RefCell::new(State {
+            view_mode: ViewMode::Month,
+            current_date: Local::now().date_naive(),
+            hour_row_height: week_view::DEFAULT_HOUR_ROW_HEIGHT,
+        })),
+        store: Rc::new(Store::open_in_memory().expect("an in-memory database")),
+        config: Rc::new(RefCell::new(Config::default())),
+        today: Rc::new(Cell::new(Local::now().date_naive())),
+        sync: Rc::new(Cell::new(CarouselSync::default())),
+        on_settled: Rc::new(RefCell::new(None)),
+        zoom_dirty: Rc::new(Cell::new(false)),
+        activity: Rc::new(AccountActivity::default()),
+        refresh_accounts_button: refresh_accounts_button.clone(),
+        history: Rc::new(RefCell::new(undo::History::default())),
+        history_busy: Rc::new(Cell::new(false)),
+        selected_event: Rc::new(RefCell::new(None)),
+        clipboard: Rc::new(RefCell::new(None)),
+        slots: SlotSelection::default(),
+        events: EventSelection::default(),
+    });
+
+    connect_refresh_button(&ui);
+    ui.reset_calendar_sidebar();
+    ui.reset_mini_month();
+    ui.reset();
+    // Week pages carry the timed grid and its drag controller, which a month
+    // page has none of.
+    set_view_mode(&ui, ViewMode::Week);
+    ui.reset();
+
+    let today_button = gtk::Button::new();
+    let prev_button = gtk::Button::new();
+    let next_button = gtk::Button::new();
+    let year_toggle = gtk::ToggleButton::new();
+    let month_toggle = gtk::ToggleButton::builder().group(&year_toggle).build();
+    let week_toggle = gtk::ToggleButton::builder().group(&year_toggle).build();
+    let day_toggle = gtk::ToggleButton::builder().group(&year_toggle).build();
+    let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let zoom_out_button = gtk::Button::new();
+    let zoom_in_button = gtk::Button::new();
+    connect_handlers(
+        &ui,
+        &today_button,
+        &prev_button,
+        &next_button,
+        &year_toggle,
+        &month_toggle,
+        &week_toggle,
+        &day_toggle,
+        &zoom_box,
+        &zoom_out_button,
+        &zoom_in_button,
+    );
+
+    let weak = Rc::downgrade(&ui);
+    drop(ui);
+    // Every widget above is a local, so the caller sees the weak reference only
+    // after they have all been dropped.
+    weak
 }
 
 /// How much one zoom-button press changes the hour height, in px.
@@ -2379,8 +2535,11 @@ fn move_handler(
     ui: &Rc<Ui>,
     events: Vec<Event>,
 ) -> Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)> {
-    let ui = ui.clone();
+    let ui = Rc::downgrade(ui);
     Rc::new(move |kind, event_id, target_date, target_time| {
+        let Some(ui) = ui.upgrade() else {
+            return;
+        };
         let Some(event) = events.iter().find(|event| event.id == event_id).cloned() else {
             return;
         };
@@ -3620,7 +3779,9 @@ fn open_icloud_account_dialog(ui: &Rc<Ui>, apple_id_hint: Option<&str>) {
         dialog,
         #[weak]
         error_label,
-        #[strong]
+        // Weak: a button's own click handler holding the button is a cycle
+        // that keeps the dialog it sits in alive after it closes.
+        #[weak]
         connect_button,
         move |_| {
             let apple_id = apple_id_row.text().trim().to_string();
@@ -4051,7 +4212,8 @@ fn open_caldav_account_dialog(
         dialog,
         #[weak]
         error_label,
-        #[strong]
+        // Weak, as in the iCloud dialog: the button must not pin its dialog.
+        #[weak]
         connect_button,
         move |_| {
             let server_url = server_row.text().trim().to_string();

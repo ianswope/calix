@@ -47,6 +47,9 @@ mod views;
 #[cfg(feature = "gui")]
 mod window;
 
+#[cfg(all(test, feature = "gui"))]
+mod gui_leaks;
+
 /// Runs the GTK application, argv handling and all.
 #[cfg(feature = "gui")]
 pub fn run() -> gtk::glib::ExitCode {

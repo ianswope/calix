@@ -321,14 +321,41 @@ impl RemoteEvent {
 
 /// Opens a create/edit dialog for an event. Remote changes are completed in a
 /// worker thread before the local cache is updated.
+#[allow(clippy::too_many_arguments)]
+pub fn open(
+    parent: &impl IsA<gtk::Widget>,
+    store: Rc<Store>,
+    create_targets: Vec<TargetChoice>,
+    editing: Option<Event>,
+    initial_start: DateTime<Local>,
+    initial_end: Option<DateTime<Local>>,
+    on_saved: impl Fn(Saved) + 'static,
+    on_change: impl Fn(undo::Change) + 'static,
+    remote_event: Option<RemoteEvent>,
+) {
+    build(
+        store,
+        create_targets,
+        editing,
+        initial_start,
+        initial_end,
+        on_saved,
+        on_change,
+        remote_event,
+    )
+    .present(Some(parent));
+}
+
+/// The dialog, built but not yet presented. Separate from [`open`] so the
+/// widget tree can be constructed — and checked for what it holds on to —
+/// without a window to present it in.
 // Eight arguments, one over clippy's threshold. They are the dialog's inputs
 // and nothing here groups meaningfully: `editing` and `remote_event` describe
 // an existing event, `create_targets` only a new one, and the start/end pair
 // applies to both. A struct to hold them would be built inline at all three
 // call sites and read no better than the argument list does.
 #[allow(clippy::too_many_arguments)]
-pub fn open(
-    parent: &impl IsA<gtk::Widget>,
+pub(crate) fn build(
     store: Rc<Store>,
     create_targets: Vec<TargetChoice>,
     editing: Option<Event>,
@@ -343,7 +370,7 @@ pub fn open(
     // single-event operations report one: see [`crate::undo`].
     on_change: impl Fn(undo::Change) + 'static,
     remote_event: Option<RemoteEvent>,
-) {
+) -> adw::Dialog {
     let on_saved = Rc::new(on_saved);
     let on_change = Rc::new(on_change);
 
@@ -567,8 +594,12 @@ pub fn open(
             .label("Delete Event")
             .css_classes(["destructive-action"])
             .build();
+        // The dialog and the button are held weakly: the button sits inside
+        // the dialog, so a strong reference from its own handler to either
+        // would be a cycle that outlives the dialog being closed. Both are
+        // certainly alive while the click is being handled.
         delete_button.connect_clicked(clone!(
-            #[strong]
+            #[weak]
             dialog,
             #[strong]
             store,
@@ -580,7 +611,7 @@ pub fn open(
             deleted,
             #[strong]
             remote_event,
-            #[strong]
+            #[weak]
             delete_button,
             #[strong]
             scope_row,
@@ -646,8 +677,11 @@ pub fn open(
         }
     ));
 
+    // Weak for the same reason as Delete's: Save is inside the dialog it would
+    // otherwise pin. The async callbacks below take strong references of their
+    // own, which is right — they must outlive the click, and they end.
     save_button.connect_clicked(clone!(
-        #[strong]
+        #[weak]
         dialog,
         #[strong]
         store,
@@ -663,7 +697,7 @@ pub fn open(
         calendar_selector,
         #[strong]
         picker_expanded,
-        #[strong]
+        #[weak]
         save_button,
         #[strong]
         scope_row,
@@ -852,7 +886,7 @@ pub fn open(
         }
     ));
 
-    dialog.present(Some(parent));
+    dialog
 }
 
 fn set_time_rows(

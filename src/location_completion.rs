@@ -90,9 +90,12 @@ pub fn attach(row: &adw::EntryRow, store: Rc<Store>) {
 
     // Clicking a row commits it. `row-activated` covers the click and the
     // keyboard alike, so the two paths can't disagree — and it is connected
-    // once here, not on every rebuild of the list.
+    // once here, not on every rebuild of the list. Weak, because the list is
+    // owned by the completion: a strong reference back would be the one cycle
+    // the weak `row` above doesn't cover, and it would keep the popover and
+    // list alive after their dialog was gone.
     completion.list.connect_row_activated(clone!(
-        #[strong]
+        #[weak]
         completion,
         move |_, row| completion.accept(row.index())
     ));

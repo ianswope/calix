@@ -62,6 +62,23 @@ If a change lives inside a widget callback and feels untestable, that's the
 signal to extract the decision into a free function and test it there. Wiring
 (signal connections, layout) stays thin and is verified by running the app.
 
+One wiring bug does have a real test: reference cycles. A closure connected to
+a widget's own controller or button that captures that widget strongly is never
+freed — GTK4 doesn't run dispose on unparenting — and the grid is rebuilt after
+every sync, edit and navigation. `src/gui_leaks.rs` builds each page, popover
+and dialog the way the app does, drops it, and asserts every widget in the tree
+was finalized. It needs a display, so it is `#[ignore]`d and run by hand:
+
+```sh
+cargo test gui_leaks -- --ignored
+```
+
+It is one test function on purpose: GTK can be initialized from only one thread
+per process, and the harness gives each test its own. Run it after touching
+anything that connects a signal or controller. In a handler, read the widget off
+the gesture (`gesture.widget()`) or capture it with `#[weak]`; the only strong
+captures that belong in a handler are the ones that end, like a poll timer.
+
 ### The `gui` feature gate
 
 `src/lib.rs` splits the crate in two. Storage, sync, recurrence, alerts and

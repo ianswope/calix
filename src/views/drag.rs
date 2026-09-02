@@ -178,9 +178,17 @@ impl TimedGrid {
         gesture.set_button(gdk::BUTTON_PRIMARY);
 
         let (orig_col, top_px, height_px) = (placement.col, placement.top_px, placement.height_px);
-        let block = block.clone().upcast::<gtk::Widget>();
-        let this = self.clone();
+        // Everything these gestures capture is held weakly. The controller
+        // owns the block (for a move, the block *is* the region), and this grid
+        // owns the day area the block sits in, so a strong reference to either
+        // from the gesture's own closure is a cycle that would keep every
+        // rendered page alive after it was swapped out.
+        let block = block.clone().upcast::<gtk::Widget>().downgrade();
+        let this = Rc::downgrade(self);
         gesture.connect_drag_update(move |gesture, offset_x, offset_y| {
+            let (Some(this), Some(block)) = (this.upgrade(), block.upgrade()) else {
+                return;
+            };
             // Ignore updates while another block owns the drag.
             if let Some(active) = this.session.borrow().as_ref()
                 && (active.event_id != event_id || active.kind != kind)
@@ -242,8 +250,11 @@ impl TimedGrid {
             this.update(offset_x, offset_y);
         });
 
-        let this = self.clone();
+        let this = Rc::downgrade(self);
         gesture.connect_drag_end(move |_, _, _| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
             let session = this.session.borrow_mut().take();
             if let Some(session) = session {
                 this.finish(&session);
@@ -251,8 +262,11 @@ impl TimedGrid {
             }
         });
 
-        let this = self.clone();
+        let this = Rc::downgrade(self);
         gesture.connect_cancel(move |_, _| {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
             let session = this.session.borrow_mut().take();
             if let Some(session) = session {
                 this.finish(&session);
@@ -272,8 +286,11 @@ impl TimedGrid {
             return;
         }
         self.autoscroll_running.set(true);
-        let this = self.clone();
+        let this = Rc::downgrade(self);
         self.day_area.add_tick_callback(move |_, _| {
+            let Some(this) = this.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             if this.autoscroll_tick() {
                 glib::ControlFlow::Continue
             } else {
@@ -482,7 +499,6 @@ pub(crate) fn install_create_drag(
     // Set once the press has travelled far enough to be a drag rather than a
     // click, so a plain click still falls through to the hour cell beneath.
     let dragging = Rc::new(Cell::new(false));
-    let root = column.clone().upcast::<gtk::Widget>();
 
     gesture.connect_drag_update(clone!(
         #[strong]
@@ -491,10 +507,13 @@ pub(crate) fn install_create_drag(
         label,
         #[strong]
         dragging,
-        #[strong]
-        root,
         move |gesture, offset_x, offset_y| {
             let Some((press_x, press_y)) = gesture.start_point() else {
+                return;
+            };
+            // The column is the gesture's own widget; capturing it would be a
+            // cycle that kept every day column of every page alive.
+            let Some(root) = gesture.widget() else {
                 return;
             };
             if !dragging.get() {

@@ -380,10 +380,13 @@ fn day_column(
         };
         let click = gtk::GestureClick::new();
         let on_create = on_create.clone();
-        let cell_for_click = cell.clone();
         let slots_for_click = slots.clone();
-        click.connect_released(move |_, presses, _, _| {
-            slots_for_click.select(slot, &cell_for_click);
+        click.connect_released(move |gesture, presses, _, _| {
+            // From the gesture, not captured — see month_view's cell click.
+            let Some(cell) = gesture.widget() else {
+                return;
+            };
+            slots_for_click.select(slot, &cell);
             if presses < 2 {
                 return;
             }

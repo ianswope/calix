@@ -220,10 +220,15 @@ pub(crate) fn add_slot_menu(
     on_create: CreateFn,
     paste: PasteAction,
 ) {
-    let target = widget.clone().upcast::<gtk::Widget>();
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gdk::BUTTON_SECONDARY);
     gesture.connect_pressed(move |gesture, _, x, y| {
+        // Read off the gesture rather than captured: a closure on a widget's
+        // own controller that holds that widget is a reference cycle GTK never
+        // breaks, and this runs on every cell of every rebuilt page.
+        let Some(target) = gesture.widget() else {
+            return;
+        };
         if press_hits_button(&target, x, y) {
             return;
         }
