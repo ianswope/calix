@@ -5,7 +5,8 @@
 
 A fast, native calendar for Linux with a clean GTK4 interface and direct sync
 for Google Calendar, Apple iCloud, Fastmail, Nextcloud, and other CalDAV
-services.
+services. It was written for [Omarchy](https://omarchy.org/), where it adopts
+the active theme's colors on its own, and runs on any GTK4 desktop.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/month-dark.png">
@@ -14,8 +15,22 @@ services.
 
 Calix keeps the essentials close: year, month, week, and day views; local and
 synced calendars; quick event creation; search; reminders; and direct
-drag-to-move or resize. On [Omarchy](https://omarchy.org/), it automatically
-adopts the active theme's colors.
+drag-to-move or resize.
+
+## On Omarchy
+
+Calix was written to give [Omarchy](https://omarchy.org/) the kind of calendar
+macOS ships with, rather than a web app in a window.
+
+- **It follows your theme.** Calix reads the active Omarchy theme's
+  `colors.toml` at startup and recolors libadwaita to match — accent, semantic
+  colors, surfaces, borders, and the theme's declared light/dark mode — with
+  nothing to configure. `calix --print-theme` shows what it resolved. On
+  machines without Omarchy this is a no-op.
+- **Your bar can read the agenda.** `calix --agenda` prints today's
+  appointments as JSON and answers without opening a window or keeping the app
+  alive, which is what makes it safe on a widget's refresh timer. See
+  [Reading your agenda from something else](#reading-your-agenda-from-something-else).
 
 ## Connect your calendars without editing config files
 
