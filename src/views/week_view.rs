@@ -97,27 +97,48 @@ fn build_days(
         .child(&grid)
         .build();
 
-    // Land on the requested scroll position from the adjustment's own
-    // `changed`, which the viewport emits while it is being allocated — inside
-    // the layout phase of a frame, and so before that frame is painted.
+    // Open at the requested hour by placing the adjustment before the grid is
+    // ever allocated. GtkViewport reads the adjustment's current value back
+    // when it configures the range during allocation and only clamps it, so a
+    // value set now is where the first painted frame lands: no frame at
+    // midnight and no jump after it. The range is given as the grid's full
+    // height so the placement isn't clamped to zero on the way in; the
+    // viewport replaces it with the measured range as soon as it has one.
     //
     // An idle callback cannot do this. GTK's redraw runs at GDK_PRIORITY_REDRAW
     // (120) and a default idle at G_PRIORITY_DEFAULT_IDLE (200), so the grid
-    // painted at midnight and only then jumped to the hour asked for: a visible
-    // flick on launch, and on every full rebuild that navigation does — three
-    // pages at a time. Worse, an idle that happened to run *before* allocation
-    // found `upper` still zero, clamped the target to zero, and left the page
-    // sitting at midnight for good.
+    // painted at midnight and only then jumped to the hour asked for.
     let target = initial_scroll_hours(&days, today, initial_scroll) * hour_row_height as f64;
+    let full_height = f64::from(24 * hour_row_height);
+    let vadjustment = scrolled.vadjustment();
+    vadjustment.configure(
+        target,
+        0.0,
+        full_height,
+        f64::from(hour_row_height),
+        0.0,
+        0.0,
+    );
+
+    // Then hold it there from the adjustment's own `changed` — emitted while
+    // the viewport is allocated, inside the layout phase of a frame — until
+    // the range covers the whole day, in case the measured range arrives in
+    // stages and an early one clamps the value short.
+    //
     // Captures the flag and nothing else. A handler owned by the adjustment
     // that captured the scrolled window — which owns that adjustment — would be
     // a reference cycle of exactly the kind `gui_leaks` exists to catch.
     let done = Cell::new(false);
-    scrolled.vadjustment().connect_changed(move |adjustment| {
+    vadjustment.connect_changed(move |adjustment| {
         if done.get() {
             return;
         }
-        match opening_scroll_action(adjustment.upper(), adjustment.page_size(), target) {
+        match opening_scroll_action(
+            adjustment.upper(),
+            adjustment.page_size(),
+            target,
+            full_height,
+        ) {
             OpeningScroll::Wait => {}
             OpeningScroll::PlaceAndWatch => adjustment.set_value(target),
             OpeningScroll::PlaceAndFinish => {
@@ -143,11 +164,14 @@ fn build_days(
 ///
 /// Placing on the way up rather than waiting for the final range matters,
 /// because a single snapshot cannot tell a grid that is still growing from one
-/// that is genuinely shorter than its viewport. So an unreachable target keeps
-/// watching rather than declaring itself done: re-placing costs nothing when
-/// there is nothing to scroll — the value clamps to where it already sits —
-/// whereas finishing early on a grid that was merely mid-measurement would
-/// strand that page at midnight.
+/// that is genuinely shorter than its viewport. What does tell them apart is
+/// `full_height`, the height the grid will have once measured: a range that
+/// already covers it is final. So a target that can never reach the top of
+/// the viewport — an evening hour, or any hour on a day zoomed out to fit the
+/// screen — is placed as far as it goes and then left alone. Left watching,
+/// the handler fired on every later `changed` — each window resize, each
+/// zoom — and dragged the page back to the bottom of the day after the user
+/// had scrolled away from it.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum OpeningScroll {
     /// No usable range yet; anything set now clamps to zero.
@@ -158,10 +182,15 @@ enum OpeningScroll {
     PlaceAndFinish,
 }
 
-fn opening_scroll_action(upper: f64, page_size: f64, target: f64) -> OpeningScroll {
+fn opening_scroll_action(
+    upper: f64,
+    page_size: f64,
+    target: f64,
+    full_height: f64,
+) -> OpeningScroll {
     if upper <= 0.0 || page_size <= 0.0 {
         OpeningScroll::Wait
-    } else if upper - page_size >= target {
+    } else if upper - page_size >= target || upper >= full_height {
         OpeningScroll::PlaceAndFinish
     } else {
         OpeningScroll::PlaceAndWatch
@@ -905,13 +934,16 @@ mod tests {
 
     #[test]
     fn an_unallocated_grid_waits_for_a_range_before_its_opening_scroll() {
-        assert_eq!(opening_scroll_action(0.0, 0.0, 384.0), OpeningScroll::Wait);
+        assert_eq!(
+            opening_scroll_action(0.0, 0.0, 384.0, 1152.0),
+            OpeningScroll::Wait
+        );
     }
 
     #[test]
     fn a_viewport_with_no_content_measured_yet_waits() {
         assert_eq!(
-            opening_scroll_action(0.0, 600.0, 384.0),
+            opening_scroll_action(0.0, 600.0, 384.0, 1152.0),
             OpeningScroll::Wait
         );
     }
@@ -919,7 +951,7 @@ mod tests {
     #[test]
     fn a_grid_tall_enough_to_reach_the_target_places_it_once_and_stops() {
         assert_eq!(
-            opening_scroll_action(1152.0, 600.0, 384.0),
+            opening_scroll_action(1152.0, 600.0, 384.0, 1152.0),
             OpeningScroll::PlaceAndFinish
         );
     }
@@ -928,20 +960,38 @@ mod tests {
     fn a_grid_still_growing_places_what_it_can_and_keeps_watching() {
         // Measured, but only far enough to scroll 100px against a 384px target.
         assert_eq!(
-            opening_scroll_action(700.0, 600.0, 384.0),
+            opening_scroll_action(700.0, 600.0, 384.0, 1152.0),
             OpeningScroll::PlaceAndWatch
         );
     }
 
     #[test]
-    fn a_grid_that_cannot_reach_the_target_keeps_watching() {
-        // Shorter than its viewport, so there is nothing to scroll and the
-        // placement clamps to zero — where the page already is. Harmless to
-        // repeat, and indistinguishable from a grid still being measured,
-        // which must not be declared finished.
+    fn a_grid_short_of_its_full_day_keeps_watching() {
+        // Shorter than its viewport, so the placement clamps to zero. Until the
+        // whole day has been measured this can't be told apart from a grid
+        // that is still growing, which must not be declared finished.
         assert_eq!(
-            opening_scroll_action(300.0, 600.0, 384.0),
+            opening_scroll_action(300.0, 600.0, 384.0, 1152.0),
             OpeningScroll::PlaceAndWatch
+        );
+    }
+
+    #[test]
+    fn an_evening_target_past_the_last_scrollable_hour_stops_once_the_day_is_measured() {
+        // 9 PM at 48px an hour can never reach the top of a 600px viewport.
+        // Still watching after this, the handler would drag the view back to
+        // the bottom on every resize the user makes.
+        assert_eq!(
+            opening_scroll_action(1152.0, 600.0, 1008.0, 1152.0),
+            OpeningScroll::PlaceAndFinish
+        );
+    }
+
+    #[test]
+    fn a_zoomed_out_day_shorter_than_its_viewport_stops_once_measured() {
+        assert_eq!(
+            opening_scroll_action(480.0, 600.0, 160.0, 480.0),
+            OpeningScroll::PlaceAndFinish
         );
     }
 }
