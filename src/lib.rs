@@ -125,9 +125,19 @@ pub fn run() -> gtk::glib::ExitCode {
     // asked to: a login launch, or the autostart option being on, keeps sync
     // and reminder timers alive after the window closes. An ordinary launch
     // still exits with its window, and `app.quit` ends either one.
-    let _background_hold =
-        autostart::keeps_running_without_a_window(&args, autostart::enabled()).then(|| app.hold());
-    app.connect_startup(|app| {
+    //
+    // The hold is taken from `startup`, which only the primary instance emits.
+    // Taken before `run`, it applied to a remote instance too — a second
+    // `calix` forwarding its command line to the one already running — and
+    // GApplication's main loop runs for as long as anything holds it, remote
+    // or not. With autostart on, every launch from the menu presented the
+    // window and then sat there as a second process for good.
+    let keeps_running = autostart::keeps_running_without_a_window(&args, autostart::enabled());
+    app.connect_startup(move |app| {
+        if keeps_running {
+            // For the life of the process: `app.quit` ends it, hold or no hold.
+            std::mem::forget(app.hold());
+        }
         style::load();
         let quit = gio::SimpleAction::new("quit", None);
         let app_for_quit = app.clone();
