@@ -20,7 +20,7 @@ use crate::views::{
     week_view, year_view,
 };
 use adw::prelude::*;
-use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime, Timelike};
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
@@ -401,6 +401,83 @@ fn step_target_index(delta: i32) -> Option<u32> {
     }
 }
 
+/// What an arrow press should do, given the carousel it finds.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum StepAction {
+    /// Animate onto this neighbour; `page-changed` finishes the move.
+    Animate(u32),
+    /// A step is already in flight, or a rebuild is still landing. Hold this
+    /// press until the carousel settles, then take it from there.
+    Queue,
+    /// Nothing trustworthy to animate onto: rebuild around the new date.
+    Rebuild,
+}
+
+/// Which of those a press of `delta` periods gets.
+///
+/// A press during an animation used to be either lost — the carousel was
+/// already heading for that page — or, in the frames after it landed, turned
+/// into a full rebuild of all three pages under the user's eyes. Queueing it
+/// gives "two presses, two periods" without either.
+fn step_action(delta: i32, settled: bool, n_pages: u32, position: f64) -> StepAction {
+    let Some(index) = step_target_index(delta) else {
+        return StepAction::Rebuild;
+    };
+    // Unsettled comes before the page count: mid-recycle the carousel may
+    // briefly hold a page on its way out, and that is a reason to wait, not
+    // to rebuild.
+    if !settled {
+        return StepAction::Queue;
+    }
+    if n_pages != PAGES_PER_REBUILD {
+        return StepAction::Rebuild;
+    }
+    if (position - MIDDLE_PAGE).abs() > POSITION_EPSILON {
+        return StepAction::Queue;
+    }
+    StepAction::Animate(index)
+}
+
+/// How to apply the presses that queued up while the carousel was busy: one
+/// more period animates like the press it was; a run of them jumps in a single
+/// rebuild rather than a parade of animations the user has stopped watching.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PendingSteps {
+    None,
+    Animate(i32),
+    Jump(i32),
+}
+
+fn pending_steps_plan(pending: i32) -> PendingSteps {
+    match pending {
+        0 => PendingSteps::None,
+        -1 | 1 => PendingSteps::Animate(pending),
+        _ => PendingSteps::Jump(pending),
+    }
+}
+
+/// Whether the page at `index` is the one being looked at, and so the one
+/// whose scrolling the other two follow. `position` is `AdwCarousel:position`,
+/// which sits on a whole index when parked and between two mid-swipe. Only one
+/// page drives at a time; were two to, a neighbour whose range is shorter —
+/// a taller all-day row leaves it less to scroll — would clamp and push the
+/// visible page back up.
+fn page_drives_siblings(index: usize, position: f64) -> bool {
+    (position - index as f64).abs() < 0.5
+}
+
+/// Where a timed page should open to show `event`: an hour above its start,
+/// so the block sits just below the header rather than flush against it. An
+/// all-day event has no hour to show, so the page opens where it normally
+/// would.
+fn scroll_showing(event: &Event) -> week_view::InitialScroll {
+    if event.all_day {
+        return week_view::InitialScroll::NowOrMorning;
+    }
+    let hour = f64::from(event.start.hour()) + f64::from(event.start.minute()) / 60.0;
+    week_view::InitialScroll::AtHour((hour - 1.0).max(0.0))
+}
+
 struct State {
     view_mode: ViewMode,
     current_date: NaiveDate,
@@ -478,6 +555,11 @@ struct Ui {
     // offscreen neighbor pages at the old height. Navigation then preserves
     // the hour the user was looking at across the rebuild.
     zoom_dirty: Rc<Cell<bool>>,
+    // Arrow presses that arrived while a step was still animating or a rebuild
+    // still landing. Applied when the carousel next settles, so a quick double
+    // press moves two periods instead of losing the second — or tearing down
+    // the page the first was still animating onto.
+    pending_steps: Cell<i32>,
     // What account work is in flight. Owned by the `Ui` that every closure
     // already holds, so a timer can't find it gone the way it found the old
     // unparented sync buttons gone.
@@ -672,7 +754,7 @@ impl Ui {
                     HistoryStep::Redo => history.commit_redo(id),
                 }
                 drop(history);
-                self.reset();
+                self.reset_keeping_scroll();
             }
             Err(error) => self.toast(&format!("Couldn't {}: {error}", step.verb())),
         }
@@ -689,7 +771,7 @@ impl Ui {
     /// provider first when the local cache can't be right on its own — see
     /// [`event_dialog::Saved`].
     fn apply_saved(self: &Rc<Self>, saved: event_dialog::Saved) {
-        self.reset();
+        self.reset_keeping_scroll();
         if saved == event_dialog::Saved::StaleUntilSync {
             self.request_background_sync();
         }
@@ -810,13 +892,31 @@ impl Ui {
 
     /// Clears the carousel and rebuilds it with prev/current/next pages
     /// centered on the selected date, landing on the usual "now" scroll spot.
+    /// For going somewhere: Today, a picked date, a new day at midnight.
+    /// Presses queued behind a step are dropped — they were about where the
+    /// user was, not where they just asked to go.
     fn reset(self: &Rc<Self>) {
+        self.pending_steps.set(0);
         self.reset_with(week_view::InitialScroll::NowOrMorning);
     }
 
-    /// `reset`, but landing the timed grid at `scroll` — used to keep the same
-    /// time in view when a full rebuild happens for reasons other than
-    /// navigation (e.g. the first swipe after an in-place zoom).
+    /// Rebuilds around the current date with the hours the user is looking at
+    /// kept at the top of the grid. For everything that redraws without the
+    /// user having asked to go anywhere — a sync landing, a save, an undo, a
+    /// drag, a calendar toggled — and for stepping periods, where the time
+    /// axis is the same and only the dates change. Landing on "now" instead
+    /// yanked the view away from the evening the user had scrolled to every
+    /// time a sync finished. Without a timed page on screen there is no
+    /// position to keep, and the page opens where it normally would.
+    fn reset_keeping_scroll(self: &Rc<Self>) {
+        let scroll = self
+            .visible_scroll_hours()
+            .map(week_view::InitialScroll::AtHour)
+            .unwrap_or(week_view::InitialScroll::NowOrMorning);
+        self.reset_with(scroll);
+    }
+
+    /// `reset`, but landing the timed grid at `scroll`.
     fn reset_with(self: &Rc<Self>, scroll: week_view::InitialScroll) {
         let generation = {
             let mut sync = self.sync.get();
@@ -929,6 +1029,18 @@ impl Ui {
         // (tick_clock skips rollovers mid-rebuild); apply it now instead of
         // waiting out the 30s timer.
         self.tick_clock();
+        self.apply_pending_steps();
+    }
+
+    /// Takes the arrow presses that queued up while the carousel was busy and
+    /// moves by them, now that its neighbours are known to be the periods they
+    /// look like.
+    fn apply_pending_steps(self: &Rc<Self>) {
+        match pending_steps_plan(self.pending_steps.replace(0)) {
+            PendingSteps::None => {}
+            PendingSteps::Animate(delta) => self.step(delta),
+            PendingSteps::Jump(delta) => self.navigate(delta),
+        }
     }
 
     /// Claims the carousel for an imminent rebuild, so `page-changed` stops
@@ -941,25 +1053,15 @@ impl Ui {
     }
 
     /// Moves the display by `delta` periods with a full rebuild of all three
-    /// pages. Used where there's no page worth keeping — arrow buttons, view
-    /// mode changes, a date rollover.
+    /// pages, keeping the hours on screen. Used where there's no page worth
+    /// keeping: a jump of more than one period, or a step with no settled
+    /// neighbour to animate onto.
     fn navigate(self: &Rc<Self>, delta: i32) {
-        // A pinch re-zoomed only the visible page, so the rebuild would
-        // otherwise drop the user back at "now". Read the hour they're
-        // looking at before the pages go away.
-        let scroll = if self.zoom_dirty.get() {
-            self.visible_scroll_hours()
-                .map(week_view::InitialScroll::AtHour)
-                .unwrap_or(week_view::InitialScroll::NowOrMorning)
-        } else {
-            week_view::InitialScroll::NowOrMorning
-        };
-
         let mut state = self.state.borrow_mut();
         state.current_date = state.shift(delta);
         drop(state);
 
-        self.reset_with(scroll);
+        self.reset_keeping_scroll();
     }
 
     /// Moves one period by animating onto the neighbor page the carousel is
@@ -972,21 +1074,24 @@ impl Ui {
     /// whole view flicker. There is no reason a button press should take the
     /// worse path when the page it is moving to is built and attached already.
     ///
-    /// Falls back to the rebuild whenever there is nothing trustworthy to
-    /// animate onto: more than one period, an unsettled carousel (whose
-    /// neighbors are not the periods they look like), or a carousel that isn't
-    /// holding the usual three pages.
+    /// A press that lands while a step is still animating, or while a rebuild
+    /// is still settling, is queued and applied once the carousel has landed —
+    /// see `step_action`. It falls back to the rebuild only when there is
+    /// nothing trustworthy to animate onto: more than one period, or a
+    /// carousel that isn't holding the usual three pages.
     fn step(self: &Rc<Self>, delta: i32) {
-        let Some(index) = step_target_index(delta) else {
-            self.navigate(delta);
-            return;
-        };
-        if !self.sync.get().is_settled() || self.carousel.n_pages() != PAGES_PER_REBUILD {
-            self.navigate(delta);
-            return;
+        match step_action(
+            delta,
+            self.sync.get().is_settled(),
+            self.carousel.n_pages(),
+            self.carousel.position(),
+        ) {
+            StepAction::Animate(index) => self
+                .carousel
+                .scroll_to(&self.carousel.nth_page(index), true),
+            StepAction::Queue => self.pending_steps.set(self.pending_steps.get() + delta),
+            StepAction::Rebuild => self.navigate(delta),
         }
-        self.carousel
-            .scroll_to(&self.carousel.nth_page(index), true);
     }
 
     /// Completes a swipe: the user has already animated onto a neighbor page,
@@ -1009,13 +1114,18 @@ impl Ui {
         // keeping the time the user was looking at; `reset_with` supersedes
         // this generation, which its own settle loop then owns.
         if self.zoom_dirty.get() {
-            let scroll = self
-                .visible_scroll_hours()
-                .map(week_view::InitialScroll::AtHour)
-                .unwrap_or(week_view::InitialScroll::NowOrMorning);
-            self.reset_with(scroll);
+            self.reset_keeping_scroll();
             return;
         }
+
+        // The pages scroll together (see `link_page_scroll`), so the page just
+        // landed on sits at the same hours as the one it replaced, and the new
+        // far page is built to match: the next swipe reveals the same hours
+        // again, not a page that happened to open at "now".
+        let scroll = self
+            .visible_scroll_hours()
+            .map(week_view::InitialScroll::AtHour)
+            .unwrap_or(week_view::InitialScroll::NowOrMorning);
 
         let state = self.state.borrow();
         let view_mode = state.view_mode;
@@ -1023,11 +1133,7 @@ impl Ui {
         let title = state.title();
         drop(state);
 
-        let replacement = self.build_page(
-            view_mode,
-            replacement_date,
-            week_view::InitialScroll::NowOrMorning,
-        );
+        let replacement = self.build_page(view_mode, replacement_date, scroll);
         let plan = recycle_plan(delta);
         let stale = if plan.drop_first {
             self.carousel.first_child()
@@ -1145,7 +1251,7 @@ impl Ui {
                 };
                 let shifted = shift_months(ui.state.borrow().current_date, delta);
                 ui.state.borrow_mut().current_date = shifted;
-                ui.reset();
+                ui.reset_keeping_scroll();
             });
         }
 
@@ -1186,7 +1292,7 @@ impl Ui {
                     let Some(ui) = ui.upgrade() else {
                         return;
                     };
-                    ui.reset();
+                    ui.reset_keeping_scroll();
                     ui.reset_calendar_sidebar();
                 });
             },
@@ -1283,7 +1389,7 @@ impl Ui {
                     open_dialog.clone(),
                     ui.store.clone(),
                     remote,
-                    Rc::new(move || ui_for_changed.reset()),
+                    Rc::new(move || ui_for_changed.reset_keeping_scroll()),
                     Rc::new(move || ui_for_copy.copy_event(copied.clone())),
                 );
             })
@@ -1340,7 +1446,7 @@ impl Ui {
             .unwrap_or_default();
         let actions = self.event_callbacks(events.clone());
 
-        match view_mode {
+        let page = match view_mode {
             ViewMode::Year => {
                 // Picking a day drops into Day view on it, which is the only
                 // reason to click a date at this zoom.
@@ -1367,15 +1473,16 @@ impl Ui {
                 let hour_row_height = self.state.borrow().hour_row_height;
                 week_view::build_day(date, &events, actions, hour_row_height, initial_scroll)
             }
-        }
+        };
+        link_page_scroll(&page);
+        page
     }
 
     /// The `ScrolledWindow` of the currently visible (middle) page, if it's a
-    /// timed view. It's the page root's last child (below the header and
-    /// all-day rows).
+    /// timed view.
     fn visible_scrolled(&self) -> Option<gtk::ScrolledWindow> {
         let page = self.carousel.first_child()?.next_sibling()?;
-        page.last_child().and_downcast::<gtk::ScrolledWindow>()
+        timed_grid_of(&page)
     }
 
     /// The fractional hour currently at the top of the visible timed page,
@@ -1561,6 +1668,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         sync: Rc::new(Cell::new(CarouselSync::default())),
         on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
+        pending_steps: Cell::new(0),
         activity: Rc::new(AccountActivity::default()),
         refresh_accounts_button: refresh_accounts_button.clone(),
         history: Rc::new(RefCell::new(undo::History::default())),
@@ -1697,7 +1805,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
                     // it, rather than inventing a selection state the grid
                     // would then have to maintain.
                     ui_for_pick.state.borrow_mut().current_date = event.start.date_naive();
-                    ui_for_pick.reset();
+                    ui_for_pick.pending_steps.set(0);
+                    ui_for_pick.reset_with(scroll_showing(&event));
                 }),
             );
         }
@@ -2212,24 +2321,20 @@ fn connect_handlers(
                 return;
             }
             let Some(delta) = swipe_delta(index) else {
+                // A swipe that let go early and sprang back to the middle, or
+                // a step's own centering. Nothing moved, but presses queued
+                // behind it are still owed.
+                ui.apply_pending_steps();
                 return;
             };
-            // Claim the carousel before anything else, so the rest of this
-            // swipe's signals land unsettled and are ignored — including
-            // across the deferral below, which `advance` would otherwise
-            // spend with the guard still down.
-            ui.begin_rebuild();
-            if delta > 0 {
-                ui.advance(delta);
-            } else {
-                // `page-changed` is emitted while the swipe animation is still
-                // running. Inserting a page ahead of the current one races
-                // that animation, so let it finish first.
-                let ui = ui.clone();
-                glib::timeout_add_local_once(Duration::from_millis(180), move || {
-                    ui.advance(delta);
-                });
-            }
+            // `page-changed` is emitted from the scroll animation's `done`,
+            // so by now the carousel is parked on the neighbour and the far
+            // page can be recycled at once, in either direction. This used to
+            // wait 180 ms before a backward recycle, on the belief that the
+            // signal arrived mid-animation; it doesn't, and the wait was a
+            // window in which a second swipe or press found the carousel
+            // unsettled.
+            ui.advance(delta);
         }
     ));
 
@@ -2273,7 +2378,7 @@ fn connect_handlers(
             move |btn| {
                 if btn.is_active() {
                     set_view_mode(&ui, mode);
-                    ui.reset();
+                    ui.reset_keeping_scroll();
                     refresh_zoom_controls(&ui, &zoom_box, &zoom_out_button, &zoom_in_button);
                 }
             }
@@ -2422,6 +2527,7 @@ fn wire_a_ui_and_drop_it() -> std::rc::Weak<Ui> {
         sync: Rc::new(Cell::new(CarouselSync::default())),
         on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
+        pending_steps: Cell::new(0),
         activity: Rc::new(AccountActivity::default()),
         refresh_accounts_button: refresh_accounts_button.clone(),
         history: Rc::new(RefCell::new(undo::History::default())),
@@ -2474,6 +2580,65 @@ fn wire_a_ui_and_drop_it() -> std::rc::Weak<Ui> {
 
 /// How much one zoom-button press changes the hour height, in px.
 const ZOOM_BUTTON_STEP: i32 = 12;
+
+/// The scroll container of a timed page: the page root's last child, below
+/// the header and all-day rows. `None` for a month or year page.
+fn timed_grid_of(page: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
+    page.last_child().and_downcast::<gtk::ScrolledWindow>()
+}
+
+/// Keeps the three timed pages at one scroll offset: whichever page is being
+/// looked at drives the other two, so a swipe or a step reveals the neighbour
+/// at the same hours rather than at wherever it happened to open.
+///
+/// Connected once, when the page is built. The handler walks up to the
+/// carousel from the page rather than capturing it, and holds the page weakly:
+/// the page owns the scroll container that owns the adjustment this sits on.
+fn link_page_scroll(page: &gtk::Widget) {
+    let Some(scrolled) = timed_grid_of(page) else {
+        return;
+    };
+    scrolled.vadjustment().connect_value_changed(clone!(
+        #[weak]
+        page,
+        move |adjustment| follow_page_scroll(&page, adjustment.value())
+    ));
+}
+
+fn follow_page_scroll(page: &gtk::Widget, value: f64) {
+    let Some(carousel) = page.parent().and_downcast::<adw::Carousel>() else {
+        return;
+    };
+    let mut index = 0;
+    let mut child = carousel.first_child();
+    while let Some(widget) = child {
+        if widget == *page {
+            break;
+        }
+        index += 1;
+        child = widget.next_sibling();
+    }
+    if !page_drives_siblings(index, carousel.position()) {
+        return;
+    }
+    let mut child = carousel.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget == *page {
+            continue;
+        }
+        let Some(scrolled) = timed_grid_of(&widget) else {
+            continue;
+        };
+        let adjustment = scrolled.vadjustment();
+        // A neighbour that already matches is left alone; setting it anyway
+        // would emit `value-changed` on every frame of a touchpad scroll for
+        // nothing.
+        if (adjustment.value() - value).abs() > 0.5 {
+            adjustment.set_value(value);
+        }
+    }
+}
 
 /// Depth-first, sets `margin` on every "now" indicator in the subtree. The
 /// indicator has no indicator descendants, so its subtree isn't recursed into.
@@ -2677,7 +2842,7 @@ fn move_handler(
                     return;
                 }
                 let _ = ui.store.mark_local_edit(event.id);
-                ui.reset();
+                ui.reset_keeping_scroll();
 
                 let (tx, rx) = mpsc::channel();
                 let remote_draft = draft.clone();
@@ -2729,7 +2894,7 @@ fn move_handler(
                         original,
                         draft,
                     ));
-                    ui.reset();
+                    ui.reset_keeping_scroll();
                 }
             }
         }
@@ -2747,7 +2912,7 @@ fn undo_failed_drag(ui: &Rc<Ui>, event_id: i64, optimistic: &EventDraft, origina
     };
     if ui.store.update_event(event_id, &undo).is_ok() {
         let _ = ui.store.clear_local_edit(event_id);
-        ui.reset();
+        ui.reset_keeping_scroll();
     }
 }
 
@@ -3065,7 +3230,7 @@ fn add_google_account(ui: &Rc<Ui>, expected_account: Option<String>) {
                 let message = match rx.try_recv() {
                     Ok(Ok(result)) => {
                         ui.reset_calendar_sidebar();
-                        ui.reset();
+                        ui.reset_keeping_scroll();
                         add_summary(&result.outcome, &result.display_name, "calendar")
                     }
                     Ok(Err(error)) => format!("Google connect failed: {}", first_line(&error)),
@@ -3759,7 +3924,7 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
                             account.display_name
                         )));
                         ui.reset_calendar_sidebar();
-                        ui.reset();
+                        ui.reset_keeping_scroll();
                         parent.close();
                         // Reopen so the list reflects the removal and more
                         // accounts can be removed without re-navigating.
@@ -4003,7 +4168,7 @@ fn add_icloud_account(
                         restore();
                         dialog.close();
                         ui.reset_calendar_sidebar();
-                        ui.reset();
+                        ui.reset_keeping_scroll();
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
@@ -4125,7 +4290,7 @@ where
                             ));
                         }
                         ui.reset_calendar_sidebar();
-                        ui.reset();
+                        ui.reset_keeping_scroll();
                     }
                     Err(error) => {
                         eprintln!("calix: {}", provider.sync_failed(&error));
@@ -4456,7 +4621,7 @@ fn add_caldav_account(
                         restore();
                         dialog.close();
                         ui.reset_calendar_sidebar();
-                        ui.reset();
+                        ui.reset_keeping_scroll();
                         glib::ControlFlow::Break
                     }
                     Ok(Err(error)) => {
@@ -5235,33 +5400,25 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_backward_swipe_holds_the_guard_across_the_delay() {
-        // A backward swipe waits ~180ms for the animation to finish before
-        // recycling pages. The guard has to be claimed at `page-changed`, not
-        // when the deferred work runs — otherwise the carousel counts as
-        // settled for that whole window and a second `page-changed` from the
-        // same swipe moves the period again.
+    fn a_swipe_unsettles_the_carousel_until_its_recycle_has_landed() {
+        // `advance` claims the carousel before recycling, so the `page-changed`
+        // its own synchronous recentering emits — and anything else that lands
+        // before the settle loop confirms the middle page — is ignored rather
+        // than read as a second swipe.
         let sync = Rc::new(Cell::new(CarouselSync::default()));
         run_healthy_rebuild(&sync);
         assert!(sync.get().is_settled());
 
-        // page-changed(0) — handler claims the carousel, then defers.
-        let mut claimed = sync.get();
-        claimed.begin_rebuild();
-        sync.set(claimed);
-
+        let mut recycle = SettleLoop::begin(&sync);
         assert!(
             !sync.get().is_settled(),
-            "a page-changed arriving during the defer must be ignored"
+            "a page-changed arriving mid-recycle must be ignored"
         );
-
-        // The deferred advance claims again, recycles, and centers.
-        let mut deferred = SettleLoop::begin(&sync);
-        deferred.tick(true, 800, 0.0);
-        deferred.tick(true, 800, MIDDLE_PAGE);
+        recycle.tick(true, 800, 0.0);
+        recycle.tick(true, 800, MIDDLE_PAGE);
 
         assert!(sync.get().is_settled());
-        assert_eq!(deferred.scrolls, 1);
+        assert_eq!(recycle.scrolls, 1);
     }
 
     #[test]
@@ -5351,5 +5508,114 @@ mod tests {
             let index = step_target_index(delta).expect("a single period steps");
             assert_eq!(swipe_delta(index), Some(delta));
         }
+    }
+    #[test]
+    fn a_press_on_a_parked_carousel_animates_onto_the_neighbour() {
+        assert_eq!(
+            step_action(1, true, PAGES_PER_REBUILD, MIDDLE_PAGE),
+            StepAction::Animate(2)
+        );
+        assert_eq!(
+            step_action(-1, true, PAGES_PER_REBUILD, MIDDLE_PAGE),
+            StepAction::Animate(0)
+        );
+    }
+
+    #[test]
+    fn a_press_while_a_step_is_still_animating_is_queued_not_lost() {
+        // Settled, but the position is on its way to the next page: the
+        // carousel is already heading there, so a second scroll_to would be
+        // swallowed. Hold the press for after it lands.
+        assert_eq!(
+            step_action(1, true, PAGES_PER_REBUILD, 1.4),
+            StepAction::Queue
+        );
+    }
+
+    #[test]
+    fn a_press_while_a_rebuild_is_landing_is_queued_not_rebuilt_again() {
+        // The frames after a swipe or a sync's rebuild, before the settle loop
+        // has confirmed the middle page. A rebuild here tore down the page the
+        // user was looking at.
+        assert_eq!(
+            step_action(1, false, PAGES_PER_REBUILD, MIDDLE_PAGE),
+            StepAction::Queue
+        );
+    }
+
+    #[test]
+    fn a_press_of_more_than_one_period_rebuilds() {
+        assert_eq!(
+            step_action(3, true, PAGES_PER_REBUILD, MIDDLE_PAGE),
+            StepAction::Rebuild
+        );
+    }
+
+    #[test]
+    fn a_press_on_a_carousel_without_its_three_pages_rebuilds() {
+        assert_eq!(step_action(1, true, 1, 0.0), StepAction::Rebuild);
+    }
+
+    #[test]
+    fn no_queued_presses_means_nothing_to_apply() {
+        assert_eq!(pending_steps_plan(0), PendingSteps::None);
+    }
+
+    #[test]
+    fn one_queued_press_animates_like_the_press_it_was() {
+        assert_eq!(pending_steps_plan(1), PendingSteps::Animate(1));
+        assert_eq!(pending_steps_plan(-1), PendingSteps::Animate(-1));
+    }
+
+    #[test]
+    fn a_run_of_queued_presses_jumps_in_one_rebuild() {
+        assert_eq!(pending_steps_plan(3), PendingSteps::Jump(3));
+        assert_eq!(pending_steps_plan(-2), PendingSteps::Jump(-2));
+    }
+
+    #[test]
+    fn only_the_page_being_looked_at_drives_its_siblings() {
+        assert!(page_drives_siblings(1, MIDDLE_PAGE));
+        assert!(!page_drives_siblings(0, MIDDLE_PAGE));
+        assert!(!page_drives_siblings(2, MIDDLE_PAGE));
+    }
+
+    #[test]
+    fn mid_swipe_the_nearer_page_drives() {
+        assert!(page_drives_siblings(1, 1.3));
+        assert!(!page_drives_siblings(2, 1.3));
+        assert!(page_drives_siblings(2, 1.8));
+        assert!(!page_drives_siblings(1, 1.8));
+    }
+
+    #[test]
+    fn a_found_event_opens_an_hour_above_its_start() {
+        let event = test_event(local_at(2026, 10, 5, 14), local_at(2026, 10, 5, 15), false);
+        assert!(matches!(
+            scroll_showing(&event),
+            week_view::InitialScroll::AtHour(hour) if (hour - 13.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn a_found_event_in_the_first_hour_opens_at_midnight() {
+        let event = test_event(local_at(2026, 10, 5, 0), local_at(2026, 10, 5, 1), false);
+        assert!(matches!(
+            scroll_showing(&event),
+            week_view::InitialScroll::AtHour(hour) if hour == 0.0
+        ));
+    }
+
+    #[test]
+    fn a_found_all_day_event_opens_where_the_page_normally_would() {
+        let event = test_event(
+            local_midnight(2026, 10, 5),
+            local_midnight(2026, 10, 6),
+            true,
+        );
+        assert!(matches!(
+            scroll_showing(&event),
+            week_view::InitialScroll::NowOrMorning
+        ));
     }
 }
