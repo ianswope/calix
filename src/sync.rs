@@ -50,6 +50,13 @@ impl SyncOutcome {
         !quiet || self.failure_note().is_some()
     }
 
+    /// [`Self::needs_reporting`], for a sync that runs on a timer: whether
+    /// this outcome is news given what the last one reported. See
+    /// [`failure_is_news`].
+    pub fn is_news(&self, quiet: bool, last_reported: Option<&str>) -> bool {
+        failure_is_news(quiet, self.failure_note().as_deref(), last_reported)
+    }
+
     /// A trailing clause naming the calendars that failed, or `None` when
     /// everything synced. Callers append it to their success message so a
     /// partial failure never reads as a clean success.
@@ -92,6 +99,24 @@ impl SyncOutcome {
             self.synced,
             account_count.saturating_sub(self.failed_accounts.len())
         ))
+    }
+}
+
+/// Whether a sync's failure (`None` for a clean one) should be announced,
+/// given what the last sync of its kind announced.
+///
+/// A manual sync always is. A quiet one — the pass every quarter hour —
+/// reports a failure the first time it appears and then not again until it
+/// changes or clears, so a sign-in that expired on Monday is said once rather
+/// than ninety-six times a day. A success after a reported failure is left to
+/// the account's own status line, as a quiet success always was.
+pub fn failure_is_news(quiet: bool, failure: Option<&str>, last_reported: Option<&str>) -> bool {
+    if !quiet {
+        return true;
+    }
+    match failure {
+        Some(failure) => last_reported != Some(failure),
+        None => false,
     }
 }
 
@@ -227,6 +252,59 @@ mod tests {
         let mut outcome = SyncOutcome::default();
         outcome.record_success();
         assert!(outcome.needs_reporting(false));
+    }
+
+    #[test]
+    fn a_quiet_failure_is_news_the_first_time_it_appears() {
+        assert!(failure_is_news(true, Some("sign-in expired"), None));
+    }
+
+    #[test]
+    fn the_same_failure_next_quarter_hour_is_not_news() {
+        assert!(!failure_is_news(
+            true,
+            Some("sign-in expired"),
+            Some("sign-in expired")
+        ));
+    }
+
+    #[test]
+    fn a_different_failure_is_news() {
+        assert!(failure_is_news(
+            true,
+            Some("network error"),
+            Some("sign-in expired")
+        ));
+    }
+
+    #[test]
+    fn a_quiet_success_is_never_news_even_after_a_failure() {
+        assert!(!failure_is_news(true, None, Some("sign-in expired")));
+    }
+
+    #[test]
+    fn a_failure_that_cleared_and_came_back_is_news_again() {
+        // The success in between reset what was last reported.
+        assert!(failure_is_news(true, Some("sign-in expired"), None));
+    }
+
+    #[test]
+    fn a_manual_sync_always_reports() {
+        assert!(failure_is_news(false, None, None));
+        assert!(failure_is_news(
+            false,
+            Some("sign-in expired"),
+            Some("sign-in expired")
+        ));
+    }
+
+    #[test]
+    fn an_outcome_is_news_by_its_failure_note() {
+        let mut outcome = SyncOutcome::default();
+        outcome.record_account_failure("Work", "sign-in expired");
+        let note = outcome.failure_note();
+        assert!(outcome.is_news(true, None));
+        assert!(!outcome.is_news(true, note.as_deref()));
     }
 
     #[test]

@@ -14,8 +14,29 @@ periods.
   so the wheel covers the same ground as before; touchpad scrolling, Shift+wheel
   paging, and a grid that already fits the window are untouched.
 
+### Changed
+
+- A sync that fails on a timer says so once. The quarter-hourly pass used to
+  toast the same failure every time it ran — an expired Google sign-in was
+  announced ninety-six times a day until it was renewed. It is now announced
+  when it first appears and again only if it changes or clears and returns; a
+  manual refresh still always reports. A failure only you can put right — a
+  sign-in to renew, a password to update — stays on screen until dismissed and
+  carries an **Accounts** button that opens the dialog with **Update sign-in**
+  on it, instead of fading after five seconds while nobody was looking.
+- The Google setup instructions now say to publish the OAuth app to Production
+  from the start. Leaving it in Testing, which the README used to call fine, is
+  what makes Google expire the sign-in every seven days.
+
 ### Fixed
 
+- Launching Calix while it is already running in the background no longer
+  leaves a second, windowless `calix` process behind. The launcher forwarded
+  its command line to the running instance and presented the window, but then
+  never exited: the hold that keeps the background process alive was taken
+  before the process knew whether it was the running instance or a messenger
+  to it, and GApplication's main loop runs for as long as anything holds it.
+  Only the running instance takes the hold now.
 - Week and day view no longer snap back to the bottom of the day when the
   window is resized. From early afternoon on, the hour a page opens at — two
   hours before now — can't reach the top of the viewport, and the handler

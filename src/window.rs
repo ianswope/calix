@@ -137,6 +137,10 @@ type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 struct AccountActivity {
     syncing: [Cell<bool>; provider::ALL.len()],
     signing_in: Cell<bool>,
+    /// The failure the last sync of each provider announced, if any, so the
+    /// quarter-hourly pass can tell a standing failure from a new one — see
+    /// [`sync::failure_is_news`].
+    last_reported: [RefCell<Option<String>>; provider::ALL.len()],
 }
 
 impl AccountActivity {
@@ -165,6 +169,22 @@ impl AccountActivity {
     /// Whether any provider is mid-sync — what the one Refresh control shows.
     fn any_sync_in_flight(&self) -> bool {
         self.syncing.iter().any(Cell::get)
+    }
+
+    fn last_reported(&self, provider: Provider) -> Option<String> {
+        let index = provider::ALL
+            .iter()
+            .position(|candidate| *candidate == provider)
+            .expect("every Provider is one of provider::ALL");
+        self.last_reported[index].borrow().clone()
+    }
+
+    fn set_last_reported(&self, provider: Provider, failure: Option<String>) {
+        let index = provider::ALL
+            .iter()
+            .position(|candidate| *candidate == provider)
+            .expect("every Provider is one of provider::ALL");
+        *self.last_reported[index].borrow_mut() = failure;
     }
 
     /// Claims the interactive sign-in. `false` means one is already open.
@@ -3130,6 +3150,24 @@ fn add_summary(outcome: &Result<SyncOutcome, String>, display_name: &str, noun: 
 
 /// Points the one Refresh control at what is actually happening. Called
 /// whenever a sync starts or ends, whichever way it ended.
+/// Toasts the result of a sync. A failure that needs the user — an expired
+/// sign-in, a changed password — stays up until dismissed and carries a button
+/// to the Accounts dialog, where Update sign-in lives; a toast that faded after
+/// five seconds while nobody was at the machine told them nothing.
+fn announce_sync(ui: &Rc<Ui>, message: &str, needs_the_user: bool) {
+    let toast = adw::Toast::new(&glib::markup_escape_text(message));
+    if needs_the_user {
+        toast.set_timeout(0);
+        toast.set_button_label(Some("Accounts"));
+        toast.connect_button_clicked(clone!(
+            #[weak]
+            ui,
+            move |_| open_manage_accounts_dialog(&ui)
+        ));
+    }
+    ui.toast_overlay.add_toast(toast);
+}
+
 fn update_refresh_affordance(ui: &Rc<Ui>) {
     let busy = ui.activity.any_sync_in_flight();
     ui.refresh_accounts_button.set_sensitive(!busy);
@@ -3487,7 +3525,7 @@ fn open_google_setup_help(ui: &Rc<Ui>) {
     save.set_halign(gtk::Align::Start);
     content.append(&save);
     let warning = gtk::Label::new(Some(
-        "If the OAuth app remains in Google's Testing mode, Google may require you to sign in again periodically.",
+        "An OAuth app left in Google's Testing mode expires its sign-ins every seven days; publish it to Production in the Google Cloud Console to stop that.",
     ));
     warning.set_wrap(true);
     warning.set_xalign(0.0);
@@ -4284,20 +4322,30 @@ where
 
                 match outcome {
                     Ok((account_count, outcome)) => {
-                        if outcome.needs_reporting(quiet) {
-                            ui.toast_overlay.add_toast(adw::Toast::new(
+                        let last_reported = ui.activity.last_reported(provider);
+                        if outcome.is_news(quiet, last_reported.as_deref()) {
+                            announce_sync(
+                                &ui,
                                 &outcome.synced_summary(provider.calendar_noun, account_count),
-                            ));
+                                // An account that never ran — a sign-in to
+                                // renew, a password to update — is something
+                                // only the user can put right.
+                                !outcome.failed_accounts.is_empty(),
+                            );
                         }
+                        ui.activity
+                            .set_last_reported(provider, outcome.failure_note());
                         ui.reset_calendar_sidebar();
                         ui.reset_keeping_scroll();
                     }
                     Err(error) => {
                         eprintln!("calix: {}", provider.sync_failed(&error));
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(
-                                &provider.sync_failed(first_line(&error)),
-                            )));
+                        let message = provider.sync_failed(first_line(&error));
+                        let last_reported = ui.activity.last_reported(provider);
+                        if sync::failure_is_news(quiet, Some(&message), last_reported.as_deref()) {
+                            announce_sync(&ui, &message, false);
+                        }
+                        ui.activity.set_last_reported(provider, Some(message));
                     }
                 }
 

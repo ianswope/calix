@@ -223,7 +223,7 @@ account first — those need nothing but a password. Otherwise, setup takes abou
 10 minutes:
 
 1. Create a project at [console.cloud.google.com](https://console.cloud.google.com) and enable the **Google Calendar API** for it.
-2. Under **Google Auth Platform → Audience**, set the app to External, and add your own Google account under **Test users** (the app stays unverified/"Testing," which is fine for personal use — publishing for public verification is a separate, much heavier process not needed here).
+2. Under **Google Auth Platform → Audience**, set the app to External, then **Publish app** so its publishing status is Production. Leaving it in Testing is the one setting that bites later: Google expires a Testing-mode app's sign-ins every seven days, and Calix will ask you to sign in again every week. Production is not the same as verification — the app stays unverified, Google shows a warning screen once at sign-in, and that is fine for personal use; public verification is a separate, much heavier process not needed here.
 3. Under **Data Access**, add these scopes:
    - `https://www.googleapis.com/auth/calendar.events`
    - `https://www.googleapis.com/auth/calendar.calendarlist.readonly`
