@@ -3,7 +3,7 @@ use crate::store::Event;
 use crate::views::{
     EditFn, EventSelection, MoveFn, PageActions, Slot, SlotGrain, add_slot_menu,
     drag::{BlockPlacement, TimedGrid, parse_drag_payload},
-    event_occurs_on_day, event_widget,
+    event_occurs_on_day, event_widget, smooth_scroll,
 };
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use gtk::prelude::*;
@@ -96,6 +96,7 @@ fn build_days(
         .vexpand(true)
         .child(&grid)
         .build();
+    smooth_scroll::install(&scrolled);
 
     // Open at the requested hour by placing the adjustment before the grid is
     // ever allocated. GtkViewport reads the adjustment's current value back

@@ -8,6 +8,7 @@ use std::rc::Rc;
 pub(crate) mod drag;
 mod event_widget;
 pub mod month_view;
+pub(crate) mod smooth_scroll;
 pub mod week_view;
 pub mod year_view;
 

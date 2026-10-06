@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+Scrolling in week and day view stays where it was put: a resize, a sync, a
+save, a drag, or a step to the next week no longer moves it, a wheel detent
+glides instead of jumping, and a quick double press of an arrow moves two
+periods.
+
+### Added
+
+- Mouse-wheel scrolling of the week and day grid is eased over a few frames
+  instead of jumping a step per detent. The distance per detent is GTK's own,
+  so the wheel covers the same ground as before; touchpad scrolling, Shift+wheel
+  paging, and a grid that already fits the window are untouched.
+
+### Fixed
+
+- Week and day view no longer snap back to the bottom of the day when the
+  window is resized. From early afternoon on, the hour a page opens at — two
+  hours before now — can't reach the top of the viewport, and the handler
+  placing it kept watching for a range that would never come, re-placing and
+  so re-clamping to the bottom on every later change to the grid's range. On a
+  tiling desktop that is every window opened or closed beside Calix. The page
+  now opens as far toward its hour as it can go and is then left alone. The
+  opening position is also set before the grid is first laid out, so the first
+  painted frame is already at the right hour rather than placed during it.
+- A sync landing, a save, a drag, an undo, or a calendar toggled in the
+  sidebar no longer throws the view back to "now". Every rebuild re-landed on
+  the page's opening position, so an evening scrolled to was lost whenever the
+  quarter-hourly sync finished, and an event dragged to 7 PM could scroll out
+  of view the moment it was dropped. Rebuilds the user didn't navigate to keep
+  the hours on screen; Today, a picked date, and a change of view still land
+  where they always did.
+- Swiping or stepping to the next week shows it at the same hours. The
+  neighbouring pages opened at "now" or 8 AM regardless of where the visible
+  page had been scrolled, so the hour axis jumped with every change of period.
+  The three pages now scroll together, and a page built to replace one keeps
+  the hours on screen.
+- Pressing an arrow twice quickly moves two periods. A press during the step
+  animation was swallowed, because the carousel was already heading for that
+  page, and a press in the frames after it landed rebuilt all three pages under
+  the user's eyes. Presses that arrive while a step is in flight are queued and
+  applied once it lands; a run of them jumps in one rebuild.
+- A backward swipe recycles its far page at once instead of after a 180 ms
+  wait. libadwaita emits `page-changed` only once the scroll animation has
+  finished, so there was no animation to wait out — only a window in which the
+  carousel wasn't trusted and a second swipe or press was ignored.
+- Opening an event from search lands the week or day grid an hour above the
+  event instead of at "now".
+
 ## 0.7.0 — 2026-09-08
 
 Events can be copied onto another day, changes taken back with Ctrl+Z, and
