@@ -52,7 +52,7 @@ fn parse_ics_attendee(parameters: &str, value: &str) -> Option<Attendee> {
     let mut name = None;
     let mut status = None;
     // `parameters` still carries the property name, so skip that first segment.
-    for parameter in parameters.split(';').skip(1) {
+    for parameter in split_parameters(parameters).into_iter().skip(1) {
         let Some((key, raw_value)) = parameter.split_once('=') else {
             continue;
         };
@@ -1001,10 +1001,10 @@ fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
         if nested_depth > 0 {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((name, value)) = split_content_line(&line) else {
             continue;
         };
-        let mut parts = name.split(';');
+        let mut parts = split_parameters(name).into_iter();
         let key = parts.next().unwrap_or(name).to_ascii_uppercase();
         if key == "ATTENDEE" {
             if let Some(attendee) = parse_ics_attendee(name, value) {
@@ -1667,7 +1667,8 @@ fn unfold_ics(ics: &str) -> Vec<String> {
     for line in ics.replace("\r\n", "\n").lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
             if let Some(last) = unfolded.last_mut() {
-                last.push_str(line.trim_start());
+                // Only the first space/tab is the fold marker; the rest is text.
+                last.push_str(&line[1..]);
             }
         } else {
             unfolded.push(line.to_string());
@@ -1735,17 +1736,67 @@ fn escape_ics_text(value: &str) -> String {
 }
 
 fn unescape_ics_text(value: &str) -> String {
-    value
-        .replace("\\n", "\n")
-        .replace("\\N", "\n")
-        .replace("\\,", ",")
-        .replace("\\;", ";")
-        .replace("\\\\", "\\")
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        // Consume each escape once, so a literal backslash followed by 'n'
+        // cannot be mistaken for an escaped newline on a later pass.
+        match characters.next() {
+            Some('n' | 'N') => decoded.push('\n'),
+            Some(escaped @ ('\\' | ',' | ';')) => decoded.push(escaped),
+            other => {
+                decoded.push('\\');
+                if let Some(character) = other {
+                    decoded.push(character);
+                }
+            }
+        }
+    }
+    decoded
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reading_an_invitation_preserves_quoted_attendee_names() {
+        let ics = "BEGIN:VEVENT\r\nDTSTART:20260709T140000Z\r\nDTEND:20260709T150000Z\r\n\
+ATTENDEE;CN=\"Smith: Jo; Work\";PARTSTAT=ACCEPTED:mailto:jo@example.com\r\nEND:VEVENT\r\n";
+        let (events, complete) = parse_resource("/cal/invitation.ics", ics);
+        assert!(complete);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attendees.len(), 1);
+        assert_eq!(events[0].attendees[0].email, "jo@example.com");
+        assert_eq!(
+            events[0].attendees[0].name.as_deref(),
+            Some("Smith: Jo; Work")
+        );
+        assert_eq!(events[0].attendees[0].status.as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn unfolding_removes_only_the_single_fold_marker() {
+        assert_eq!(
+            unfold_ics("DESCRIPTION:Meet\r\n  at the café\r\n\t\tthen lunch\r\n"),
+            vec!["DESCRIPTION:Meet at the café\tthen lunch"]
+        );
+    }
+
+    #[test]
+    fn escaped_text_round_trips_literal_backslashes_and_newlines() {
+        let notes = "Read C:\\notes\\New; bring café, tea\nThen write \\n literally.";
+        assert_eq!(unescape_ics_text(&escape_ics_text(notes)), notes);
+        assert_eq!(unescape_ics_text(r"First\Nsecond"), "First\nsecond");
+        assert_eq!(
+            unescape_ics_text("unknown\\x and trailing\\"),
+            "unknown\\x and trailing\\"
+        );
+    }
 
     fn credentials_for(base_url: &str) -> Credentials {
         Credentials {

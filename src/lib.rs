@@ -109,17 +109,13 @@ pub fn run() -> gtk::glib::ExitCode {
     // already running: GApplication forwards argv to it, and the date moves
     // the window that's up rather than opening a second one beside it.
     let non_unique = std::env::var_os("CALIX_NON_UNIQUE").is_some();
-    let mut flags = gio::ApplicationFlags::HANDLES_COMMAND_LINE;
     // A clean-profile UX or integration test must be able to coexist with a
     // normally running Calix while still using the real desktop/keyring bus.
     // This opt-in is intentionally environment-only and never affects an
     // ordinary launch from the application menu.
-    if non_unique {
-        flags = gio::ApplicationFlags::NON_UNIQUE;
-    }
     let app = adw::Application::builder()
         .application_id(APP_ID)
-        .flags(flags)
+        .flags(application_flags(non_unique))
         .build();
     // Calix doubles as the lightweight alert process, but only when it was
     // asked to: a login launch, or the autostart option being on, keeps sync
@@ -170,6 +166,15 @@ pub fn run() -> gtk::glib::ExitCode {
     app.run()
 }
 
+#[cfg(feature = "gui")]
+fn application_flags(non_unique: bool) -> gtk::gio::ApplicationFlags {
+    let mut flags = gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE;
+    if non_unique {
+        flags |= gtk::gio::ApplicationFlags::NON_UNIQUE;
+    }
+    flags
+}
+
 /// A `--background` command line attaches to the running process without
 /// presenting a window. Any other command line opens or re-presents the UI.
 #[cfg(feature = "gui")]
@@ -179,6 +184,17 @@ fn command_line_presents_window(background_launch: bool) -> bool {
 
 #[cfg(all(test, feature = "gui"))]
 mod tests {
+    #[test]
+    fn isolated_launches_still_handle_dates_as_command_line_arguments() {
+        use gtk::gio::ApplicationFlags;
+
+        for non_unique in [false, true] {
+            let flags = super::application_flags(non_unique);
+            assert!(flags.contains(ApplicationFlags::HANDLES_COMMAND_LINE));
+            assert_eq!(flags.contains(ApplicationFlags::NON_UNIQUE), non_unique);
+        }
+    }
+
     #[test]
     fn a_background_command_line_does_not_present_a_window() {
         assert!(!super::command_line_presents_window(true));

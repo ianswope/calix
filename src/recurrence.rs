@@ -115,6 +115,27 @@ pub fn occurrences_in<Tz: TimeZone>(
     range_start: DateTime<Tz>,
     range_end: DateTime<Tz>,
 ) -> Vec<DateTime<Tz>> {
+    occurrences_with_end_in(
+        base_start,
+        duration,
+        freq,
+        range_start,
+        range_end,
+        |start| start.clone() + duration,
+    )
+}
+
+/// Expand with the same end calculation used to render each occurrence.
+/// `duration` controls the lookback; `end_at` decides actual overlap, allowing
+/// all-day events to end at local midnight even across a DST transition.
+pub(crate) fn occurrences_with_end_in<Tz: TimeZone>(
+    base_start: DateTime<Tz>,
+    duration: Duration,
+    freq: Frequency,
+    range_start: DateTime<Tz>,
+    range_end: DateTime<Tz>,
+    end_at: impl Fn(&DateTime<Tz>) -> DateTime<Tz>,
+) -> Vec<DateTime<Tz>> {
     let tz = base_start.timezone();
     let base_date = base_start.date_naive();
     let base_time = base_start.time();
@@ -140,7 +161,7 @@ pub fn occurrences_in<Tz: TimeZone>(
             if start >= range_end {
                 break;
             }
-            if start.clone() + duration > range_start {
+            if end_at(&start) > range_start {
                 occurrences.push(start);
             }
         }
@@ -289,6 +310,35 @@ mod tests {
 
     fn occurrence_days(occ: &[DateTime<chrono_tz::Tz>]) -> Vec<NaiveDate> {
         occ.iter().map(|o| o.date_naive()).collect()
+    }
+
+    #[test]
+    fn all_day_occurrences_use_midnight_for_overlap_across_dst() {
+        // An explicit timezone keeps this regression covered even on UTC CI.
+        for (base, range_start, range_end, expected) in [
+            (
+                at(2026, 3, 1, 0),
+                at(2026, 3, 9, 0),
+                at(2026, 3, 10, 0),
+                at(2026, 3, 9, 0),
+            ),
+            (
+                at(2026, 10, 25, 0),
+                at(2026, 11, 1, 23),
+                at(2026, 11, 2, 0),
+                at(2026, 11, 1, 0),
+            ),
+        ] {
+            let occurrences = occurrences_with_end_in(
+                base,
+                Duration::days(1),
+                Frequency::Daily,
+                range_start,
+                range_end,
+                |start| crate::date_util::day_start_in(&NY, start.date_naive() + Duration::days(1)),
+            );
+            assert_eq!(occurrences, vec![expected]);
+        }
     }
 
     #[test]

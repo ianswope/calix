@@ -1255,25 +1255,37 @@ fn expand_recurring(
     let Some(freq) = master.recurrence else {
         return Vec::new();
     };
-    let duration = master.end - master.start;
-    crate::recurrence::occurrences_in(master.start, duration, freq, range_start, range_end)
-        .into_iter()
-        .map(|start| {
-            let mut occurrence = master.clone();
-            occurrence.end = if master.all_day {
-                // Keep an all-day span a whole number of calendar days, the same
-                // policy as a moved all-day draft, so DST can't nudge the end.
-                let span_days = (master.end.date_naive() - master.start.date_naive())
-                    .num_days()
-                    .max(1);
-                day_start(start.date_naive() + chrono::Duration::days(span_days))
-            } else {
-                start + duration
-            };
-            occurrence.start = start;
-            occurrence
-        })
-        .collect()
+    let span_days = (master.end.date_naive() - master.start.date_naive())
+        .num_days()
+        .max(1);
+    let duration = if master.all_day {
+        chrono::Duration::days(span_days)
+    } else {
+        master.end - master.start
+    };
+    let end_at = |start: &DateTime<Local>| {
+        if master.all_day {
+            day_start(start.date_naive() + chrono::Duration::days(span_days))
+        } else {
+            *start + duration
+        }
+    };
+    crate::recurrence::occurrences_with_end_in(
+        master.start,
+        duration,
+        freq,
+        range_start,
+        range_end,
+        end_at,
+    )
+    .into_iter()
+    .map(|start| {
+        let mut occurrence = master.clone();
+        occurrence.end = end_at(&start);
+        occurrence.start = start;
+        occurrence
+    })
+    .collect()
 }
 
 /// `None` for a row whose stored timestamps can't be read — see
@@ -2003,6 +2015,43 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
         );
         assert_eq!(events[0].recurrence, Some(Frequency::Weekly));
+    }
+
+    #[test]
+    fn a_recurring_all_day_event_does_not_spill_past_its_calendar_day() {
+        let store = Store::open_in_memory().unwrap();
+        let midnight = |month, day| day_start(NaiveDate::from_ymd_opt(2026, month, day).unwrap());
+        // The master spans the 25-hour fall-back day in US timezones.
+        let mut daily = draft("Holiday", midnight(11, 1), midnight(11, 2));
+        daily.all_day = true;
+        daily.recurrence = Some(Frequency::Daily);
+        store.create_event(1, &daily).unwrap();
+
+        let events = store
+            .events_between(midnight(11, 3), midnight(11, 4))
+            .unwrap();
+        assert_eq!(events.len(), 1, "yesterday's occurrence ended at midnight");
+        assert_eq!(events[0].start, midnight(11, 3));
+        assert_eq!(events[0].end, midnight(11, 4));
+    }
+
+    #[test]
+    fn a_recurring_all_day_event_still_overlaps_the_last_hour_of_its_day() {
+        let store = Store::open_in_memory().unwrap();
+        let midnight = |month, day| day_start(NaiveDate::from_ymd_opt(2026, month, day).unwrap());
+        // The master's elapsed duration is only 23 hours across spring-forward.
+        let mut daily = draft("Holiday", midnight(3, 8), midnight(3, 9));
+        daily.all_day = true;
+        daily.recurrence = Some(Frequency::Daily);
+        store.create_event(1, &daily).unwrap();
+
+        let end = midnight(3, 11);
+        let events = store
+            .events_between(end - Duration::minutes(30), end)
+            .unwrap();
+        assert_eq!(events.len(), 1, "all-day lasts until the next midnight");
+        assert_eq!(events[0].start, midnight(3, 10));
+        assert_eq!(events[0].end, end);
     }
 
     #[test]
