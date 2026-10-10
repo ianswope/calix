@@ -9,6 +9,8 @@
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
     pub synced: usize,
+    /// At least one calendar or event change committed during this sync.
+    pub changed: bool,
     pub failed: Vec<String>,
     /// Accounts that failed as a whole — a missing credential, a rejected
     /// authorization, a discovery error — already rendered as
@@ -35,6 +37,7 @@ impl SyncOutcome {
     /// sync loops.
     pub fn merge(&mut self, other: SyncOutcome) {
         self.synced += other.synced;
+        self.changed |= other.changed;
         self.failed.extend(other.failed);
         self.failed_accounts.extend(other.failed_accounts);
     }
@@ -159,6 +162,18 @@ pub fn sync_accounts<A>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merging_accounts_keeps_changes_from_either_account() {
+        let mut outcome = SyncOutcome::default();
+        outcome.merge(SyncOutcome {
+            changed: true,
+            ..SyncOutcome::default()
+        });
+        assert!(outcome.changed);
+        outcome.merge(SyncOutcome::default());
+        assert!(outcome.changed);
+    }
 
     /// Two accounts, the first of which fails outright.
     fn sync_two_accounts() -> SyncOutcome {

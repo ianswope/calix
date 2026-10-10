@@ -112,6 +112,7 @@ pub fn sync_account(
     store: &Store,
     account_id: i64,
 ) -> Result<SyncOutcome, String> {
+    let before = store.sync_revision();
     let calendars = discover_calendars(credentials)?;
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
     let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
@@ -120,19 +121,21 @@ pub fn sync_account(
         .map(|calendar| calendar.href.clone())
         .collect::<Vec<_>>();
     store
-        .prune_caldav_calendars(account_id, &calendar_ids)
+        .sync_batch(|| store.prune_caldav_calendars(account_id, &calendar_ids))
         .map_err(|e| e.to_string())?;
 
     let mut outcome = SyncOutcome::default();
     for calendar in &calendars {
         let local_calendar_id = store
-            .upsert_caldav_calendar(
-                account_id,
-                &calendar.href,
-                &calendar.name,
-                &calendar.color,
-                true,
-            )
+            .sync_batch(|| {
+                store.upsert_caldav_calendar(
+                    account_id,
+                    &calendar.href,
+                    &calendar.name,
+                    &calendar.color,
+                    true,
+                )
+            })
             .map_err(|e| e.to_string())?;
 
         let synced = match calendar_events(credentials, &calendar.href, time_min, time_max) {
@@ -152,18 +155,30 @@ pub fn sync_account(
                 calendar.name
             );
         }
-        let mut synced_ids = Vec::with_capacity(synced.events.len());
-        for event in synced.events {
-            store
-                .upsert_caldav_event(
-                    local_calendar_id,
-                    &event.href,
-                    &event.draft,
-                    &event.attendees,
-                )
-                .map_err(|e| e.to_string())?;
-            synced_ids.push(event.href);
-        }
+        store
+            .sync_batch(|| {
+                let mut synced_ids = Vec::with_capacity(synced.events.len());
+                for event in &synced.events {
+                    store.upsert_caldav_event(
+                        local_calendar_id,
+                        &event.href,
+                        &event.draft,
+                        &event.attendees,
+                    )?;
+                    synced_ids.push(event.href.clone());
+                }
+                if synced.prunable {
+                    store.prune_caldav_events(
+                        local_calendar_id,
+                        &synced_ids,
+                        &synced.unreadable,
+                        time_min,
+                        time_max,
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
         if !synced.prunable {
             eprintln!(
                 "calix: not pruning {} — the server sent a response with no href",
@@ -172,18 +187,10 @@ pub fn sync_account(
             outcome.record_failure(calendar.name.clone());
             continue;
         }
-        store
-            .prune_caldav_events(
-                local_calendar_id,
-                &synced_ids,
-                &synced.unreadable,
-                time_min,
-                time_max,
-            )
-            .map_err(|e| e.to_string())?;
         outcome.record_success();
     }
 
+    outcome.changed = store.sync_revision() != before;
     Ok(outcome)
 }
 

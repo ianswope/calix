@@ -137,6 +137,7 @@ type SettledFn = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
 struct AccountActivity {
     syncing: [Cell<bool>; provider::ALL.len()],
     signing_in: Cell<bool>,
+    sync_refresh_pending: Cell<bool>,
     /// The failure the last sync of each provider announced, if any, so the
     /// quarter-hourly pass can tell a standing failure from a new one — see
     /// [`sync::failure_is_news`].
@@ -144,6 +145,16 @@ struct AccountActivity {
 }
 
 impl AccountActivity {
+    /// Only the first changed result schedules a refresh. The short delay
+    /// combines nearby completions without waiting for a slower provider.
+    fn queue_sync_refresh(&self, changed: bool) -> bool {
+        changed && !self.sync_refresh_pending.replace(true)
+    }
+
+    fn finish_sync_refresh(&self) {
+        self.sync_refresh_pending.set(false);
+    }
+
     fn slot(&self, provider: Provider) -> &Cell<bool> {
         let index = provider::ALL
             .iter()
@@ -3870,9 +3881,28 @@ fn sync_account_with_health(
     account: &store::Account,
     sync: impl FnOnce() -> Result<SyncOutcome, String>,
 ) -> Result<SyncOutcome, String> {
+    let before = store.sync_revision();
     let result = sync();
+    let changed = store.sync_revision() != before;
     record_sync_result(store, account.id, &account.label(), &result);
-    result
+    match result {
+        Ok(mut outcome) => {
+            outcome.changed |= changed;
+            Ok(outcome)
+        }
+        // Earlier calendars may have committed before a later one failed.
+        // Keep both the failure and the refresh request in the merged result.
+        Err(error) if changed => {
+            eprintln!("calix: failed to sync account {}: {error}", account.label());
+            let mut outcome = SyncOutcome {
+                changed: true,
+                ..SyncOutcome::default()
+            };
+            outcome.record_account_failure(account.label(), error);
+            Ok(outcome)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn record_sync_result(
@@ -4335,8 +4365,20 @@ where
                         }
                         ui.activity
                             .set_last_reported(provider, outcome.failure_note());
-                        ui.reset_calendar_sidebar();
-                        ui.reset_keeping_scroll();
+                        if ui.activity.queue_sync_refresh(outcome.changed) {
+                            glib::timeout_add_local_once(
+                                Duration::from_millis(100),
+                                clone!(
+                                    #[weak]
+                                    ui,
+                                    move || {
+                                        ui.activity.finish_sync_refresh();
+                                        ui.reset_calendar_sidebar();
+                                        ui.reset_keeping_scroll();
+                                    }
+                                ),
+                            );
+                        }
                     }
                     Err(error) => {
                         eprintln!("calix: {}", provider.sync_failed(&error));
@@ -4738,6 +4780,68 @@ fn host_label(server_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_syncs_do_not_queue_a_refresh() {
+        assert!(!AccountActivity::default().queue_sync_refresh(false));
+    }
+
+    #[test]
+    fn nearby_sync_changes_share_one_refresh_without_waiting_for_slow_providers() {
+        let activity = AccountActivity::default();
+        activity.start_sync(provider::CALDAV);
+        assert!(activity.queue_sync_refresh(true));
+        assert!(!activity.queue_sync_refresh(true));
+        assert!(!activity.queue_sync_refresh(false));
+        activity.finish_sync_refresh();
+        assert!(activity.queue_sync_refresh(true));
+    }
+
+    fn sync_account_fixture() -> (Store, store::Account) {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_google_account("test", "Test", "test-key")
+            .unwrap();
+        let account = store.google_accounts().unwrap().remove(0);
+        (store, account)
+    }
+
+    #[test]
+    fn unchanged_sync_health_does_not_require_a_calendar_refresh() {
+        let (store, account) = sync_account_fixture();
+        let outcome =
+            sync_account_with_health(&store, &account, || Ok(SyncOutcome::default())).unwrap();
+        assert!(!outcome.changed);
+        assert!(store.google_accounts().unwrap()[0].last_sync_at.is_some());
+    }
+
+    #[test]
+    fn committed_sync_changes_require_a_refresh_even_if_the_account_later_fails() {
+        for fails in [false, true] {
+            let (store, account) = sync_account_fixture();
+            let result = sync_account_with_health(&store, &account, || {
+                store
+                    .sync_batch(|| {
+                        store.upsert_google_calendar(account.id, "remote", "Work", "#123456", true)
+                    })
+                    .unwrap();
+                if fails {
+                    Err("later calendar failed".to_string())
+                } else {
+                    Ok(SyncOutcome::default())
+                }
+            });
+            let outcome = result.expect("committed changes must reach the UI even on failure");
+            assert!(outcome.changed);
+            assert_eq!(!outcome.failed_accounts.is_empty(), fails);
+            assert_eq!(
+                store.google_accounts().unwrap()[0]
+                    .last_sync_error
+                    .is_some(),
+                fails
+            );
+        }
+    }
 
     #[test]
     fn a_second_sync_of_one_provider_is_refused_while_the_first_is_in_flight() {

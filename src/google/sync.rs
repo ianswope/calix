@@ -32,6 +32,7 @@ pub fn sync_account(
     store: &Store,
     account_id: i64,
 ) -> Result<SyncOutcome, String> {
+    let before = store.sync_revision();
     let calendars = calendar_api::list_calendars(access_token)?;
 
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
@@ -41,7 +42,7 @@ pub fn sync_account(
         .map(|calendar| calendar.id.clone())
         .collect::<Vec<_>>();
     store
-        .prune_google_calendars(account_id, &calendar_ids)
+        .sync_batch(|| store.prune_google_calendars(account_id, &calendar_ids))
         .map_err(|e| e.to_string())?;
 
     let mut outcome = SyncOutcome::default();
@@ -51,13 +52,15 @@ pub fn sync_account(
             .clone()
             .unwrap_or_else(|| "#3584e4".to_string());
         let local_calendar_id = store
-            .upsert_google_calendar(
-                account_id,
-                &calendar.id,
-                &calendar.summary,
-                &color,
-                calendar.is_visible(),
-            )
+            .sync_batch(|| {
+                store.upsert_google_calendar(
+                    account_id,
+                    &calendar.id,
+                    &calendar.summary,
+                    &color,
+                    calendar.is_visible(),
+                )
+            })
             .map_err(|e| e.to_string())?;
 
         let events = match calendar_api::list_events(access_token, &calendar.id, time_min, time_max)
@@ -80,28 +83,29 @@ pub fn sync_account(
                 calendar.summary
             );
         }
-        for pending in &reconciliation.upserts {
-            store
-                .upsert_google_event_from_series(
-                    local_calendar_id,
-                    pending.event_id,
-                    pending.series_id.as_deref(),
-                    &pending.draft,
-                    &pending.attendees,
-                )
-                .map_err(|e| e.to_string())?;
-        }
         store
-            .prune_google_events(
-                local_calendar_id,
-                &reconciliation.keep_ids,
-                time_min,
-                time_max,
-            )
+            .sync_batch(|| {
+                for pending in &reconciliation.upserts {
+                    store.upsert_google_event_from_series(
+                        local_calendar_id,
+                        pending.event_id,
+                        pending.series_id.as_deref(),
+                        &pending.draft,
+                        &pending.attendees,
+                    )?;
+                }
+                store.prune_google_events(
+                    local_calendar_id,
+                    &reconciliation.keep_ids,
+                    time_min,
+                    time_max,
+                )
+            })
             .map_err(|e| e.to_string())?;
         outcome.record_success();
     }
 
+    outcome.changed = store.sync_revision() != before;
     Ok(outcome)
 }
 

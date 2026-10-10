@@ -2,6 +2,7 @@ use crate::recurrence::Frequency;
 use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 /// Someone invited to an event. Attendee lists are read-only here: they come
@@ -177,9 +178,38 @@ pub struct CalendarConnection {
 
 pub struct Store {
     conn: Connection,
+    sync_revision: Cell<u64>,
 }
 
 impl Store {
+    /// Connection-local generation of committed sync changes. Account health
+    /// writes do not advance it; callers compare before/after an account sync.
+    pub(crate) fn sync_revision(&self) -> u64 {
+        self.sync_revision.get()
+    }
+
+    /// Apply an already-fetched batch atomically. Never perform network I/O in
+    /// `write`: this holds SQLite's writer lock. RAII rolls back on errors and
+    /// panics; only a successful commit can advance the sync generation.
+    pub(crate) fn sync_batch<T>(
+        &self,
+        write: impl FnOnce() -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let before = self.conn.total_changes();
+        let result = write()?;
+        let changed = self.conn.total_changes() != before;
+        transaction.commit()?;
+        if changed {
+            self.sync_revision
+                .set(self.sync_revision.get().wrapping_add(1));
+        }
+        Ok(result)
+    }
+
     pub fn open() -> rusqlite::Result<Self> {
         Self::open_at(&data_file_path())
     }
@@ -232,9 +262,15 @@ impl Store {
             let read_write = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
             let connection = Connection::open_with_flags(path, read_write)?;
             connection.busy_timeout(std::time::Duration::from_secs(5))?;
-            return Ok(Self { conn: connection });
+            return Ok(Self {
+                conn: connection,
+                sync_revision: Cell::new(0),
+            });
         }
-        Ok(Self { conn: connection })
+        Ok(Self {
+            conn: connection,
+            sync_revision: Cell::new(0),
+        })
     }
 
     #[cfg(test)]
@@ -351,7 +387,10 @@ impl Store {
             conn.pragma_update(None, "user_version", 1)?;
         }
 
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            sync_revision: Cell::new(0),
+        };
         store.ensure_default_calendar()?;
         Ok(store)
     }
@@ -634,21 +673,17 @@ impl Store {
             params![account_id, google_calendar_id, name, color],
         )?;
 
-        self.conn.query_row(
-            "INSERT INTO calendars (account_id, name, color, google_calendar_id, visible)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(account_id, google_calendar_id)
-             WHERE account_id IS NOT NULL AND google_calendar_id IS NOT NULL
-             DO UPDATE SET name = ?2, color = ?3
-             RETURNING id",
-            params![account_id, name, color, google_calendar_id, visible as i64],
-            |row| row.get(0),
+        self.upsert_synced_calendar(
+            account_id,
+            "google_calendar_id",
+            google_calendar_id,
+            name,
+            color,
+            visible,
         )
     }
 
-    /// Upserts a CalDAV-sourced calendar (iCloud or generic `caldav`). The
-    /// href is stored in the `icloud_calendar_id` column (see the schema
-    /// note); the account's provider distinguishes the source.
+    /// Upserts a CalDAV-sourced calendar, preserving the user's visibility choice.
     pub fn upsert_caldav_calendar(
         &self,
         account_id: i64,
@@ -657,16 +692,52 @@ impl Store {
         color: &str,
         visible: bool,
     ) -> rusqlite::Result<i64> {
-        self.conn.query_row(
-            "INSERT INTO calendars (account_id, name, color, icloud_calendar_id, visible)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(account_id, icloud_calendar_id)
-             WHERE account_id IS NOT NULL AND icloud_calendar_id IS NOT NULL
-             DO UPDATE SET name = ?2, color = ?3
-             RETURNING id",
-            params![account_id, name, color, icloud_calendar_id, visible as i64],
-            |row| row.get(0),
+        self.upsert_synced_calendar(
+            account_id,
+            "icloud_calendar_id",
+            icloud_calendar_id,
+            name,
+            color,
+            visible,
         )
+    }
+
+    fn upsert_synced_calendar(
+        &self,
+        account_id: i64,
+        id_column: &str,
+        remote_id: &str,
+        name: &str,
+        color: &str,
+        visible: bool,
+    ) -> rusqlite::Result<i64> {
+        debug_assert!(id_column == "google_calendar_id" || id_column == "icloud_calendar_id");
+        let sql = format!(
+            "INSERT INTO calendars (account_id, name, color, {id_column}, visible)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, {id_column})
+             WHERE account_id IS NOT NULL AND {id_column} IS NOT NULL
+             DO UPDATE SET name = ?2, color = ?3
+             WHERE name IS NOT ?2 OR color IS NOT ?3
+             RETURNING id"
+        );
+        let written = self
+            .conn
+            .prepare_cached(&sql)?
+            .query_row(
+                params![account_id, name, color, remote_id, visible as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match written {
+            Some(id) => Ok(id),
+            None => self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT id FROM calendars WHERE account_id = ?1 AND {id_column} = ?2"
+                ))?
+                .query_row(params![account_id, remote_id], |row| row.get(0)),
+        }
     }
 
     /// Events whose [start, end) span overlaps the given half-open range.
@@ -938,11 +1009,9 @@ impl Store {
     /// Reports the row `remote_id` maps to, whether or not this call wrote it.
     ///
     /// `RETURNING` rather than `last_insert_rowid`, which says nothing useful
-    /// when the upsert took the update branch. The `local_edit` guard makes
-    /// that reporting conditional, though: an update it skips returns no row
-    /// at all, and the id is still wanted — undo needs the row of an event it
-    /// just created on a provider, and a protected row is no less the one this
-    /// remote id names. So a skipped update falls back to looking it up.
+    /// when the upsert took the update branch. An unchanged or locally edited
+    /// row skips that branch and returns no row, so look up its existing id:
+    /// callers such as undo still need it even when nothing was written.
     fn upsert_synced_event(
         &self,
         calendar_id: i64,
@@ -970,11 +1039,13 @@ impl Store {
                 ))
              ON CONFLICT(calendar_id, {id_column}) WHERE {id_column} IS NOT NULL
              DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9
-             WHERE local_edit = 0
+             WHERE local_edit = 0 AND (
+                 title IS NOT ?2 OR start_at IS NOT ?3 OR end_at IS NOT ?4
+                 OR all_day IS NOT ?5 OR location IS NOT ?6 OR notes IS NOT ?7
+                 OR attendees IS NOT ?9)
              RETURNING id"
         );
-        let written = self.conn.query_row(
-            &sql,
+        let written = self.conn.prepare_cached(&sql)?.query_row(
             params![
                 calendar_id,
                 draft.title,
@@ -991,11 +1062,12 @@ impl Store {
             |row| row.get(0),
         );
         match written {
-            Err(rusqlite::Error::QueryReturnedNoRows) => self.conn.query_row(
-                &format!("SELECT id FROM events WHERE calendar_id = ?1 AND {id_column} = ?2"),
-                params![calendar_id, remote_id],
-                |row| row.get(0),
-            ),
+            Err(rusqlite::Error::QueryReturnedNoRows) => self
+                .conn
+                .prepare_cached(&format!(
+                    "SELECT id FROM events WHERE calendar_id = ?1 AND {id_column} = ?2"
+                ))?
+                .query_row(params![calendar_id, remote_id], |row| row.get(0)),
             other => other,
         }
     }
@@ -1481,6 +1553,238 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
             attendees: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_batch_rolls_back_upserts_and_pruning() {
+        let store = store_with(&[("Original", None, None)]);
+        let original = store.event_by_id(1).unwrap().unwrap();
+        let before = store.sync_revision();
+        let result: rusqlite::Result<()> = store.sync_batch(|| {
+            store.delete_event(original.id)?;
+            store.upsert_google_event(1, "new", &original.draft(), &[])?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(result.is_err());
+        assert!(
+            store.event_by_id(original.id).unwrap().is_some(),
+            "pruning must roll back"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE google_event_id IS NOT NULL",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.sync_revision(), before);
+        assert!(store.conn.is_autocommit());
+    }
+
+    #[test]
+    fn a_sync_batch_advances_its_revision_only_for_committed_changes() {
+        let store = store_with(&[("Original", None, None)]);
+        let event = store.event_by_id(1).unwrap().unwrap().draft();
+        let before = store.sync_revision();
+        let id = store
+            .sync_batch(|| store.upsert_google_event(1, "remote", &event, &[]))
+            .unwrap();
+        assert_ne!(store.sync_revision(), before);
+        let committed = store.sync_revision();
+        assert_eq!(
+            store
+                .sync_batch(|| store.upsert_google_event(1, "remote", &event, &[]))
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            store.sync_revision(),
+            committed,
+            "an unchanged batch is not news"
+        );
+        let _: rusqlite::Result<()> = store.sync_batch(|| {
+            store.delete_event(id)?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        store.sync_batch(|| Ok(())).unwrap();
+        assert_eq!(
+            store.sync_revision(),
+            committed,
+            "rolled-back writes cannot leak into the next batch"
+        );
+        assert!(store.event_by_id(id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_panicking_sync_batch_releases_its_transaction_without_committing() {
+        let store = store_with(&[("Original", None, None)]);
+        let before = store.sync_revision();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: rusqlite::Result<()> = store.sync_batch(|| {
+                store.delete_event(1)?;
+                panic!("interrupted batch");
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(store.conn.is_autocommit());
+        assert!(store.event_by_id(1).unwrap().is_some());
+        assert_eq!(store.sync_revision(), before);
+    }
+
+    #[test]
+    fn identical_synced_events_do_not_write_again_and_keep_their_ids() {
+        let store = Store::open_in_memory().unwrap();
+        let start = day_start(NaiveDate::from_ymd_opt(2026, 10, 10).unwrap());
+        let event = draft("Meeting", start, start + Duration::hours(1));
+        for column in ["google_event_id", "icloud_event_id"] {
+            let id = store
+                .upsert_synced_event(1, column, "remote", None, &event, &[])
+                .unwrap();
+            let before = store.conn.total_changes();
+            assert_eq!(
+                store
+                    .upsert_synced_event(1, column, "remote", None, &event, &[])
+                    .unwrap(),
+                id
+            );
+            assert_eq!(
+                store.conn.total_changes(),
+                before,
+                "unchanged {column} event wrote again"
+            );
+        }
+    }
+
+    #[test]
+    fn each_changed_remote_field_is_written_including_cleared_optional_fields() {
+        let store = Store::open_in_memory().unwrap();
+        let start = day_start(NaiveDate::from_ymd_opt(2026, 10, 10).unwrap());
+        let original = draft("Meeting", start, start + Duration::hours(1));
+        let mut versions = Vec::new();
+        let mut event = original.clone();
+        event.title = "Renamed".into();
+        versions.push(event.clone());
+        event.start += Duration::minutes(5);
+        versions.push(event.clone());
+        event.end += Duration::minutes(10);
+        versions.push(event.clone());
+        event.all_day = true;
+        versions.push(event.clone());
+        event.location = Some("Room".into());
+        versions.push(event.clone());
+        event.notes = Some("Notes".into());
+        versions.push(event.clone());
+        event.attendees.push(Attendee {
+            email: "test@example.com".into(),
+            name: None,
+            status: Some("accepted".into()),
+            is_self: true,
+        });
+        versions.push(event.clone());
+        event.location = None;
+        versions.push(event.clone());
+        event.notes = None;
+        versions.push(event.clone());
+        event.attendees.clear();
+        versions.push(event);
+        for column in ["google_event_id", "icloud_event_id"] {
+            let id = store
+                .upsert_synced_event(1, column, "remote", None, &original, &[])
+                .unwrap();
+            for version in &versions {
+                let before = store.conn.total_changes();
+                assert_eq!(
+                    store
+                        .upsert_synced_event(1, column, "remote", None, version, &version.attendees)
+                        .unwrap(),
+                    id
+                );
+                assert!(store.conn.total_changes() > before);
+                assert_eq!(store.event_by_id(id).unwrap().unwrap().draft(), *version);
+            }
+        }
+    }
+
+    /// A local storage benchmark, not an end-to-end sync timing. Run with
+    /// `cargo test benchmark_sync_batches -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual storage benchmark using temporary SQLite files"]
+    fn benchmark_sync_batches() {
+        let start = day_start(NaiveDate::from_ymd_opt(2026, 10, 10).unwrap());
+        let event = draft("Meeting", start, start + Duration::hours(1));
+        let ids: Vec<_> = (0..1000).map(|i| format!("event-{i}")).collect();
+        for batched in [false, true] {
+            let path = temp_db_path(if batched {
+                "batch-benchmark"
+            } else {
+                "autocommit-benchmark"
+            });
+            remove_db(&path);
+            let store = Store::open_at(&path).unwrap();
+            let write = || -> rusqlite::Result<()> {
+                for id in &ids {
+                    store.upsert_google_event(1, id, &event, &[])?;
+                }
+                store.prune_google_events(1, &ids, start, start + Duration::days(1))
+            };
+            let timer = std::time::Instant::now();
+            if batched {
+                store.sync_batch(write).unwrap();
+            } else {
+                write().unwrap();
+            }
+            let initial = timer.elapsed();
+            let before = store.conn.total_changes();
+            let timer = std::time::Instant::now();
+            store.sync_batch(write).unwrap();
+            let unchanged = timer.elapsed();
+            assert_eq!(store.conn.total_changes(), before);
+            eprintln!(
+                "1000 events, batched={batched}: initial={initial:?}, unchanged={unchanged:?}, unchanged writes=0"
+            );
+            drop(store);
+            remove_db(&path);
+        }
+    }
+
+    #[test]
+    fn identical_synced_calendars_do_not_write_again_or_reset_visibility() {
+        let store = Store::open_in_memory().unwrap();
+        let account = store
+            .upsert_google_account("test", "Test", "test-key")
+            .unwrap();
+        for google in [true, false] {
+            let upsert = || {
+                if google {
+                    store.upsert_google_calendar(account, "remote", "Work", "#123456", true)
+                } else {
+                    store.upsert_caldav_calendar(account, "remote", "Work", "#123456", true)
+                }
+                .unwrap()
+            };
+            let id = upsert();
+            store.set_calendar_visible(id, false).unwrap();
+            let before = store.conn.total_changes();
+            assert_eq!(upsert(), id);
+            assert_eq!(
+                store.conn.total_changes(),
+                before,
+                "unchanged calendar wrote again"
+            );
+            assert!(
+                !store
+                    .calendars_for_account(account)
+                    .unwrap()
+                    .iter()
+                    .find(|c| c.id == id)
+                    .unwrap()
+                    .visible
+            );
         }
     }
 
