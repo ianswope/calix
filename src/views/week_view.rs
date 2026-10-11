@@ -1,4 +1,5 @@
 use crate::date_util::week_dates;
+use crate::locale;
 use crate::store::Event;
 use crate::views::{
     EditFn, EventSelection, MoveFn, PageActions, Slot, SlotGrain, add_slot_menu,
@@ -275,7 +276,7 @@ fn day_header_row(
             col.set_size_request(1, -1);
             col.add_css_class("week-header-cell");
 
-            let weekday = gtk::Label::new(Some(&day.format("%a").to_string()));
+            let weekday = gtk::Label::new(Some(&locale::weekday_abbreviation(day.weekday())));
             weekday.add_css_class("caption-heading");
             weekday.add_css_class("dim-label");
 
