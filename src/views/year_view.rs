@@ -61,8 +61,13 @@ pub fn build(anchor: NaiveDate, events: &[Event], on_pick: Rc<dyn Fn(NaiveDate)>
 
     let today = Local::now().date_naive();
     for (index, month) in year_months(anchor).into_iter().enumerate() {
-        let thumbnail = month_thumbnail(month, events, today, on_pick.clone());
-        grid.attach(&thumbnail, index as i32 % 4, index as i32 / 4, 1, 1);
+        let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let name = gtk::Label::new(Some(&month.format("%B").to_string()));
+        name.add_css_class("heading");
+        name.set_xalign(0.0);
+        cell.append(&name);
+        cell.append(&month_thumbnail(month, events, today, on_pick.clone()));
+        grid.attach(&cell, index as i32 % 4, index as i32 / 4, 1, 1);
     }
 
     let scrolled = gtk::ScrolledWindow::builder()
@@ -74,7 +79,8 @@ pub fn build(anchor: NaiveDate, events: &[Event], on_pick: Rc<dyn Fn(NaiveDate)>
     scrolled.upcast()
 }
 
-/// One month as a compact, clickable day grid.
+/// One month as a compact, clickable day grid, without a title: the year view
+/// labels each month, and the sidebar mini month has its own header.
 pub(crate) fn month_thumbnail(
     month: NaiveDate,
     events: &[Event],
@@ -83,11 +89,6 @@ pub(crate) fn month_thumbnail(
 ) -> gtk::Widget {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.add_css_class("year-month");
-
-    let name = gtk::Label::new(Some(&month.format("%B").to_string()));
-    name.add_css_class("heading");
-    name.set_xalign(0.0);
-    column.append(&name);
 
     let days = gtk::Grid::new();
     days.set_row_homogeneous(true);

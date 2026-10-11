@@ -69,6 +69,8 @@ periods.
   carousel wasn't trusted and a second swipe or press was ignored.
 - Opening an event from search lands the week or day grid an hour above the
   event instead of at "now".
+- The sidebar's mini month no longer names the month twice. It reused the
+  year view's thumbnail, title and all, beneath its own header with the arrows.
 
 ## 0.7.0 — 2026-09-08
 
