@@ -37,6 +37,8 @@ mod event_dialog;
 #[cfg(feature = "gui")]
 mod event_popover;
 #[cfg(feature = "gui")]
+mod locale;
+#[cfg(feature = "gui")]
 mod location_completion;
 #[cfg(feature = "gui")]
 mod search;
@@ -135,6 +137,10 @@ pub fn run() -> gtk::glib::ExitCode {
             std::mem::forget(app.hold());
         }
         style::load();
+        // After GTK's setlocale.
+        if let Some(day) = locale::first_weekday() {
+            date_util::set_first_weekday(day);
+        }
         let quit = gio::SimpleAction::new("quit", None);
         let app_for_quit = app.clone();
         quit.connect_activate(move |_, _| app_for_quit.quit());

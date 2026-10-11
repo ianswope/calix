@@ -1,4 +1,4 @@
-use crate::date_util::month_grid;
+use crate::date_util::{first_weekday, month_grid, weekdays_from};
 use crate::store::Event;
 use crate::views::{
     MoveFn, PageActions, Slot, SlotGrain, add_slot_menu, drag::parse_drag_payload,
@@ -23,7 +23,8 @@ pub fn build(anchor: NaiveDate, events: &[Event], actions: PageActions) -> gtk::
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.set_homogeneous(true);
     header.set_hexpand(true);
-    for label in WEEKDAY_LABELS {
+    for day in weekdays_from(first_weekday()) {
+        let label = WEEKDAY_LABELS[day.num_days_from_sunday() as usize];
         let weekday_label = gtk::Label::new(Some(label));
         weekday_label.add_css_class("caption-heading");
         weekday_label.add_css_class("dim-label");

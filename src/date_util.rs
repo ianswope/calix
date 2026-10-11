@@ -2,6 +2,7 @@ use chrono::{
     DateTime, Datelike, Local, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone,
     Weekday,
 };
+use std::sync::OnceLock;
 
 /// The day Calix was asked to open on, from its command line.
 ///
@@ -18,16 +19,52 @@ pub fn parse_date_arg(args: &[String]) -> Result<Option<NaiveDate>, String> {
         .map_err(|_| format!("not a date: {arg} (expected YYYY-MM-DD)"))
 }
 
-/// First day of the week, matching Apple/Google Calendar's US default.
-const WEEK_START: Weekday = Weekday::Sun;
+/// First day of the week: Sunday until startup sets the locale's.
+static FIRST_WEEKDAY: OnceLock<Weekday> = OnceLock::new();
 
-/// The start (WEEK_START) of the week containing `date`.
+/// Sets the first day of the week. Only the first call counts.
+pub fn set_first_weekday(day: Weekday) {
+    let _ = FIRST_WEEKDAY.set(day);
+}
+
+/// The first day of the week.
+pub fn first_weekday() -> Weekday {
+    FIRST_WEEKDAY.get().copied().unwrap_or(Weekday::Sun)
+}
+
+/// The start of the week containing `date`.
 pub fn week_start(date: NaiveDate) -> NaiveDate {
-    let days_since_start = date.weekday().days_since(WEEK_START);
+    week_start_on(date, first_weekday())
+}
+
+/// The start of the week containing `date`, for weeks beginning on `first`.
+fn week_start_on(date: NaiveDate, first: Weekday) -> NaiveDate {
+    let days_since_start = date.weekday().days_since(first);
     date - chrono::Duration::days(days_since_start as i64)
 }
 
-/// The 7 dates of the week containing `date`, starting on WEEK_START.
+/// The seven weekdays, beginning on `first`.
+pub fn weekdays_from(first: Weekday) -> [Weekday; 7] {
+    let mut days = [first; 7];
+    for i in 1..7 {
+        days[i] = days[i - 1].succ();
+    }
+    days
+}
+
+/// Decodes glibc's `_NL_TIME_WEEK_1STDAY` (19971130 = Sunday, 19971201 =
+/// Monday) and 1-based `_NL_TIME_FIRST_WEEKDAY`, as GtkCalendar does.
+pub fn first_weekday_from_langinfo(week_1stday: u32, first_weekday: u8) -> Option<Weekday> {
+    let origin = match week_1stday {
+        19971130 => Weekday::Sun,
+        19971201 => Weekday::Mon,
+        _ => return None,
+    };
+    let offset = usize::from(first_weekday.checked_sub(1)?);
+    weekdays_from(origin).get(offset).copied()
+}
+
+/// The 7 dates of the week containing `date`.
 pub fn week_dates(date: NaiveDate) -> [NaiveDate; 7] {
     let start = week_start(date);
     std::array::from_fn(|i| start + chrono::Duration::days(i as i64))
@@ -39,7 +76,7 @@ pub fn month_start(date: NaiveDate) -> NaiveDate {
 }
 
 /// 42 dates (6 full weeks) covering the month containing `date`, including
-/// leading/trailing days from adjacent months, starting on WEEK_START.
+/// leading/trailing days from adjacent months.
 pub fn month_grid(date: NaiveDate) -> [NaiveDate; 42] {
     let grid_start = week_start(month_start(date));
     std::array::from_fn(|i| grid_start + chrono::Duration::days(i as i64))
@@ -289,6 +326,37 @@ mod tests {
         assert_eq!(week_start(d(2026, 7, 8)), d(2026, 7, 5));
         // Sunday itself should map to itself.
         assert_eq!(week_start(d(2026, 7, 5)), d(2026, 7, 5));
+    }
+
+    #[test]
+    fn week_start_on_monday_lands_on_the_preceding_monday() {
+        // 2026-07-08 is a Wednesday; a Sunday belongs to the week before it.
+        assert_eq!(week_start_on(d(2026, 7, 8), Weekday::Mon), d(2026, 7, 6));
+        assert_eq!(week_start_on(d(2026, 7, 5), Weekday::Mon), d(2026, 6, 29));
+    }
+
+    #[test]
+    fn weekdays_from_starts_on_the_given_day_and_wraps() {
+        use Weekday::*;
+        assert_eq!(weekdays_from(Mon), [Mon, Tue, Wed, Thu, Fri, Sat, Sun]);
+        assert_eq!(weekdays_from(Sat), [Sat, Sun, Mon, Tue, Wed, Thu, Fri]);
+    }
+
+    #[test]
+    fn langinfo_first_weekday_covers_sunday_monday_and_saturday_locales() {
+        // en_US / de_DE / ar_EG as glibc reports them.
+        assert_eq!(first_weekday_from_langinfo(19971130, 1), Some(Weekday::Sun));
+        assert_eq!(first_weekday_from_langinfo(19971130, 2), Some(Weekday::Mon));
+        assert_eq!(first_weekday_from_langinfo(19971130, 7), Some(Weekday::Sat));
+        // A Monday origin (19971201) shifts by one.
+        assert_eq!(first_weekday_from_langinfo(19971201, 1), Some(Weekday::Mon));
+    }
+
+    #[test]
+    fn langinfo_first_weekday_rejects_values_it_cannot_interpret() {
+        assert_eq!(first_weekday_from_langinfo(20000101, 1), None);
+        assert_eq!(first_weekday_from_langinfo(19971130, 0), None);
+        assert_eq!(first_weekday_from_langinfo(19971130, 8), None);
     }
 
     #[test]

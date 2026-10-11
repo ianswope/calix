@@ -16,6 +16,10 @@ periods.
 
 ### Changed
 
+- The week starts on the day the system locale starts it on: Monday under
+  `pl_PL` or `de_DE`, Saturday under `ar_EG`. Month, week and year view and
+  the sidebar's mini month all follow it. It used to be Sunday everywhere, and
+  Sunday is still the fallback where the locale can't be read.
 - A sync that fails on a timer says so once. The quarter-hourly pass used to
   toast the same failure every time it ran — an expired Google sign-in was
   announced ninety-six times a day until it was renewed. It is now announced

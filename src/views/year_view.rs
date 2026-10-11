@@ -4,15 +4,14 @@
 //! the sidebar wants exactly this widget for date-jumping — building it once
 //! here means the two can't drift into looking like different products.
 
-use crate::date_util::{month_grid, year_months};
+use crate::date_util::{first_weekday, month_grid, weekdays_from, year_months};
 use crate::store::Event;
 use crate::views::event_occurs_on_day;
 use chrono::{Datelike, Local, NaiveDate};
 use gtk::prelude::*;
 use std::rc::Rc;
 
-/// Weekday initials above each thumbnail, starting on the same day
-/// `week_start` uses.
+/// Weekday initials above each thumbnail, from Sunday.
 const WEEKDAY_INITIALS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
 
 /// One cell of a month thumbnail.
@@ -93,7 +92,8 @@ pub(crate) fn month_thumbnail(
     days.set_row_homogeneous(true);
     days.set_column_homogeneous(true);
 
-    for (index, initial) in WEEKDAY_INITIALS.iter().enumerate() {
+    for (index, day) in weekdays_from(first_weekday()).into_iter().enumerate() {
+        let initial = WEEKDAY_INITIALS[day.num_days_from_sunday() as usize];
         let label = gtk::Label::new(Some(initial));
         label.add_css_class("caption");
         label.add_css_class("dim-label");
