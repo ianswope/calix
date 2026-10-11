@@ -27,6 +27,10 @@ periods.
 - The Google setup instructions now say to publish the OAuth app to Production
   from the start. Leaving it in Testing, which the README used to call fine, is
   what makes Google expire the sign-in every seven days.
+- Text on an Omarchy theme's accent and red is black or white by whichever
+  stands out more. A fixed brightness cutoff put white on mid tones where black
+  reads far better — 2.7:1 against 7.7:1 on Everforest's red, which every
+  delete button is filled with.
 
 ### Fixed
 
