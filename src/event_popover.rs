@@ -104,6 +104,10 @@ fn detail_row(caption: &str, value: Option<&str>) -> Option<gtk::Box> {
     let value_label = gtk::Label::new(Some(value));
     value_label.set_xalign(0.0);
     value_label.set_wrap(true);
+    // Word-only wrapping can't break a URL, and one long enough (Teams
+    // invites carry several) widened the popover past the screen, where it
+    // was never shown at all.
+    value_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     value_label.set_max_width_chars(POPOVER_WIDTH_CHARS);
     row.append(&caption_label);
     row.append(&value_label);
@@ -164,6 +168,7 @@ pub(crate) fn build(
     title.add_css_class("heading");
     title.set_xalign(0.0);
     title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     title.set_max_width_chars(POPOVER_WIDTH_CHARS);
     content.append(&title);
 

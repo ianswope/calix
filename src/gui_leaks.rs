@@ -317,6 +317,34 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         "a controller must report the widget it is attached to"
     );
 
+    // Not a leak, but the one other popover failure that needs GTK to see: a
+    // note with a long unbroken URL (Teams invites carry several) used to set
+    // the inspector's minimum width to the URL's, and a popover that can't fit
+    // beside its block never appears — taking its Edit button with it.
+    let mut linked = timed.clone();
+    linked.notes = Some(format!(
+        "Need help?<https://teams.microsoft.com/l/meetup-join/{}>",
+        "19%3ameeting_N2E2OWJlZTgtZmUxOS00MDUyLWJkYjAtYWNiYzBkYjEyNzFj".repeat(5)
+    ));
+    let inspector = event_popover::build(
+        &linked,
+        Rc::new(|_| {}),
+        store.clone(),
+        None,
+        Rc::new(|| {}),
+        Rc::new(|| {}),
+    );
+    // The popover itself reports no width to its parent; its content is what
+    // the surface has to fit.
+    let (min_width, ..) = inspector
+        .child()
+        .expect("the inspector has content")
+        .measure(gtk::Orientation::Horizontal, -1);
+    assert!(
+        min_width < 500,
+        "a long URL in the notes must wrap, not widen the inspector to {min_width}px"
+    );
+
     let mut leaks = Vec::new();
     for (name, build) in scenarios {
         let alive = survivors(build);
