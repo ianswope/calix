@@ -114,6 +114,25 @@ fn detail_row(caption: &str, value: Option<&str>) -> Option<gtk::Box> {
     Some(row)
 }
 
+/// The notes row, which unlike the others has no natural length limit: past
+/// [`NOTES_MAX_HEIGHT`] it scrolls in place. A Teams invite's boilerplate
+/// wrapped to the popover's width runs taller than the window, and a popover
+/// that can't fit is never shown at all.
+fn notes_row(notes: Option<&str>) -> Option<gtk::Box> {
+    let row = detail_row("Notes", notes)?;
+    let value = row.last_child()?;
+    row.remove(&value);
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scroller.set_propagate_natural_height(true);
+    scroller.set_max_content_height(NOTES_MAX_HEIGHT);
+    scroller.set_child(Some(&value));
+    row.append(&scroller);
+    Some(row)
+}
+
+const NOTES_MAX_HEIGHT: i32 = 240;
+
 /// Wraps prose so a long note can't stretch the popover across the window.
 const POPOVER_WIDTH_CHARS: i32 = 34;
 
@@ -208,7 +227,7 @@ pub(crate) fn build(
 
     for row in [
         detail_row("Location", event.location.as_deref()),
-        detail_row("Notes", event.notes.as_deref()),
+        notes_row(event.notes.as_deref()),
     ]
     .into_iter()
     .flatten()

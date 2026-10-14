@@ -318,13 +318,15 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
     );
 
     // Not a leak, but the one other popover failure that needs GTK to see: a
-    // note with a long unbroken URL (Teams invites carry several) used to set
-    // the inspector's minimum width to the URL's, and a popover that can't fit
-    // beside its block never appears — taking its Edit button with it.
+    // popover that can't fit beside its block never appears, taking its Edit
+    // button with it. A Teams invite does it both ways — unbroken URLs set
+    // the minimum width, and the whole boilerplate wrapped to the popover's
+    // width ran taller than the window.
     let mut linked = timed.clone();
     linked.notes = Some(format!(
-        "Need help?<https://teams.microsoft.com/l/meetup-join/{}>",
-        "19%3ameeting_N2E2OWJlZTgtZmUxOS00MDUyLWJkYjAtYWNiYzBkYjEyNzFj".repeat(5)
+        "Need help?<https://teams.microsoft.com/l/meetup-join/{}>\n{}",
+        "19%3ameeting_N2E2OWJlZTgtZmUxOS00MDUyLWJkYjAtYWNiYzBkYjEyNzFj".repeat(5),
+        "Recording, transcription or screenshots are not permitted.\n".repeat(20)
     ));
     let inspector = event_popover::build(
         &linked,
@@ -334,15 +336,18 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         Rc::new(|| {}),
         Rc::new(|| {}),
     );
-    // The popover itself reports no width to its parent; its content is what
+    // The popover itself reports no size to its parent; its content is what
     // the surface has to fit.
-    let (min_width, ..) = inspector
-        .child()
-        .expect("the inspector has content")
-        .measure(gtk::Orientation::Horizontal, -1);
+    let content = inspector.child().expect("the inspector has content");
+    let (min_width, natural_width, ..) = content.measure(gtk::Orientation::Horizontal, -1);
     assert!(
         min_width < 500,
         "a long URL in the notes must wrap, not widen the inspector to {min_width}px"
+    );
+    let (_, natural_height, ..) = content.measure(gtk::Orientation::Vertical, natural_width);
+    assert!(
+        natural_height < 600,
+        "long notes must scroll, not stretch the inspector to {natural_height}px"
     );
 
     let mut leaks = Vec::new();
