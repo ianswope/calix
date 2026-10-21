@@ -1,5 +1,5 @@
 use crate::store::Event;
-use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, drag_payload};
+use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, occurrence_payload};
 use crate::views::{EditFn, EventSelection};
 use gtk::gdk;
 use gtk::prelude::*;
@@ -37,14 +37,11 @@ pub fn timed_event_widget(
     selected.restore(event.id, &button);
     overlay.set_child(Some(&button));
 
-    // A local recurring event is drawn as many occurrences sharing one id;
-    // moving or resizing one would rewrite the whole series, so it stays
-    // read-only until per-instance recurrence editing exists.
-    let movable = event.recurrence.is_none();
-
     // Moving commits the block's top edge as the event's new start, so only
-    // a block whose top really is the start may move.
-    if placement.starts_here && movable {
+    // a block whose top really is the start may move. A repeating event is
+    // one row drawn many times; moving or resizing any copy shifts that whole
+    // series, and the window asks before it writes.
+    if placement.starts_here {
         button.set_cursor_from_name(Some("grab"));
         grid.install(&button, &button, DragKind::Move, event.id, placement);
     }
@@ -56,7 +53,7 @@ pub fn timed_event_widget(
         (DragKind::ResizeStart, placement.starts_here),
         (DragKind::ResizeEnd, placement.ends_here),
     ] {
-        if !is_own_edge || !movable {
+        if !is_own_edge {
             continue;
         }
         let handle = resize_handle(kind, handle_height);
@@ -150,11 +147,14 @@ fn event_button_with_padding(
     if !event.title.is_empty() {
         button.set_tooltip_text(Some(event.title.as_str()));
     }
-    // A local recurring event is drawn as many occurrences sharing one id, so
-    // dragging one would move the whole series to that date; leave it read-only
-    // until per-instance recurrence editing exists.
-    if draggable && event.recurrence.is_none() {
-        make_draggable(&button, event.id, DragKind::Move);
+    // Chips (month and all-day) travel by drag-and-drop. The payload names the
+    // occurrence's own day, so a series move is measured from the copy that
+    // was grabbed rather than whichever copy the page listed first.
+    if draggable {
+        make_draggable(
+            &button,
+            occurrence_payload(DragKind::Move, event.id, event.start.date_naive()),
+        );
     }
     button
 }
@@ -168,17 +168,16 @@ fn resize_handle(kind: DragKind, height: i32) -> gtk::Box {
     handle.set_valign(match kind {
         DragKind::ResizeStart => gtk::Align::Start,
         DragKind::ResizeEnd => gtk::Align::End,
-        DragKind::Move => gtk::Align::Start,
+        DragKind::Move | DragKind::ToAllDay => gtk::Align::Start,
     });
     handle.set_cursor_from_name(Some("ns-resize"));
     handle
 }
 
-fn make_draggable(widget: &impl IsA<gtk::Widget>, event_id: i64, kind: DragKind) {
+fn make_draggable(widget: &impl IsA<gtk::Widget>, payload: String) {
     let drag = gtk::DragSource::builder()
         .actions(gdk::DragAction::MOVE)
         .build();
-    let payload = drag_payload(kind, event_id);
     drag.connect_prepare(move |_, _, _| Some(gdk::ContentProvider::for_value(&payload.to_value())));
     widget.add_controller(drag);
 }

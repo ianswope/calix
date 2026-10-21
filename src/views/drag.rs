@@ -12,6 +12,9 @@ pub(crate) enum DragKind {
     Move,
     ResizeStart,
     ResizeEnd,
+    /// A move dragged into the band above the hours. Not a gesture target;
+    /// the grid reports it when a move commits there.
+    ToAllDay,
 }
 
 impl DragKind {
@@ -20,6 +23,7 @@ impl DragKind {
             Self::Move => "move",
             Self::ResizeStart => "resize-start",
             Self::ResizeEnd => "resize-end",
+            Self::ToAllDay => "to-all-day",
         }
     }
 
@@ -28,6 +32,7 @@ impl DragKind {
             "move" => Some(Self::Move),
             "resize-start" => Some(Self::ResizeStart),
             "resize-end" => Some(Self::ResizeEnd),
+            "to-all-day" => Some(Self::ToAllDay),
             _ => None,
         }
     }
@@ -37,9 +42,29 @@ pub(crate) fn drag_payload(kind: DragKind, event_id: i64) -> String {
     format!("{}:{event_id}", kind.as_prefix())
 }
 
-pub(crate) fn parse_drag_payload(value: &str) -> Option<(DragKind, i64)> {
-    let (kind, event_id) = value.split_once(':')?;
-    Some((DragKind::from_prefix(kind)?, event_id.parse().ok()?))
+/// A chip drag names the occurrence it came from. Several copies of a series
+/// share one id; the day is what tells the grabbed copy from the others.
+pub(crate) fn occurrence_payload(kind: DragKind, event_id: i64, day: NaiveDate) -> String {
+    format!(
+        "{}:{}",
+        drag_payload(kind, event_id),
+        day.format("%Y-%m-%d")
+    )
+}
+
+pub(crate) fn parse_drag_payload(value: &str) -> Option<(DragKind, i64, Option<NaiveDate>)> {
+    let (kind, rest) = value.split_once(':')?;
+    let kind = DragKind::from_prefix(kind)?;
+    let (id_text, day_text) = match rest.split_once(':') {
+        Some((id, day)) => (id, Some(day)),
+        None => (rest, None),
+    };
+    let event_id = id_text.parse().ok()?;
+    let day = match day_text {
+        Some(text) => Some(NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?),
+        None => None,
+    };
+    Some((kind, event_id, day))
 }
 
 /// Snap granularity for interactive drag/resize, in minutes.
@@ -58,9 +83,10 @@ const AUTOSCROLL_MAX_STEP: f64 = 14.0;
 const PREVIEW_LABEL_MIN_PX: f64 = 22.0;
 
 /// Callback fired when an interactive drag/resize commits: the event id, the
-/// target day column, and the new time for the moved edge (or the moved
-/// event's start).
-pub(crate) type CommitFn = Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)>;
+/// target day, the new time for the moved edge (or the moved event's start),
+/// and the day the grabbed occurrence started on.
+pub(crate) type CommitFn =
+    Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>, Option<NaiveDate>)>;
 
 /// Where a timed block sits in the week/day grid, and which of its edges are
 /// the event's own start/end. An event spanning midnight renders as one
@@ -84,6 +110,10 @@ struct Session {
     top_px: f64,
     height_px: f64,
     block: gtk::Widget,
+    /// Where the press landed on the day-area's x axis. The column is the one
+    /// under the pointer (`origin_x + offset_x`), not a count of columns the
+    /// grab point has travelled.
+    origin_x: f64,
     /// Where the press landed on the day-area's y axis; auto-scroll follows
     /// the pointer, not the block's edges.
     anchor_y: f64,
@@ -97,6 +127,12 @@ struct Session {
     vadj: Option<gtk::Adjustment>,
     // Live, snapped result in day-area coordinates.
     col: usize,
+    /// Whole days to add on a one-column day page. Zero in week view, where
+    /// horizontal travel is a column change instead.
+    day_shift: i64,
+    /// The pointer is in the band above the hour grid, so a move commits as
+    /// all-day. Resize never sets this.
+    all_day: bool,
     new_top_px: f64,
     new_height_px: f64,
 }
@@ -204,15 +240,30 @@ impl TimedGrid {
                 gesture.set_state(gtk::EventSequenceState::Claimed);
                 block.set_opacity(0.35);
                 block.set_cursor_from_name(Some("grabbing"));
-                let press_y = gesture.start_point().map(|(_, y)| y).unwrap_or(0.0);
+                let (press_x, press_y) = gesture.start_point().unwrap_or((0.0, 0.0));
                 let anchor_y = match kind {
                     // The press offset is in the grabbed region's own
                     // coordinates: the whole block for a move, a thin edge
                     // handle for a resize.
-                    DragKind::Move => top_px + press_y,
+                    DragKind::Move | DragKind::ToAllDay => top_px + press_y,
                     DragKind::ResizeStart => top_px,
                     DragKind::ResizeEnd => top_px + height_px,
                 };
+                // Map the press into the day area so later offsets describe the
+                // pointer, not travel from wherever on the block was grabbed.
+                // A grid that has not been allocated yet (the leak test builds
+                // one off-screen) has no coordinate space; falling back to the
+                // column keeps that drag on its own day.
+                let origin_x = gesture
+                    .widget()
+                    .and_then(|widget| {
+                        widget.compute_point(
+                            &this.day_area,
+                            &gtk::graphene::Point::new(press_x as f32, press_y as f32),
+                        )
+                    })
+                    .map(|point| f64::from(point.x()))
+                    .unwrap_or_else(|| orig_col as f64 * this.column_width() + press_x);
                 let vadj = this
                     .day_area
                     .ancestor(gtk::ScrolledWindow::static_type())
@@ -226,11 +277,14 @@ impl TimedGrid {
                     top_px,
                     height_px,
                     block: block.clone(),
+                    origin_x,
                     anchor_y,
                     last_offset: (offset_x, offset_y),
                     scroll_baseline,
                     vadj,
                     col: orig_col,
+                    day_shift: 0,
+                    all_day: false,
                     new_top_px: top_px,
                     new_height_px: height_px,
                 });
@@ -343,11 +397,26 @@ impl TimedGrid {
         true
     }
 
+    /// Width of one day column, or zero when the grid has not been allocated.
+    ///
+    /// Zero must stay zero. Treating an unallocated grid as one pixel wide
+    /// would turn a vertical drag on the leak test's off-screen page into a
+    /// day change.
+    fn column_width(&self) -> f64 {
+        let count = self.days.len();
+        let width = self.day_area.width() as f64;
+        if count == 0 || width <= 0.0 {
+            0.0
+        } else {
+            width / count as f64
+        }
+    }
+
     /// Recompute the snapped target from the current pointer offset and repaint
     /// the preview.
     fn update(&self, offset_x: f64, offset_y: f64) {
-        let column_count = self.days.len().max(1);
-        let column_width = (self.day_area.width() as f64 / column_count as f64).max(1.0);
+        let column_count = self.days.len();
+        let column_width = self.column_width();
         let px_per_minute = self.hour_height / 60.0;
         let snap_px = SNAP_MINUTES * px_per_minute;
         let min_block_px = MIN_BLOCK_MINUTES * px_per_minute;
@@ -360,13 +429,38 @@ impl TimedGrid {
 
         match session.kind {
             DragKind::Move => {
-                let top = snap(session.top_px + offset_y, snap_px)
-                    .clamp(0.0, (day_px - session.height_px).max(0.0));
-                session.new_top_px = top;
-                session.new_height_px = session.height_px;
-                let columns_moved = (offset_x / column_width).round() as i64;
-                session.col = (session.orig_col as i64 + columns_moved)
-                    .clamp(0, column_count as i64 - 1) as usize;
+                let pointer_x = session.origin_x + offset_x;
+                let pointer_y = session.anchor_y + offset_y;
+                // Content y grows downward from midnight. The all-day row sits
+                // above the viewport, so "above the hours" is above whatever
+                // slice is on screen, not above midnight.
+                let visible_top = session
+                    .vadj
+                    .as_ref()
+                    .map(gtk::Adjustment::value)
+                    .unwrap_or(0.0);
+                let aim = aim_move(
+                    pointer_x,
+                    pointer_y,
+                    column_width,
+                    column_count,
+                    visible_top,
+                );
+                // No allocation yet: keep the column the gesture started on.
+                if column_width <= 0.0 {
+                    session.col = session.orig_col;
+                    session.day_shift = 0;
+                } else {
+                    session.col = aim.col;
+                    session.day_shift = aim.day_shift;
+                }
+                session.all_day = aim.all_day;
+                if !session.all_day {
+                    let top = snap(session.top_px + offset_y, snap_px)
+                        .clamp(0.0, (day_px - session.height_px).max(0.0));
+                    session.new_top_px = top;
+                    session.new_height_px = session.height_px;
+                }
             }
             DragKind::ResizeStart => {
                 let bottom = session.top_px + session.height_px;
@@ -375,6 +469,8 @@ impl TimedGrid {
                 session.new_top_px = top;
                 session.new_height_px = bottom - top;
                 session.col = session.orig_col;
+                session.day_shift = 0;
+                session.all_day = false;
             }
             DragKind::ResizeEnd => {
                 let bottom = snap(session.top_px + session.height_px + offset_y, snap_px)
@@ -382,25 +478,51 @@ impl TimedGrid {
                 session.new_top_px = session.top_px;
                 session.new_height_px = bottom - session.top_px;
                 session.col = session.orig_col;
+                session.day_shift = 0;
+                session.all_day = false;
             }
+            // Reported by a committed move. A session never has this kind.
+            DragKind::ToAllDay => {}
         }
 
         let col = session.col;
-        let top = session.new_top_px;
-        let height = session.new_height_px;
+        let all_day = session.all_day;
+        let day_shift = session.day_shift;
+        let (top, height) = if all_day {
+            (0.0, ALL_DAY_PREVIEW_PX)
+        } else {
+            (session.new_top_px, session.new_height_px)
+        };
 
-        let x = col as f64 * column_width + 2.0;
-        let width = (column_width - 4.0).max(1.0);
+        let layout_width = if column_width <= 0.0 {
+            1.0
+        } else {
+            column_width
+        };
+        let x = col as f64 * layout_width + 2.0;
+        let width = (layout_width - 4.0).max(1.0);
         self.preview_block
             .set_size_request(width as i32, height.max(1.0) as i32);
         self.preview.move_(&self.preview_block, x, top);
-        self.preview_label.set_text(&format!(
-            "{} – {}",
-            format_minutes(top / px_per_minute),
-            format_minutes((top + height) / px_per_minute),
-        ));
+        let landing = self
+            .days
+            .get(col)
+            .copied()
+            .map(|day| landing_date(day, day_shift));
+        let label = match landing {
+            Some(day) => move_preview_label(
+                all_day,
+                day_shift,
+                day,
+                &format_minutes(top / px_per_minute),
+                &format_minutes((top + height) / px_per_minute),
+            ),
+            None => String::new(),
+        };
+        self.preview_label.set_text(&label);
         // On a block too short for the label, showing it would stretch the
-        // preview taller than the event it stands for.
+        // preview taller than the event it stands for. The all-day bar is
+        // drawn tall enough to carry its label.
         self.preview_label
             .set_visible(height >= PREVIEW_LABEL_MIN_PX);
         self.preview_block.set_visible(true);
@@ -416,41 +538,81 @@ impl TimedGrid {
     /// Apply the result if the event actually moved.
     fn commit(&self, session: &Session) {
         let px_per_minute = self.hour_height / 60.0;
-        let moved = session.col != session.orig_col
+        let geometry_moved = session.col != session.orig_col
             || (session.new_top_px - session.top_px).abs() >= 0.5
             || (session.new_height_px - session.height_px).abs() >= 0.5;
+        // A day-page shift or a conversion to all-day changes the event even
+        // when the snapped top of the block did not.
+        let moved = match session.kind {
+            DragKind::Move => geometry_moved || session.day_shift != 0 || session.all_day,
+            DragKind::ResizeStart | DragKind::ResizeEnd | DragKind::ToAllDay => geometry_moved,
+        };
         if !moved {
             return;
         }
 
+        let Some(column_day) = self.days.get(session.col).copied() else {
+            return;
+        };
+        let Some(source_day) = self.days.get(session.orig_col).copied() else {
+            return;
+        };
         let start_minutes = (session.new_top_px / px_per_minute).round();
         let end_minutes = ((session.new_top_px + session.new_height_px) / px_per_minute).round();
 
         match session.kind {
             DragKind::Move => {
-                let date = self.days[session.col];
-                (self.on_move)(session.kind, session.event_id, date, time_of(start_minutes));
+                let date = landing_date(column_day, session.day_shift);
+                if session.all_day {
+                    (self.on_move)(
+                        DragKind::ToAllDay,
+                        session.event_id,
+                        date,
+                        None,
+                        Some(source_day),
+                    );
+                } else {
+                    (self.on_move)(
+                        DragKind::Move,
+                        session.event_id,
+                        date,
+                        time_of(start_minutes),
+                        Some(source_day),
+                    );
+                }
             }
             DragKind::ResizeStart => {
-                let date = self.days[session.orig_col];
-                (self.on_move)(session.kind, session.event_id, date, time_of(start_minutes));
+                (self.on_move)(
+                    session.kind,
+                    session.event_id,
+                    source_day,
+                    time_of(start_minutes),
+                    Some(source_day),
+                );
             }
             DragKind::ResizeEnd => {
                 // An edge dragged to the very bottom means midnight of the next
                 // day, which has no same-day NaiveTime.
-                let date = self.days[session.orig_col];
                 if end_minutes >= MINUTES_PER_DAY {
-                    let next = date.succ_opt().unwrap_or(date);
+                    let next = source_day.succ_opt().unwrap_or(source_day);
                     (self.on_move)(
                         session.kind,
                         session.event_id,
                         next,
                         NaiveTime::from_hms_opt(0, 0, 0),
+                        Some(source_day),
                     );
                 } else {
-                    (self.on_move)(session.kind, session.event_id, date, time_of(end_minutes));
+                    (self.on_move)(
+                        session.kind,
+                        session.event_id,
+                        source_day,
+                        time_of(end_minutes),
+                        Some(source_day),
+                    );
                 }
             }
+            DragKind::ToAllDay => {}
         }
     }
 }
@@ -599,6 +761,103 @@ pub(crate) fn create_range(from_y: f64, to_y: f64, hour_height: f64) -> Option<(
     Some((start, end))
 }
 
+/// How far above the day grid a move has to travel before it becomes all-day.
+/// The all-day row sits above the hours, so this is that gesture without
+/// needing the pointer to hit that row's widgets.
+pub(crate) const ALL_DAY_ENTER_PX: f64 = 16.0;
+/// Height of the all-day preview bar. Tall enough for its label.
+const ALL_DAY_PREVIEW_PX: f64 = 28.0;
+
+/// Where a move is aimed: the column under the pointer, a day-page shift, and
+/// whether the pointer has crossed into the all-day band.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MoveAim {
+    pub col: usize,
+    pub day_shift: i64,
+    pub all_day: bool,
+}
+
+pub(crate) fn aim_move(
+    pointer_x: f64,
+    pointer_y: f64,
+    column_width: f64,
+    column_count: usize,
+    visible_top: f64,
+) -> MoveAim {
+    MoveAim {
+        col: column_under_pointer(pointer_x, column_width, column_count),
+        day_shift: day_page_shift(pointer_x, column_width, column_count),
+        all_day: dragged_above_the_day(pointer_y, visible_top),
+    }
+}
+
+/// The column under the pointer, not the column a grab-point offset would imply.
+///
+/// A wide block grabbed at its left edge crosses into the next day as soon as
+/// the pointer does. Measuring travel from the grab point waits until the hand
+/// has moved half a column past where it started, which lands the event on the
+/// day beside the cursor.
+pub(crate) fn column_under_pointer(
+    pointer_x: f64,
+    column_width: f64,
+    column_count: usize,
+) -> usize {
+    if column_count == 0 || column_width <= 0.0 {
+        return 0;
+    }
+    let index = (pointer_x / column_width).floor() as i64;
+    index.clamp(0, column_count as i64 - 1) as usize
+}
+
+/// Days to add on a one-column day page. Week view already has one column per
+/// day, so horizontal travel there is a column change and this stays zero.
+pub(crate) fn day_page_shift(pointer_x: f64, column_width: f64, column_count: usize) -> i64 {
+    if column_count != 1 || column_width <= 0.0 {
+        return 0;
+    }
+    (pointer_x / column_width).floor() as i64
+}
+
+/// Whether a move has been dragged into the band above the timed grid.
+///
+/// `pointer_y` and `visible_top` are both in the day column's coordinates,
+/// where midnight is 0 and the scrolled viewport starts at `visible_top`.
+/// The all-day row is above that viewport, so a grid scrolled to the
+/// afternoon still converts when the pointer crosses its top edge.
+pub(crate) fn dragged_above_the_day(pointer_y: f64, visible_top: f64) -> bool {
+    pointer_y < visible_top - ALL_DAY_ENTER_PX
+}
+
+/// The day a drag commits to: the column it landed on, plus a day-page shift.
+pub(crate) fn landing_date(day: NaiveDate, shift: i64) -> NaiveDate {
+    // A pointer fling on a tiny allocation can ask for a shift chrono cannot
+    // represent. Keeping the column's own day is safer than panicking.
+    let shift = shift.clamp(-100_000, 100_000);
+    day.checked_add_signed(chrono::Duration::days(shift))
+        .unwrap_or(day)
+}
+
+/// Preview text for a move. A day-page shift has no column header under the
+/// pointer, so the landing weekday is named; an all-day landing says so.
+pub(crate) fn move_preview_label(
+    all_day: bool,
+    day_shift: i64,
+    landing: NaiveDate,
+    start_label: &str,
+    end_label: &str,
+) -> String {
+    let when = if all_day {
+        "All day".to_string()
+    } else {
+        format!("{start_label} – {end_label}")
+    };
+    if day_shift == 0 {
+        when
+    } else {
+        format!("{} · {when}", landing.format("%a"))
+    }
+}
+
 fn snap(value: f64, snap_px: f64) -> f64 {
     if snap_px <= 0.0 {
         value
@@ -631,10 +890,25 @@ mod tests {
 
     #[test]
     fn drag_payload_round_trips_through_parse() {
-        for kind in [DragKind::Move, DragKind::ResizeStart, DragKind::ResizeEnd] {
+        for kind in [
+            DragKind::Move,
+            DragKind::ResizeStart,
+            DragKind::ResizeEnd,
+            DragKind::ToAllDay,
+        ] {
             let payload = drag_payload(kind, 42);
-            assert_eq!(parse_drag_payload(&payload), Some((kind, 42)));
+            assert_eq!(parse_drag_payload(&payload), Some((kind, 42, None)));
         }
+    }
+
+    #[test]
+    fn an_occurrence_payload_names_the_day_it_came_from() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        let payload = occurrence_payload(DragKind::Move, 42, day);
+        assert_eq!(
+            parse_drag_payload(&payload),
+            Some((DragKind::Move, 42, Some(day)))
+        );
     }
 
     #[test]
@@ -642,6 +916,7 @@ mod tests {
         assert!(parse_drag_payload("move").is_none()); // no ':' separator
         assert!(parse_drag_payload("teleport:42").is_none()); // unknown kind
         assert!(parse_drag_payload("move:notanumber").is_none()); // bad id
+        assert!(parse_drag_payload("move:42:not-a-date").is_none()); // bad day
     }
 
     #[test]
@@ -722,6 +997,117 @@ mod tests {
     #[test]
     fn a_grid_with_no_height_has_no_range_rather_than_dividing_by_zero() {
         assert_eq!(create_range(540.0, 630.0, 0.0), None);
+    }
+
+    #[test]
+    fn the_column_is_the_one_under_the_pointer() {
+        // 100px columns. The pointer just inside Wednesday (index 2) lands
+        // there even if the grab started at the left edge of Tuesday.
+        assert_eq!(column_under_pointer(200.0, 100.0, 7), 2);
+        assert_eq!(column_under_pointer(199.0, 100.0, 7), 1);
+        // Past either end stays on the page rather than inventing a column.
+        assert_eq!(column_under_pointer(-40.0, 100.0, 7), 0);
+        assert_eq!(column_under_pointer(10_000.0, 100.0, 7), 6);
+        assert_eq!(column_under_pointer(50.0, 0.0, 7), 0);
+    }
+
+    #[test]
+    fn a_day_page_shifts_to_the_neighbour_under_the_pointer() {
+        // One column, 400px wide. Dragging a full column left or right is the
+        // previous or next day; week view does not also shift.
+        assert_eq!(day_page_shift(-1.0, 400.0, 1), -1);
+        assert_eq!(day_page_shift(400.0, 400.0, 1), 1);
+        assert_eq!(day_page_shift(850.0, 400.0, 1), 2);
+        assert_eq!(day_page_shift(200.0, 400.0, 1), 0);
+        assert_eq!(day_page_shift(-400.0, 400.0, 7), 0);
+        assert_eq!(day_page_shift(50.0, 0.0, 1), 0);
+    }
+
+    #[test]
+    fn dragging_above_the_hours_means_all_day() {
+        assert!(!dragged_above_the_day(0.0, 0.0));
+        assert!(!dragged_above_the_day(-ALL_DAY_ENTER_PX, 0.0));
+        assert!(dragged_above_the_day(-ALL_DAY_ENTER_PX - 1.0, 0.0));
+        // Scrolled to 9:00 (432px). The pointer can sit on a morning hour in
+        // content coordinates and still be in the all-day row above the
+        // viewport.
+        assert!(dragged_above_the_day(400.0, 432.0));
+        assert!(!dragged_above_the_day(420.0, 432.0));
+        assert!(!dragged_above_the_day(432.0, 432.0));
+    }
+
+    #[test]
+    fn the_landing_date_adds_a_day_page_shift() {
+        let wednesday = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        assert_eq!(
+            landing_date(wednesday, 0),
+            NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()
+        );
+        assert_eq!(
+            landing_date(wednesday, 1),
+            NaiveDate::from_ymd_opt(2026, 10, 22).unwrap()
+        );
+        assert_eq!(
+            landing_date(wednesday, -1),
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_move_aims_at_the_column_or_the_day_under_the_pointer() {
+        assert_eq!(
+            aim_move(250.0, 10.0, 100.0, 7, 0.0),
+            MoveAim {
+                col: 2,
+                day_shift: 0,
+                all_day: false
+            }
+        );
+        // One column: leaving it to the left is the previous day, not a column.
+        assert_eq!(
+            aim_move(-1.0, 10.0, 400.0, 1, 0.0),
+            MoveAim {
+                col: 0,
+                day_shift: -1,
+                all_day: false
+            }
+        );
+        assert_eq!(
+            aim_move(850.0, 10.0, 400.0, 1, 0.0),
+            MoveAim {
+                col: 0,
+                day_shift: 2,
+                all_day: false
+            }
+        );
+        assert!(aim_move(10.0, -ALL_DAY_ENTER_PX - 1.0, 400.0, 1, 0.0).all_day);
+        assert!(aim_move(200.0, 400.0, 400.0, 1, 432.0).all_day);
+        let unallocated = aim_move(50.0, 10.0, 0.0, 7, 0.0);
+        assert_eq!(unallocated.col, 0);
+        assert_eq!(unallocated.day_shift, 0);
+    }
+
+    #[test]
+    fn the_preview_names_the_day_when_a_day_page_shifts() {
+        let wednesday = NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        let thursday = NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        let tuesday = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert_eq!(
+            move_preview_label(false, 0, wednesday, "9:00 AM", "10:00 AM"),
+            "9:00 AM – 10:00 AM"
+        );
+        assert_eq!(
+            move_preview_label(true, 0, wednesday, "9:00 AM", "10:00 AM"),
+            "All day"
+        );
+        assert_eq!(
+            move_preview_label(true, 1, thursday, "9:00 AM", "10:00 AM"),
+            "Thu · All day"
+        );
+        assert_eq!(
+            move_preview_label(false, -1, tuesday, "9:00 AM", "10:00 AM"),
+            "Tue · 9:00 AM – 10:00 AM"
+        );
     }
 
     #[test]

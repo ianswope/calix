@@ -1318,7 +1318,9 @@ const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name
 
 /// The occurrences of a recurring `master` overlapping the range. Each is a
 /// clone carrying the master's id and recurrence, so clicking any occurrence
-/// opens the series and dragging stays disabled (see `event_widget`).
+/// opens the series. Dragging one shifts the whole series by that same amount
+/// (`shift_series`); it does not retarget the master onto the copy that was
+/// grabbed.
 fn expand_recurring(
     master: &Event,
     range_start: DateTime<Local>,

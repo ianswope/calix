@@ -92,6 +92,72 @@ pub(crate) fn attendee_line(attendee: &Attendee) -> String {
     }
 }
 
+/// Pango markup for event text, with web addresses made actionable.
+fn linked_text(text: &str) -> String {
+    let mut markup = String::new();
+    let mut end = 0;
+    for range in web_links(text) {
+        markup.push_str(&glib::markup_escape_text(&text[end..range.start]));
+        let escaped = glib::markup_escape_text(&text[range.clone()]);
+        markup.push_str(&format!("<a href=\"{escaped}\">{escaped}</a>"));
+        end = range.end;
+    }
+    markup.push_str(&glib::markup_escape_text(&text[end..]));
+    markup
+}
+
+/// Locate web URLs without interpreting provider text as HTML. Keep balanced
+/// parentheses in paths, but leave surrounding prose punctuation outside.
+fn web_links(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut links = Vec::new();
+    let mut offset = 0;
+    while let Some(start) = text[offset..]
+        .find("http://")
+        .into_iter()
+        .chain(text[offset..].find("https://"))
+        .min()
+    {
+        let start = offset + start;
+        let tail = &text[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+            .unwrap_or(tail.len());
+        let mut candidate = &tail[..end];
+        loop {
+            let trimmed = candidate.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            candidate = trimmed;
+            let unmatched =
+                [('(', ')'), ('[', ']'), ('{', '}')]
+                    .into_iter()
+                    .any(|(open, close)| {
+                        candidate.ends_with(close)
+                            && candidate.matches(close).count() > candidate.matches(open).count()
+                    });
+            if !unmatched {
+                break;
+            }
+            candidate = &candidate[..candidate.len() - 1];
+        }
+        if url::Url::parse(candidate).is_ok_and(|url| url.host_str().is_some()) {
+            links.push(start..start + candidate.len());
+        }
+        offset = start + end;
+    }
+    links
+}
+
+fn meeting_link(event: &Event) -> Option<&str> {
+    [event.location.as_deref(), event.notes.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|text| {
+            web_links(text).into_iter().find_map(|range| {
+                let link = &text[range];
+                crate::agenda::conference_link(Some(link)).map(|_| link)
+            })
+        })
+}
+
 /// A detail row: dim caption over its value, or nothing when the value is
 /// empty. Returning `None` keeps the caller from having to test each field.
 fn detail_row(caption: &str, value: Option<&str>) -> Option<gtk::Box> {
@@ -101,7 +167,9 @@ fn detail_row(caption: &str, value: Option<&str>) -> Option<gtk::Box> {
     caption_label.add_css_class("caption-heading");
     caption_label.add_css_class("dim-label");
     caption_label.set_xalign(0.0);
-    let value_label = gtk::Label::new(Some(value));
+    let value_label = gtk::Label::new(None);
+    value_label.set_markup(&linked_text(value));
+    value_label.set_selectable(true);
     value_label.set_xalign(0.0);
     value_label.set_wrap(true);
     // Word-only wrapping can't break a URL, and one long enough (Teams
@@ -224,6 +292,13 @@ pub(crate) fn build(
     calendar_row.append(&swatch);
     calendar_row.append(&calendar_name);
     content.append(&calendar_row);
+
+    if let Some(uri) = meeting_link(event) {
+        let join = gtk::LinkButton::with_label(uri, "Join meeting");
+        join.set_tooltip_text(Some(uri));
+        join.set_halign(gtk::Align::Start);
+        content.append(&join);
+    }
 
     for row in [
         detail_row("Location", event.location.as_deref()),
@@ -373,6 +448,54 @@ pub(crate) fn build(
 mod tests {
     use super::*;
     use chrono::{DateTime, Local, TimeZone};
+
+    #[test]
+    fn event_links_are_clickable_without_treating_notes_as_markup() {
+        assert_eq!(
+            linked_text("<Agenda> https://example.com/?a=1&b=2\nRoom & board"),
+            "&lt;Agenda&gt; <a href=\"https://example.com/?a=1&amp;b=2\">https://example.com/?a=1&amp;b=2</a>\nRoom &amp; board"
+        );
+    }
+
+    #[test]
+    fn links_next_to_prose_keep_balanced_parentheses_and_exclude_punctuation() {
+        assert_eq!(
+            linked_text(
+                "Join:<https://meet.google.com/abc-defg-hij>. See (https://example.com/Guide_(team))."
+            ),
+            "Join:&lt;<a href=\"https://meet.google.com/abc-defg-hij\">https://meet.google.com/abc-defg-hij</a>&gt;. See (<a href=\"https://example.com/Guide_(team)\">https://example.com/Guide_(team)</a>)."
+        );
+    }
+
+    #[test]
+    fn only_valid_web_addresses_become_links() {
+        assert_eq!(
+            linked_text("file:///tmp/note javascript:alert(1) https:// https://?q=x"),
+            "file:///tmp/note javascript:alert(1) https:// https://?q=x"
+        );
+        assert_eq!(
+            linked_text("Résumé: http://example.com/café"),
+            "Résumé: <a href=\"http://example.com/café\">http://example.com/café</a>"
+        );
+    }
+
+    #[test]
+    fn join_action_finds_meetings_in_location_or_notes_next_to_prose() {
+        let mut ev = event(at(2026, 9, 1, 9, 0), at(2026, 9, 1, 10, 0), false);
+        ev.location = Some("Video: https://meet.google.com/abc-defg-hij".into());
+        assert_eq!(
+            meeting_link(&ev),
+            Some("https://meet.google.com/abc-defg-hij")
+        );
+        ev.location = Some("Room 5".into());
+        ev.notes = Some("Join:<https://teams.microsoft.com/l/meetup-join/123>.".into());
+        assert_eq!(
+            meeting_link(&ev),
+            Some("https://teams.microsoft.com/l/meetup-join/123")
+        );
+        ev.notes = Some("https://example.com/agenda".into());
+        assert_eq!(meeting_link(&ev), None);
+    }
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
         Local

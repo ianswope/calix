@@ -178,10 +178,10 @@ fn add_drop_target(widget: &impl IsA<gtk::Widget>, date: NaiveDate, on_move: Mov
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Some((kind, event_id)) = parse_drag_payload(&event_id) else {
+        let Some((kind, event_id, source_day)) = parse_drag_payload(&event_id) else {
             return false;
         };
-        on_move(kind, event_id, date, None);
+        on_move(kind, event_id, date, None, source_day);
         true
     });
     widget.add_controller(drop);

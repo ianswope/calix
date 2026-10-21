@@ -142,7 +142,7 @@ fn actions() -> PageActions {
     PageActions {
         on_create: Rc::new(|_, _| {}),
         on_edit: Rc::new(|_, _| {}),
-        on_move: Rc::new(|_, _, _, _| {}),
+        on_move: Rc::new(|_, _, _, _, _| {}),
         paste: PasteAction {
             ready: Rc::new(|| true),
             paste: Rc::new(|_| {}),
@@ -171,20 +171,60 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
 
     let day = NaiveDate::from_ymd_opt(2026, 9, 1).expect("a real date");
     let timed = event(1, at(2026, 9, 1, 9), at(2026, 9, 1, 10), false);
+    // Exercise the real gesture after the builder has returned. Weak captures
+    // must prevent cycles without letting the drag controller disappear early.
+    let commits = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut drag_actions = actions();
+    let recorded = commits.clone();
+    drag_actions.on_move = Rc::new(move |kind, id, date, time, source_day| {
+        recorded
+            .borrow_mut()
+            .push((kind, id, date, time, source_day));
+    });
+    let grid = week_view::build_hour_grid(&[day], std::slice::from_ref(&timed), drag_actions, 48);
+    let block = watch(&grid)
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .find(|widget| widget.has_css_class("event-block"))
+        .expect("a timed event block");
+    let controllers = block.observe_controllers();
+    let gesture = (0..controllers.n_items())
+        .filter_map(|i| controllers.item(i).and_downcast::<gtk::GestureDrag>())
+        .next()
+        .expect("the event's move gesture");
+    gesture.emit_by_name::<()>("drag-update", &[&0.0_f64, &48.0_f64]);
+    gesture.emit_by_name::<()>("drag-end", &[&0.0_f64, &48.0_f64]);
+    assert_eq!(
+        *commits.borrow(),
+        vec![(
+            crate::views::drag::DragKind::Move,
+            timed.id,
+            day,
+            chrono::NaiveTime::from_hms_opt(10, 0, 0),
+            Some(day)
+        )],
+        "dragging a built page must reschedule the event"
+    );
+    drop((gesture, controllers, block, grid));
     let all_day = event(2, at(2026, 9, 2, 0), at(2026, 9, 3, 0), true);
     // Spans midnight, so the week grid draws it as two clipped blocks and
     // takes the "not this block's own edge" paths.
     let overnight = event(3, at(2026, 9, 3, 22), at(2026, 9, 4, 2), false);
     let week_events = vec![timed.clone(), all_day.clone(), overnight];
+    // A series is movable now: the week and month pages install its gesture
+    // and drag source, which this leak sweep has to drop with the page.
+    let mut series = event(5, at(2026, 9, 1, 11), at(2026, 9, 1, 12), false);
+    series.recurrence = Some(crate::recurrence::Frequency::Weekly);
     let (invited, remote) = invitation(4, at(2026, 9, 1, 9));
 
     let scenarios: Vec<Scenario> = vec![
         ("month page", {
-            let events = vec![timed.clone(), all_day.clone()];
+            let events = vec![timed.clone(), all_day.clone(), series.clone()];
             Box::new(move || month_view::build(day, &events, actions()))
         }),
         ("week page", {
-            let events = week_events.clone();
+            let mut events = week_events.clone();
+            events.push(series.clone());
             Box::new(move || {
                 week_view::build(
                     day,
@@ -196,7 +236,7 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
             })
         }),
         ("day page", {
-            let events = vec![timed.clone()];
+            let events = vec![timed.clone(), series.clone()];
             Box::new(move || {
                 week_view::build_day(
                     day,
@@ -335,6 +375,29 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         None,
         Rc::new(|| {}),
         Rc::new(|| {}),
+    );
+    let widgets: Vec<_> = watch(inspector.upcast_ref())
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect();
+    assert!(
+        widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::LinkButton>()
+                .is_some_and(|button| {
+                    button.label().as_deref() == Some("Join meeting")
+                        && button.uri().starts_with("https://teams.microsoft.com/")
+                })
+        }),
+        "the inspector must expose its meeting link as an action"
+    );
+    assert!(
+        widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.is_selectable() && label.label().contains("<a href="))
+        }),
+        "event details must contain selectable hyperlinks"
     );
     // The popover itself reports no size to its parent; its content is what
     // the surface has to fit.

@@ -22,9 +22,12 @@ pub(crate) type CreateFn = Rc<dyn Fn(DateTime<Local>, Option<DateTime<Local>>)>;
 /// nowhere meaningful to point.
 pub(crate) type EditFn = Rc<dyn Fn(Event, gtk::Widget)>;
 
-/// Commits a finished move or resize: which edge was dragged, which event, and
-/// the day and (in a timed view) the time it was dropped on.
-pub(crate) type MoveFn = Rc<dyn Fn(drag::DragKind, i64, NaiveDate, Option<NaiveTime>)>;
+/// Commits a finished move or resize: which edge was dragged, which event,
+/// the day and (in a timed view) the time it was dropped on, and the day the
+/// grabbed occurrence started on. That last day is how one copy of a repeating
+/// event is told from the others, which share an id.
+pub(crate) type MoveFn =
+    Rc<dyn Fn(drag::DragKind, i64, NaiveDate, Option<NaiveTime>, Option<NaiveDate>)>;
 
 /// A place on the grid: the day, and — where the view draws one — the hour
 /// within it. This is what a click on empty space selects, what the highlight

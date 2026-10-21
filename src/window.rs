@@ -3,8 +3,9 @@ use crate::caldav;
 use crate::calendar_dialog;
 use crate::config::Config;
 use crate::date_util::{
-    day_bounds, month_grid_bounds, month_start, shift_days, shift_months, shift_weeks, shift_years,
-    week_bounds, week_dates, week_start, year_bounds, year_start,
+    day_bounds, last_covered_day, local_day_start, month_grid_bounds, month_start, resolve_forward,
+    shift_days, shift_months, shift_weeks, shift_years, week_bounds, week_dates, week_start,
+    year_bounds, year_start,
 };
 use crate::event_dialog;
 use crate::event_popover;
@@ -16,8 +17,8 @@ use crate::store::{self, Event, EventDraft, Store};
 use crate::sync::{self, SyncOutcome};
 use crate::undo;
 use crate::views::{
-    EventSelection, PageActions, PasteAction, Slot, SlotSelection, drag::DragKind, month_view,
-    week_view, year_view,
+    EventSelection, MoveFn, PageActions, PasteAction, Slot, SlotSelection, drag::DragKind,
+    month_view, week_view, year_view,
 };
 use adw::prelude::*;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, NaiveTime, Timelike};
@@ -1909,14 +1910,11 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     // don't nag; `sync_connected_accounts` touches only providers that have an
     // account and aren't already mid-sync. The launch pass is deferred a beat
     // so the window paints first.
-    let launch_sync = Cell::new(Some(glib::timeout_add_local_once(
-        Duration::from_millis(100),
-        clone!(
-            #[strong]
-            ui,
-            move || sync_connected_accounts(&ui)
-        ),
-    )));
+    let launch_sync = schedule_launch_sync(clone!(
+        #[strong]
+        ui,
+        move || sync_connected_accounts(&ui)
+    ));
     let periodic_sync = Cell::new(Some(glib::timeout_add_seconds_local(
         15 * 60,
         clone!(
@@ -2618,6 +2616,22 @@ fn timed_grid_of(page: &gtk::Widget) -> Option<gtk::ScrolledWindow> {
     page.last_child().and_downcast::<gtk::ScrolledWindow>()
 }
 
+/// The launch sync can be cancelled if the window closes before it runs.
+fn schedule_launch_sync(action: impl FnOnce() + 'static) -> Rc<Cell<Option<glib::SourceId>>> {
+    let pending = Rc::new(Cell::new(None));
+    let completed = pending.clone();
+    pending.set(Some(glib::timeout_add_local_once(
+        Duration::from_millis(100),
+        move || {
+            // GLib removes a one-shot source after it fires. Forget its id
+            // first, so closing the window cannot try to remove it twice.
+            completed.take();
+            action();
+        },
+    )));
+    pending
+}
+
 /// Keeps the three timed pages at one scroll offset: whichever page is being
 /// looked at drives the other two, so a swipe or a step reveals the neighbour
 /// at the same hours rather than at wherever it happened to open.
@@ -2842,94 +2856,139 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
         .collect()
 }
 
-fn move_handler(
-    ui: &Rc<Ui>,
-    events: Vec<Event>,
-) -> Rc<dyn Fn(DragKind, i64, NaiveDate, Option<NaiveTime>)> {
+fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
     let ui = Rc::downgrade(ui);
-    Rc::new(move |kind, event_id, target_date, target_time| {
-        let Some(ui) = ui.upgrade() else {
-            return;
-        };
-        let Some(event) = events.iter().find(|event| event.id == event_id).cloned() else {
-            return;
-        };
-        let Some(draft) = drag_draft(&event, kind, target_date, target_time) else {
-            ui.toast_overlay.add_toast(adw::Toast::new(
-                "Resize needs a timed slot in week or day view",
-            ));
-            return;
-        };
-        let original = event.draft();
-        match remote_event_handler(&ui, &event) {
-            Some(event_dialog::RemoteEvent::Unavailable(error)) => {
-                ui.toast_overlay.add_toast(adw::Toast::new(&error));
+    Rc::new(
+        move |kind, event_id, target_date, target_time, source_day| {
+            let Some(ui) = ui.upgrade() else {
+                return;
+            };
+            let Some(occurrence) = occurrence_for_drag(&events, event_id, source_day) else {
+                return;
+            };
+            let Some(draft) = drag_draft(&occurrence, kind, target_date, target_time) else {
+                ui.toast_overlay.add_toast(adw::Toast::new(
+                    "Resize needs a timed slot in week or day view",
+                ));
+                return;
+            };
+            // A local series is one row. The draft describes the grabbed
+            // occurrence; the stored master has to move by the same delta, or
+            // the series would be replanted on the day that was dragged.
+            if occurrence.recurrence.is_some() {
+                let master = match ui.store.event_by_id(occurrence.id) {
+                    Ok(Some(master)) => master,
+                    _ => {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new("Couldn't load the repeating event"));
+                        return;
+                    }
+                };
+                let shifted = shift_series(&master, &occurrence, &draft);
+                confirm_series_drag(&ui, master, shifted);
+                return;
             }
-            Some(remote_event) => {
-                if let Err(error) = ui.store.update_event(event.id, &draft) {
-                    ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                        "Couldn't move event locally: {error}"
-                    )));
-                    return;
-                }
-                let _ = ui.store.mark_local_edit(event.id);
-                ui.reset_keeping_scroll();
+            apply_drag(&ui, occurrence, draft);
+        },
+    )
+}
 
-                let (tx, rx) = mpsc::channel();
-                let remote_draft = draft.clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(remote_event.update(&remote_draft));
-                });
-                glib::timeout_add_local(
-                    Duration::from_millis(100),
-                    clone!(
-                        #[strong]
-                        ui,
-                        move || match rx.try_recv() {
-                            Ok(Ok(())) => {
-                                let _ = ui.store.clear_local_edit(event.id);
-                                ui.record(undo::Change::edited(
-                                    event.calendar_id,
-                                    event.id,
-                                    original.clone(),
-                                    draft.clone(),
-                                ));
-                                glib::ControlFlow::Break
-                            }
-                            Ok(Err(error)) => {
-                                undo_failed_drag(&ui, event.id, &draft, &original);
-                                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                                    "Couldn't move event: {error}"
-                                )));
-                                glib::ControlFlow::Break
-                            }
-                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                undo_failed_drag(&ui, event.id, &draft, &original);
-                                ui.toast_overlay
-                                    .add_toast(adw::Toast::new("Event move stopped unexpectedly"));
-                                glib::ControlFlow::Break
-                            }
-                        }
-                    ),
-                );
+/// Asks before a drag rewrites every occurrence. "Only this event" needs
+/// exceptions the sync layer cannot round-trip, so the choice is the whole
+/// series or nothing.
+fn confirm_series_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
+    let alert = adw::AlertDialog::builder()
+        .heading("Change all events in this series?")
+        .body(
+            "This event repeats. The change applies to every event in the series. \
+             Changing only this one isn't available yet.",
+        )
+        .build();
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("all", "Change All");
+    alert.set_response_appearance("all", adw::ResponseAppearance::Suggested);
+    alert.set_default_response(Some("cancel"));
+    alert.set_close_response("cancel");
+    let ui_for_dialog = ui.clone();
+    alert.connect_response(None, move |_, response| {
+        if response != "all" {
+            return;
+        }
+        apply_drag(&ui_for_dialog, event.clone(), draft.clone());
+    });
+    alert.present(Some(&ui.carousel));
+}
+
+fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
+    let original = event.draft();
+    match remote_event_handler(ui, &event) {
+        Some(event_dialog::RemoteEvent::Unavailable(error)) => {
+            ui.toast_overlay.add_toast(adw::Toast::new(&error));
+        }
+        Some(remote_event) => {
+            if let Err(error) = ui.store.update_event(event.id, &draft) {
+                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                    "Couldn't move event locally: {error}"
+                )));
+                return;
             }
-            None => {
-                if let Err(error) = ui.store.update_event(event.id, &draft) {
-                    ui.toast_overlay
-                        .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
-                } else {
-                    ui.record(undo::Change::edited(
-                        event.calendar_id,
-                        event.id,
-                        original,
-                        draft,
-                    ));
-                    ui.reset_keeping_scroll();
-                }
+            let _ = ui.store.mark_local_edit(event.id);
+            ui.reset_keeping_scroll();
+
+            let (tx, rx) = mpsc::channel();
+            let remote_draft = draft.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(remote_event.update(&remote_draft));
+            });
+            glib::timeout_add_local(
+                Duration::from_millis(100),
+                clone!(
+                    #[strong]
+                    ui,
+                    move || match rx.try_recv() {
+                        Ok(Ok(())) => {
+                            let _ = ui.store.clear_local_edit(event.id);
+                            ui.record(undo::Change::edited(
+                                event.calendar_id,
+                                event.id,
+                                original.clone(),
+                                draft.clone(),
+                            ));
+                            glib::ControlFlow::Break
+                        }
+                        Ok(Err(error)) => {
+                            undo_failed_drag(&ui, event.id, &draft, &original);
+                            ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                                "Couldn't move event: {error}"
+                            )));
+                            glib::ControlFlow::Break
+                        }
+                        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            undo_failed_drag(&ui, event.id, &draft, &original);
+                            ui.toast_overlay
+                                .add_toast(adw::Toast::new("Event move stopped unexpectedly"));
+                            glib::ControlFlow::Break
+                        }
+                    }
+                ),
+            );
+        }
+        None => {
+            if let Err(error) = ui.store.update_event(event.id, &draft) {
+                ui.toast_overlay
+                    .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+            } else {
+                ui.record(undo::Change::edited(
+                    event.calendar_id,
+                    event.id,
+                    original,
+                    draft,
+                ));
+                ui.reset_keeping_scroll();
             }
         }
-    })
+    }
 }
 
 /// Puts back the local write a failed drag made, unless the event has changed
@@ -2985,6 +3044,93 @@ fn drag_draft(
         DragKind::Move => Some(moved_draft(event, target_date, target_time)),
         DragKind::ResizeStart => resized_start_draft(event, target_date, target_time),
         DragKind::ResizeEnd => resized_end_draft(event, target_date, target_time),
+        DragKind::ToAllDay => Some(all_day_draft(event, target_date)),
+    }
+}
+
+/// The occurrence a drag grabbed. Several blocks of a series share one id;
+/// the source day is what tells them apart. Without one, the first copy is
+/// the only candidate.
+fn occurrence_for_drag(
+    events: &[Event],
+    event_id: i64,
+    source_day: Option<NaiveDate>,
+) -> Option<Event> {
+    if let Some(day) = source_day
+        && let Some(event) = events
+            .iter()
+            .find(|event| event.id == event_id && event.start.date_naive() == day)
+    {
+        return Some(event.clone());
+    }
+    events.iter().find(|event| event.id == event_id).cloned()
+}
+
+/// The master row after one occurrence was edited.
+///
+/// The stored row is the first occurrence, not the block that was dragged.
+/// The series keeps its shape: the same calendar-day distance and the same
+/// clock change, measured from the grabbed occurrence to where it landed.
+/// The day is applied first and the clock second, so a 23:00 dragged to 01:00
+/// the next morning is one day forward and 22 hours back — 01:00, not a
+/// second day earlier from also counting the midnight wrap.
+fn shift_series(master: &Event, occurrence: &Event, edited: &EventDraft) -> EventDraft {
+    let day_delta =
+        days_as_i32((edited.start.date_naive() - occurrence.start.date_naive()).num_days());
+    if edited.all_day {
+        let span_days = days_as_i32(
+            (edited.end.date_naive() - edited.start.date_naive())
+                .num_days()
+                .max(1),
+        );
+        let start_date = shift_days(master.start.date_naive(), day_delta);
+        return EventDraft {
+            start: local_day_start(start_date),
+            end: local_day_start(shift_days(start_date, span_days)),
+            all_day: true,
+            ..master.draft()
+        };
+    }
+
+    let clock_delta = ChronoDuration::seconds(
+        i64::from(edited.start.time().num_seconds_from_midnight())
+            - i64::from(occurrence.start.time().num_seconds_from_midnight()),
+    );
+    let start_date = shift_days(master.start.date_naive(), day_delta);
+    let start = resolve_forward(&Local, start_date.and_time(master.start.time())) + clock_delta;
+    let duration = edited.end - edited.start;
+    EventDraft {
+        start,
+        end: start + duration,
+        all_day: false,
+        ..master.draft()
+    }
+}
+
+fn days_as_i32(days: i64) -> i32 {
+    i32::try_from(days).unwrap_or(if days.is_negative() {
+        i32::MIN
+    } else {
+        i32::MAX
+    })
+}
+
+/// Calendar days a timed or all-day span covers. An end at midnight is
+/// exclusive, matching how all-day events are stored.
+fn covered_day_count(event: &Event) -> i64 {
+    let last = last_covered_day(event.start, event.end);
+    (last - event.start.date_naive()).num_days().max(0) + 1
+}
+
+/// The all-day event a timed block becomes, anchored on `target_date` and
+/// covering the same number of calendar days.
+fn all_day_draft(event: &Event, target_date: NaiveDate) -> EventDraft {
+    let span = days_as_i32(covered_day_count(event)).max(1);
+    EventDraft {
+        start: local_day_start(target_date),
+        end: local_day_start(shift_days(target_date, span)),
+        all_day: true,
+        ..event.draft()
     }
 }
 
@@ -2993,6 +3139,19 @@ fn moved_draft(
     target_date: NaiveDate,
     target_time: Option<NaiveTime>,
 ) -> EventDraft {
+    // Dropping an all-day chip on a timed slot gives it a time. A multi-day
+    // span collapses to one hour: an all-day chip has no clock duration to keep.
+    if event.all_day
+        && let Some(time) = target_time
+    {
+        let start = resolve_forward(&Local, target_date.and_time(time));
+        return EventDraft {
+            start,
+            end: start + ChronoDuration::hours(1),
+            all_day: false,
+            ..event.draft()
+        };
+    }
     let start = target_date
         .and_time(target_time.unwrap_or_else(|| event.start.time()))
         .and_local_timezone(Local)
@@ -4782,6 +4941,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completed_launch_sync_leaves_no_timer_for_window_close_to_remove() {
+        let ran = Rc::new(Cell::new(false));
+        let completed = ran.clone();
+        let pending = schedule_launch_sync(move || completed.set(true));
+        while !ran.get() {
+            glib::MainContext::default().iteration(true);
+        }
+        assert!(
+            pending.take().is_none(),
+            "completed timers must not be removed again"
+        );
+    }
+
+    #[test]
     fn unchanged_syncs_do_not_queue_a_refresh() {
         assert!(!AccountActivity::default().queue_sync_refresh(false));
     }
@@ -5314,6 +5487,215 @@ mod tests {
         assert_eq!(draft.location.as_deref(), Some("Room 5"));
         assert_eq!(draft.notes.as_deref(), Some("Bring the deck"));
         assert_eq!(draft.reminder_minutes, Some(10));
+    }
+
+    #[test]
+    fn dropping_an_all_day_event_on_a_time_makes_it_a_one_hour_event() {
+        let event = test_event(
+            local_midnight(2026, 10, 21),
+            local_midnight(2026, 10, 22),
+            true,
+        );
+        let target = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
+
+        let draft = moved_draft(&event, target, NaiveTime::from_hms_opt(15, 30, 0));
+
+        assert!(!draft.all_day);
+        assert_eq!(draft.start.date_naive(), target);
+        assert_eq!(
+            draft.start.time(),
+            NaiveTime::from_hms_opt(15, 30, 0).unwrap()
+        );
+        assert_eq!(draft.end - draft.start, ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn dragging_a_timed_event_above_the_day_makes_those_days_all_day() {
+        // 9pm through 1am covers two calendar days. Becoming all-day keeps
+        // both, with the exclusive end on the morning after the last one.
+        let event = test_event(local_at(2026, 10, 21, 21), local_at(2026, 10, 22, 1), false);
+
+        let draft = drag_draft(
+            &event,
+            DragKind::ToAllDay,
+            NaiveDate::from_ymd_opt(2026, 10, 21).unwrap(),
+            None,
+        )
+        .expect("an all-day conversion");
+
+        assert!(draft.all_day);
+        assert_eq!(
+            draft.start.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()
+        );
+        assert_eq!(draft.start.time(), NaiveTime::MIN);
+        assert_eq!(
+            draft.end.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 23).unwrap()
+        );
+        assert_eq!(draft.end.time(), NaiveTime::MIN);
+    }
+
+    #[test]
+    fn a_same_day_timed_event_becomes_one_all_day() {
+        let event = test_event(local_at(2026, 10, 21, 9), local_at(2026, 10, 21, 10), false);
+
+        let draft = drag_draft(
+            &event,
+            DragKind::ToAllDay,
+            NaiveDate::from_ymd_opt(2026, 10, 22).unwrap(),
+            None,
+        )
+        .expect("an all-day conversion");
+
+        assert_eq!(
+            draft.start.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 22).unwrap()
+        );
+        assert_eq!(
+            draft.end.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 10, 23).unwrap()
+        );
+    }
+
+    #[test]
+    fn moving_a_later_occurrence_shifts_the_whole_series() {
+        // The master is Monday the 5th. The dragged block is the occurrence
+        // two weeks later. Writing that block's new time onto the row would
+        // plant the series on the 20th; the series has to slide by the same
+        // day and the same clock change instead.
+        let mut master = test_event(local_at(2026, 10, 5, 9), local_at(2026, 10, 5, 10), false);
+        master.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let mut occurrence = master.clone();
+        occurrence.start = local_at(2026, 10, 19, 9);
+        occurrence.end = local_at(2026, 10, 19, 10);
+        let edited = moved_draft(
+            &occurrence,
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            NaiveTime::from_hms_opt(11, 0, 0),
+        );
+
+        let shifted = shift_series(&master, &occurrence, &edited);
+
+        assert_eq!(shifted.start, local_at(2026, 10, 6, 11));
+        assert_eq!(shifted.end, local_at(2026, 10, 6, 12));
+        assert_eq!(
+            shifted.recurrence,
+            Some(crate::recurrence::Frequency::Weekly)
+        );
+        assert_eq!(shifted.title, master.title);
+    }
+
+    #[test]
+    fn resizing_one_occurrence_changes_the_series_duration() {
+        let mut master = test_event(local_at(2026, 10, 5, 9), local_at(2026, 10, 5, 10), false);
+        master.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let mut occurrence = master.clone();
+        occurrence.start = local_at(2026, 10, 19, 9);
+        occurrence.end = local_at(2026, 10, 19, 10);
+        let edited = resized_end_draft(
+            &occurrence,
+            NaiveDate::from_ymd_opt(2026, 10, 19).unwrap(),
+            NaiveTime::from_hms_opt(11, 0, 0),
+        )
+        .expect("a timed resize");
+
+        let shifted = shift_series(&master, &occurrence, &edited);
+
+        assert_eq!(shifted.start, master.start);
+        assert_eq!(shifted.end, local_at(2026, 10, 5, 11));
+        assert_eq!(shifted.recurrence, master.recurrence);
+    }
+
+    #[test]
+    fn the_dragged_occurrence_is_the_one_on_the_source_day() {
+        let mut earlier = test_event(local_at(2026, 10, 19, 9), local_at(2026, 10, 19, 10), false);
+        earlier.recurrence = Some(crate::recurrence::Frequency::Daily);
+        let mut later = earlier.clone();
+        later.start = local_at(2026, 10, 21, 9);
+        later.end = local_at(2026, 10, 21, 10);
+
+        let found = occurrence_for_drag(
+            &[earlier.clone(), later.clone()],
+            earlier.id,
+            Some(NaiveDate::from_ymd_opt(2026, 10, 21).unwrap()),
+        )
+        .expect("the Wednesday occurrence");
+
+        assert_eq!(found.start, later.start);
+    }
+
+    #[test]
+    fn a_series_shift_applies_the_calendar_day_before_the_clock_change() {
+        // 11pm dragged to 1am the next day is one day forward and 22 hours
+        // back. Counting the midnight wrap a second time would land at 1am
+        // the day after that.
+        let mut master = test_event(local_at(2026, 10, 5, 23), local_at(2026, 10, 6, 0), false);
+        master.recurrence = Some(crate::recurrence::Frequency::Daily);
+        let mut occurrence = master.clone();
+        occurrence.start = local_at(2026, 10, 19, 23);
+        occurrence.end = local_at(2026, 10, 20, 0);
+        let edited = moved_draft(
+            &occurrence,
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            NaiveTime::from_hms_opt(1, 0, 0),
+        );
+
+        let shifted = shift_series(&master, &occurrence, &edited);
+
+        assert_eq!(shifted.start, local_at(2026, 10, 6, 1));
+        assert_eq!(shifted.end - shifted.start, ChronoDuration::hours(1));
+    }
+
+    #[test]
+    fn an_all_day_series_dropped_on_a_time_starts_that_series_then() {
+        let mut master = test_event(
+            local_midnight(2026, 10, 5),
+            local_midnight(2026, 10, 6),
+            true,
+        );
+        master.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let mut occurrence = master.clone();
+        occurrence.start = local_midnight(2026, 10, 19);
+        occurrence.end = local_midnight(2026, 10, 20);
+        let edited = moved_draft(
+            &occurrence,
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            NaiveTime::from_hms_opt(15, 30, 0),
+        );
+
+        let shifted = shift_series(&master, &occurrence, &edited);
+
+        assert!(!shifted.all_day);
+        assert_eq!(
+            shifted.start,
+            local_at(2026, 10, 6, 15) + ChronoDuration::minutes(30)
+        );
+        assert_eq!(shifted.end - shifted.start, ChronoDuration::hours(1));
+        assert_eq!(shifted.recurrence, master.recurrence);
+    }
+
+    #[test]
+    fn a_timed_series_dragged_above_the_hours_becomes_all_day() {
+        let mut master = test_event(local_at(2026, 10, 5, 21), local_at(2026, 10, 6, 1), false);
+        master.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let mut occurrence = master.clone();
+        occurrence.start = local_at(2026, 10, 19, 21);
+        occurrence.end = local_at(2026, 10, 20, 1);
+        let edited = drag_draft(
+            &occurrence,
+            DragKind::ToAllDay,
+            NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+            None,
+        )
+        .expect("an all-day conversion");
+
+        let shifted = shift_series(&master, &occurrence, &edited);
+
+        assert!(shifted.all_day);
+        assert_eq!(shifted.start, local_midnight(2026, 10, 6));
+        assert_eq!(shifted.end, local_midnight(2026, 10, 8));
+        assert_eq!(shifted.recurrence, master.recurrence);
     }
 
     #[test]

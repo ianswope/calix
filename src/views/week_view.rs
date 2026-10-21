@@ -260,6 +260,13 @@ pub fn build_hour_grid(
     grid_overlay.add_overlay(timed_grid.preview_layer());
     hour_grid.append(&grid_overlay);
 
+    // Gestures hold this controller weakly. The enclosing grid owns its
+    // lifetime; the controller only owns descendants, never this container.
+    // Capturing it on a day column or event would create a reference cycle.
+    hour_grid.connect_destroy(move |_| {
+        let _keep_alive = &timed_grid;
+    });
+
     hour_grid.upcast()
 }
 
@@ -648,11 +655,11 @@ fn add_drop_target(
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Some((kind, event_id)) = parse_drag_payload(&event_id) else {
+        let Some((kind, event_id, source_day)) = parse_drag_payload(&event_id) else {
             return false;
         };
         let time = hour_height.and_then(|hour_height| time_for_y(y, hour_height));
-        on_move(kind, event_id, date, time);
+        on_move(kind, event_id, date, time, source_day);
         true
     });
     widget.add_controller(drop);
