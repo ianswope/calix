@@ -1,14 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-21
 
-Scrolling in week and day view stays where it was put: a resize, a sync, a
-save, a drag, or a step to the next week no longer moves it, a wheel detent
-glides instead of jumping, and a quick double press of an arrow moves two
-periods.
+Events follow the pointer when you drag them: into the next day, up into the
+all-day band, or down onto a time, and moving a repeating event shifts the
+whole series after you confirm. The week and day grid keeps the hours you
+scrolled to through a sync, a resize, and a step to the next week. A standing
+sync failure is announced once, with a button that opens Accounts.
 
 ### Added
 
+- Web addresses in an event's location and notes open in the browser, and a
+  recognized meeting link gets a **Join meeting** button.
 - Mouse-wheel scrolling of the week and day grid is eased over a few frames
   instead of jumping a step per detent. The distance per detent is GTK's own,
   so the wheel covers the same ground as before; touchpad scrolling, Shift+wheel
@@ -27,6 +30,13 @@ periods.
 - The Google setup instructions now say to publish the OAuth app to Production
   from the start. Leaving it in Testing, which the README used to call fine, is
   what makes Google expire the sign-in every seven days.
+- Dragging an event follows the pointer. The day under the cursor is the one
+  that changes, so a wide block crosses into the next day and a day page can
+  move sideways. Dragging above the hours makes the event all-day, and dropping
+  an all-day event on a time makes a one-hour event. Moving a repeating event
+  shifts the whole series from the occurrence you grabbed, after you confirm.
+- A sync that finds nothing new no longer rewrites the calendars or redraws the
+  window. The writes for one account land in a single transaction.
 
 ### Fixed
 
@@ -69,6 +79,15 @@ periods.
   carousel wasn't trusted and a second swipe or press was ignored.
 - Opening an event from search lands the week or day grid an hour above the
   event instead of at "now".
+- A repeating all-day event stays on its own calendar days across a
+  daylight-saving change, instead of spilling into the next day.
+- Reading a CalDAV invitation keeps a quoted attendee name, and unfolding a
+  wrapped line no longer drops the character after the fold.
+- An event whose notes are a long invitation, or carry an unbroken URL, can be
+  opened. The inspector wraps a word that will not fit and scrolls notes that
+  are taller than the window, so the popover and its Edit button stay on screen.
+- Closing the window while the first sync is still running no longer crashes by
+  cancelling a timer that has already finished.
 
 ## 0.7.0 — 2026-09-08
 
