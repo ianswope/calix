@@ -29,6 +29,7 @@ pub enum RemoteEvent {
         token_key: String,
         calendar_id: String,
         event_id: String,
+        series_id: Option<String>,
     },
     Caldav {
         base_url: String,
@@ -191,6 +192,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let token = google::oauth::get_access_token(config, token_key)
                     .map_err(|error| error.to_string())?
@@ -224,6 +226,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let access_token = google::oauth::get_access_token(config, token_key)
                     .map_err(|e| e.to_string())?
@@ -246,6 +249,13 @@ impl RemoteEvent {
     /// i.e. a case where "this event" vs "all events" is a meaningful choice.
     pub fn is_series_instance(&self) -> bool {
         matches!(self, Self::Caldav { event_href, .. } if event_href.contains('#'))
+            || matches!(
+                self,
+                Self::Google {
+                    series_id: Some(_),
+                    ..
+                }
+            )
     }
 
     /// Applies an edit to every occurrence of a series, moving the series by
@@ -256,6 +266,19 @@ impl RemoteEvent {
         shift: caldav::SeriesShift,
     ) -> Result<(), String> {
         match self {
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                series_id: Some(series_id),
+                ..
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Google account is not connected")?;
+                google::calendar_api::update_series(&token, calendar_id, series_id, shift, draft)
+            }
+
             Self::Caldav {
                 base_url,
                 username,
@@ -279,6 +302,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let access_token = google::oauth::get_access_token(config, token_key)
                     .map_err(|e| e.to_string())?
@@ -301,6 +325,19 @@ impl RemoteEvent {
     /// the one occurrence [`Self::delete`] would drop for a CalDAV instance.
     fn delete_all_events(&self) -> Result<(), String> {
         match self {
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                series_id: Some(series_id),
+                ..
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Google account is not connected")?;
+                google::calendar_api::delete_event(&token, calendar_id, series_id)
+            }
+
             Self::Caldav {
                 base_url,
                 username,
@@ -1272,18 +1309,13 @@ pub(crate) fn create_event_async(
             glib::ControlFlow::Break
         }
         Ok(Ok(Some((is_google, remote_id)))) => {
-            // A just-created event has no invitees — Calix has no flow for
-            // sending invites.
-            let result = if is_google {
-                store.upsert_google_event(
-                    target.calendar_id(),
-                    &remote_id,
-                    &draft,
-                    &draft.attendees,
-                )
-            } else {
-                store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
-            };
+            let result = undo::cache_remote_creation(
+                &store,
+                target.calendar_id(),
+                &draft,
+                is_google,
+                &remote_id,
+            );
             match result {
                 Ok(id) => {
                     // A repeat is a series operation: the cached row is one

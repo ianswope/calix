@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Weekday and month names follow the system locale.
+- Google recurring events offer This event and All events for edits and deletes.
+- Undo can recreate deleted events on synced calendars and retain their new provider identities.
+
+### Changed
+
+- Weeks begin on the system locale's first weekday.
+- Event notes use a multiline editor.
+- Calendar screenshots include month, week and year views.
+
+### Fixed
+
+- Primary and destructive buttons keep readable fills on light accents.
+- Accent text uses the higher-contrast choice of black or white.
+- The sidebar mini month no longer repeats its month title.
+
+### Security
+
+- Updated rustls to 0.23.46 for GHSA-2mjx-qc3c-rqvc.
+
 ## 0.8.0 — 2026-10-21
 
 Events follow the pointer when you drag them: into the next day, up into the
@@ -16,18 +40,9 @@ sync failure is announced once, with a button that opens Accounts.
   instead of jumping a step per detent. The distance per detent is GTK's own,
   so the wheel covers the same ground as before; touchpad scrolling, Shift+wheel
   paging, and a grid that already fits the window are untouched.
-- Weekday headers, month titles and the year view's month names are in the
-  system locale's language, with the month in the form it takes on its own —
-  *październik*, not *października*, under `pl_PL`. Full dates — the day
-  view's title, the week's range, tooltips and notifications — are still in
-  English.
 
 ### Changed
 
-- The week starts on the day the system locale starts it on: Monday under
-  `pl_PL` or `de_DE`, Saturday under `ar_EG`. Month, week and year view and
-  the sidebar's mini month all follow it. It used to be Sunday everywhere, and
-  Sunday is still the fallback where the locale can't be read.
 - A sync that fails on a timer says so once. The quarter-hourly pass used to
   toast the same failure every time it ran — an expired Google sign-in was
   announced ninety-six times a day until it was renewed. It is now announced
@@ -46,18 +61,9 @@ sync failure is announced once, with a button that opens Accounts.
   shifts the whole series from the occurrence you grabbed, after you confirm.
 - A sync that finds nothing new no longer rewrites the calendars or redraws the
   window. The writes for one account land in a single transaction.
-- Text on an Omarchy theme's accent and red is black or white by whichever
-  stands out more. A fixed brightness cutoff put white on mid tones where black
-  reads far better — 2.7:1 against 7.7:1 on Everforest's red, which every
-  delete button is filled with.
 
 ### Fixed
 
-- Primary and destructive buttons — **Connect an account**, **Save and sign
-  in**, **Edit**, **Delete Event** — are readable on a light accent. The
-  terminal styling cleared their fill but kept the label coloured for it, so on
-  a theme like Everforest the label sat dark on the dark window. They are
-  filled again, the primary ones in the same inverse video as a pressed button.
 - Launching Calix while it is already running in the background no longer
   leaves a second, windowless `calix` process behind. The launcher forwarded
   its command line to the running instance and presented the window, but then
@@ -106,8 +112,6 @@ sync failure is announced once, with a button that opens Accounts.
   are taller than the window, so the popover and its Edit button stay on screen.
 - Closing the window while the first sync is still running no longer crashes by
   cancelling a timer that has already finished.
-- The sidebar's mini month no longer names the month twice. It reused the
-  year view's thumbnail, title and all, beneath its own header with the arrows.
 
 ## 0.7.0 — 2026-09-08
 

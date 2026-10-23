@@ -376,7 +376,7 @@ fn reply_to_invitation(ics: &str, attendee_email: &str, partstat: &str) -> Resul
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeriesShift {
     exact: chrono::Duration,
-    wall_clock: chrono::Duration,
+    pub(crate) wall_clock: chrono::Duration,
 }
 
 impl SeriesShift {

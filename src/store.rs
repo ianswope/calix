@@ -328,6 +328,7 @@ impl Store {
         ensure_column(&conn, "calendars", "google_calendar_id", "TEXT")?;
         ensure_column(&conn, "calendars", "visible", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "events", "google_event_id", "TEXT")?;
+        ensure_column(&conn, "events", "google_series_id", "TEXT")?;
         // The `icloud_*` columns hold CalDAV hrefs. iCloud was the first
         // CalDAV provider, so they kept its name; generic CalDAV accounts
         // (provider = 'caldav') store their calendar/event hrefs in the same
@@ -985,6 +986,14 @@ impl Store {
         )
     }
 
+    pub fn google_series_id(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row(
+            "SELECT google_series_id FROM events WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+    }
+
     /// Creates or updates a CalDAV-sourced event by its href. Handles
     /// `reminder_minutes` and `local_edit` exactly as
     /// [`Self::upsert_google_event`] does. Expanded instances (`href#id`)
@@ -1027,7 +1036,7 @@ impl Store {
         );
         let inherit = inherit_reminder_from.unwrap_or(remote_id);
         let sql = format!(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, {id_column}, attendees, reminder_minutes)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, {id_column}, attendees, reminder_minutes, google_series_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                 COALESCE(
                     (SELECT reminder_minutes FROM events
@@ -1036,13 +1045,13 @@ impl Store {
                        AND reminder_minutes IS NOT NULL
                      LIMIT 1),
                     ?10
-                ))
+                ), ?12)
              ON CONFLICT(calendar_id, {id_column}) WHERE {id_column} IS NOT NULL
-             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9
+             DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9, google_series_id = ?12
              WHERE local_edit = 0 AND (
                  title IS NOT ?2 OR start_at IS NOT ?3 OR end_at IS NOT ?4
                  OR all_day IS NOT ?5 OR location IS NOT ?6 OR notes IS NOT ?7
-                 OR attendees IS NOT ?9)
+                 OR attendees IS NOT ?9 OR google_series_id IS NOT ?12)
              RETURNING id"
         );
         let written = self.conn.prepare_cached(&sql)?.query_row(
@@ -1058,6 +1067,11 @@ impl Store {
                 attendees_to_json(attendees),
                 draft.reminder_minutes,
                 inherit,
+                if id_column == "google_event_id" {
+                    inherit_reminder_from
+                } else {
+                    None
+                },
             ],
             |row| row.get(0),
         );
@@ -1556,6 +1570,23 @@ mod tests {
             reminder_minutes: None,
             attendees: Vec::new(),
         }
+    }
+
+    #[test]
+    fn syncing_a_google_occurrence_retains_its_series_identity() {
+        let store = store_with(&[("Original", None, None)]);
+        let draft = store.event_by_id(1).unwrap().unwrap().draft();
+        let id = store
+            .upsert_google_event_from_series(1, "instance", Some("master"), &draft, &[])
+            .unwrap();
+        assert_eq!(
+            store.google_series_id(id).unwrap().as_deref(),
+            Some("master")
+        );
+        store
+            .upsert_google_event_from_series(1, "instance", None, &draft, &[])
+            .unwrap();
+        assert_eq!(store.google_series_id(id).unwrap(), None);
     }
 
     #[test]

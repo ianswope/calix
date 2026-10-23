@@ -694,11 +694,59 @@ impl Ui {
             return;
         };
         if undo::needs_a_remote_create(&write, self.calendar_is_local(change.calendar_id)) {
-            self.discard(step);
-            self.toast("Calix can't put a synced event back on its calendar yet");
+            if let undo::Write::Insert { calendar_id, draft } = write {
+                self.restore_remote_event(step, calendar_id, draft);
+            }
             return;
         }
         self.apply_history_write(step, write, current);
+    }
+
+    fn restore_remote_event(
+        self: &Rc<Self>,
+        step: HistoryStep,
+        calendar_id: i64,
+        draft: EventDraft,
+    ) {
+        let Some(choice) = create_targets(self)
+            .into_iter()
+            .find(|choice| choice.target.calendar_id() == calendar_id)
+        else {
+            self.toast("That event's calendar is no longer available");
+            return;
+        };
+        if let event_dialog::CreateTarget::Unavailable { error, .. } = &choice.target {
+            self.toast(error);
+            return;
+        }
+        self.history_busy.set(true);
+        let ui_for_change = self.clone();
+        let ui = self.clone();
+        event_dialog::create_event_async(
+            self.store.clone(),
+            choice.target,
+            draft,
+            Rc::new(move |created| {
+                let mut history = ui_for_change.history.borrow_mut();
+                match step {
+                    HistoryStep::Undo => history.commit_undo(created.id),
+                    HistoryStep::Redo => history.commit_redo(created.id),
+                }
+            }),
+            move |outcome| {
+                ui.history_busy.set(false);
+                match outcome {
+                    Ok(saved) => ui.apply_saved(saved),
+                    Err((message, retryable)) => {
+                        if !retryable {
+                            ui.discard(step);
+                            ui.request_background_sync();
+                        }
+                        ui.toast(&message);
+                    }
+                }
+            },
+        );
     }
 
     /// Drops a change that can no longer be applied, so the next keypress
@@ -2759,6 +2807,12 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
                 token_key,
                 calendar_id,
                 event_id,
+                series_id: match ui.store.google_series_id(event.id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return Some(event_dialog::RemoteEvent::Unavailable(error.to_string()));
+                    }
+                },
             })
         }
         Some(provider @ ("icloud" | "caldav")) => {
