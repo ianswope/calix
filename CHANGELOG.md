@@ -16,6 +16,11 @@ sync failure is announced once, with a button that opens Accounts.
   instead of jumping a step per detent. The distance per detent is GTK's own,
   so the wheel covers the same ground as before; touchpad scrolling, Shift+wheel
   paging, and a grid that already fits the window are untouched.
+- Weekday headers, month titles and the year view's month names are in the
+  system locale's language, with the month in the form it takes on its own —
+  *październik*, not *października*, under `pl_PL`. Full dates — the day
+  view's title, the week's range, tooltips and notifications — are still in
+  English.
 
 ### Changed
 

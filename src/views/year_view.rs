@@ -5,14 +5,12 @@
 //! here means the two can't drift into looking like different products.
 
 use crate::date_util::{first_weekday, month_grid, weekdays_from, year_months};
+use crate::locale;
 use crate::store::Event;
 use crate::views::event_occurs_on_day;
 use chrono::{Datelike, Local, NaiveDate};
 use gtk::prelude::*;
 use std::rc::Rc;
-
-/// Weekday initials above each thumbnail, from Sunday.
-const WEEKDAY_INITIALS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
 
 /// One cell of a month thumbnail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +59,7 @@ pub fn build(anchor: NaiveDate, events: &[Event], on_pick: Rc<dyn Fn(NaiveDate)>
     let today = Local::now().date_naive();
     for (index, month) in year_months(anchor).into_iter().enumerate() {
         let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let name = gtk::Label::new(Some(&month.format("%B").to_string()));
+        let name = gtk::Label::new(Some(&locale::month_name(month)));
         name.add_css_class("heading");
         name.set_xalign(0.0);
         cell.append(&name);
@@ -94,8 +92,7 @@ pub(crate) fn month_thumbnail(
     days.set_column_homogeneous(true);
 
     for (index, day) in weekdays_from(first_weekday()).into_iter().enumerate() {
-        let initial = WEEKDAY_INITIALS[day.num_days_from_sunday() as usize];
-        let label = gtk::Label::new(Some(initial));
+        let label = gtk::Label::new(Some(&locale::weekday_initial(day)));
         label.add_css_class("caption");
         label.add_css_class("dim-label");
         days.attach(&label, index as i32, 0, 1, 1);

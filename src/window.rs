@@ -11,6 +11,7 @@ use crate::event_dialog;
 use crate::event_popover;
 use crate::google;
 use crate::icloud;
+use crate::locale;
 use crate::provider::{self, Provider};
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
@@ -542,7 +543,7 @@ impl State {
     fn title(&self) -> String {
         match self.view_mode {
             ViewMode::Year => self.period_anchor().format("%Y").to_string(),
-            ViewMode::Month => self.period_anchor().format("%B %Y").to_string(),
+            ViewMode::Month => locale::month_title(self.period_anchor()),
             ViewMode::Week => {
                 let days = week_dates(self.current_date);
                 let (start, end) = (days[0], days[6]);
@@ -1267,7 +1268,7 @@ impl Ui {
         for button in [&prev, &next] {
             button.add_css_class("flat");
         }
-        let title = gtk::Label::new(Some(&anchor.format("%B %Y").to_string()));
+        let title = gtk::Label::new(Some(&locale::month_title(anchor)));
         title.add_css_class("heading");
         title.set_hexpand(true);
         title.set_xalign(0.0);
