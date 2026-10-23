@@ -97,6 +97,8 @@ sync failure is announced once, with a button that opens Accounts.
   are taller than the window, so the popover and its Edit button stay on screen.
 - Closing the window while the first sync is still running no longer crashes by
   cancelling a timer that has already finished.
+- The sidebar's mini month no longer names the month twice. It reused the
+  year view's thumbnail, title and all, beneath its own header with the arrows.
 
 ## 0.7.0 — 2026-09-08
 
