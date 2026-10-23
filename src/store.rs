@@ -72,6 +72,7 @@ pub struct Event {
     /// alert. Local to this machine — never pushed to Google/CalDAV, and the
     /// sync upserts leave it alone so it survives re-syncs.
     pub reminder_minutes: Option<i64>,
+    pub additional_reminders: Vec<i64>,
     /// Everyone invited, as last seen on the provider. Empty for local events
     /// and for remote events with no invitees.
     pub attendees: Vec<Attendee>,
@@ -93,6 +94,7 @@ pub struct EventDraft {
     pub notes: Option<String>,
     pub recurrence: Option<Frequency>,
     pub reminder_minutes: Option<i64>,
+    pub additional_reminders: Vec<i64>,
     /// Invitees to send with a remote event. Local calendars retain these as
     /// event metadata but cannot deliver invitations.
     pub attendees: Vec<Attendee>,
@@ -112,6 +114,7 @@ impl Event {
             notes: self.notes.clone(),
             recurrence: self.recurrence,
             reminder_minutes: self.reminder_minutes,
+            additional_reminders: self.additional_reminders.clone(),
             attendees: self.attendees.clone(),
         }
     }
@@ -341,6 +344,12 @@ impl Store {
         // Desktop-alert lead time in minutes; NULL = no alert. Local-only:
         // the sync upserts never write it, so it survives re-syncs.
         ensure_column(&conn, "events", "reminder_minutes", "INTEGER")?;
+        ensure_column(
+            &conn,
+            "events",
+            "additional_reminders",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         // Base URL for a generic CalDAV account's server; NULL for google and
         // icloud (iCloud uses a fixed well-known root).
         ensure_column(&conn, "accounts", "server_url", "TEXT")?;
@@ -867,8 +876,8 @@ impl Store {
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence, reminder_minutes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence, reminder_minutes, additional_reminders)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 calendar_id,
                 draft.title,
@@ -879,6 +888,7 @@ impl Store {
                 draft.notes,
                 draft.recurrence.map(Frequency::to_rrule),
                 draft.reminder_minutes,
+                serde_json::to_string(&draft.additional_reminders).unwrap(),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -887,7 +897,7 @@ impl Store {
     pub fn update_event(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE events SET title = ?1, start_at = ?2, end_at = ?3, all_day = ?4,
-             location = ?5, notes = ?6, recurrence = ?7, reminder_minutes = ?8 WHERE id = ?9",
+             location = ?5, notes = ?6, recurrence = ?7, reminder_minutes = ?8, additional_reminders = ?10 WHERE id = ?9",
             params![
                 draft.title,
                 stored_timestamp(&draft.start),
@@ -898,6 +908,7 @@ impl Store {
                 draft.recurrence.map(Frequency::to_rrule),
                 draft.reminder_minutes,
                 id,
+                serde_json::to_string(&draft.additional_reminders).unwrap(),
             ],
         )?;
         Ok(())
@@ -1036,7 +1047,7 @@ impl Store {
         );
         let inherit = inherit_reminder_from.unwrap_or(remote_id);
         let sql = format!(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, {id_column}, attendees, reminder_minutes, google_series_id)
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, {id_column}, attendees, reminder_minutes, google_series_id, additional_reminders)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                 COALESCE(
                     (SELECT reminder_minutes FROM events
@@ -1045,7 +1056,7 @@ impl Store {
                        AND reminder_minutes IS NOT NULL
                      LIMIT 1),
                     ?10
-                ), ?12)
+                ), ?12, COALESCE((SELECT additional_reminders FROM events WHERE calendar_id = ?1 AND {id_column} = ?11 LIMIT 1), ?13))
              ON CONFLICT(calendar_id, {id_column}) WHERE {id_column} IS NOT NULL
              DO UPDATE SET title = ?2, start_at = ?3, end_at = ?4, all_day = ?5, location = ?6, notes = ?7, attendees = ?9, google_series_id = ?12
              WHERE local_edit = 0 AND (
@@ -1072,6 +1083,7 @@ impl Store {
                 } else {
                     None
                 },
+                serde_json::to_string(&draft.additional_reminders).unwrap(),
             ],
             |row| row.get(0),
         );
@@ -1325,7 +1337,7 @@ const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name
             events.end_at, events.all_day, events.location, events.notes,
             events.google_event_id, events.icloud_event_id,
             accounts.server_url, events.recurrence, events.reminder_minutes,
-            events.attendees
+            events.attendees, events.additional_reminders
      FROM events
      JOIN calendars ON calendars.id = events.calendar_id
      LEFT JOIN accounts ON accounts.id = calendars.account_id";
@@ -1408,6 +1420,7 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Option<Event>> {
             .as_deref()
             .and_then(Frequency::from_rrule),
         reminder_minutes: row.get(18)?,
+        additional_reminders: serde_json::from_str(&row.get::<_, String>(20)?).unwrap_or_default(),
         attendees: attendees_from_json(row.get(19)?),
     }))
 }
@@ -1568,8 +1581,39 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
+    }
+
+    #[test]
+    fn multiple_reminders_survive_storage_edits_and_sync() {
+        let store = store_with(&[("Original", None, None)]);
+        let mut draft = store.event_by_id(1).unwrap().unwrap().draft();
+        draft.reminder_minutes = Some(10);
+        draft.additional_reminders = vec![60, 1440];
+        let id = store.create_event(1, &draft).unwrap();
+        assert_eq!(
+            store.event_by_id(id).unwrap().unwrap().additional_reminders,
+            vec![60, 1440]
+        );
+        draft.additional_reminders = vec![30];
+        store.update_event(id, &draft).unwrap();
+        assert_eq!(
+            store.event_by_id(id).unwrap().unwrap().additional_reminders,
+            vec![30]
+        );
+        let remote = store.upsert_google_event(1, "remote", &draft, &[]).unwrap();
+        draft.additional_reminders.clear();
+        store.upsert_google_event(1, "remote", &draft, &[]).unwrap();
+        assert_eq!(
+            store
+                .event_by_id(remote)
+                .unwrap()
+                .unwrap()
+                .additional_reminders,
+            vec![30]
+        );
     }
 
     #[test]

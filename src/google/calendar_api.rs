@@ -607,6 +607,7 @@ mod tests {
                 notes: None,
                 recurrence: None,
                 reminder_minutes: None,
+                additional_reminders: Vec::new(),
                 attendees: Vec::new(),
             },
         )
@@ -764,6 +765,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -785,6 +787,7 @@ mod tests {
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 

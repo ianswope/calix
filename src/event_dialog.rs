@@ -466,16 +466,25 @@ pub(crate) fn build(
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
-    // Alert choices in notify::ALERT_CHOICES order — matching
-    // notify::picker_index / from_picker_index.
-    let alert_labels: Vec<&str> = notify::ALERT_CHOICES
-        .iter()
-        .map(|(label, _)| *label)
-        .collect();
-    let alert_row = adw::ComboRow::builder()
-        .title("Alert")
-        .model(&gtk::StringList::new(&alert_labels))
+    let alert_row = adw::ExpanderRow::builder()
+        .title("Alerts")
+        .subtitle("Choose one or more reminders")
         .build();
+    let alert_buttons: Vec<(i64, gtk::CheckButton)> = notify::ALERT_CHOICES
+        .iter()
+        .filter_map(|(label, minutes)| {
+            minutes.map(|minutes| {
+                let button = gtk::CheckButton::new();
+                let row = adw::ActionRow::builder()
+                    .title(*label)
+                    .activatable_widget(&button)
+                    .build();
+                row.add_suffix(&button);
+                alert_row.add_row(&row);
+                (minutes, button)
+            })
+        })
+        .collect();
     // Shown only when editing one occurrence of a series: governs whether Save
     // and Delete affect just this occurrence or the whole series (0 = this, 1
     // = all).
@@ -555,7 +564,12 @@ pub(crate) fn build(
             // means the save handler reads back the event's existing rule
             // unchanged instead of clearing it.
             repeat_row.set_selected(Frequency::picker_index(event.recurrence));
-            alert_row.set_selected(notify::picker_index(event.reminder_minutes));
+            for (minutes, button) in &alert_buttons {
+                button.set_active(
+                    event.reminder_minutes == Some(*minutes)
+                        || event.additional_reminders.contains(minutes),
+                );
+            }
         }
         None => {
             set_time_rows(
@@ -764,6 +778,7 @@ pub(crate) fn build(
                 return;
             }
 
+            let mut reminders = alert_buttons.iter().filter(|(_, button)| button.is_active()).map(|(minutes, _)| *minutes);
             let draft = EventDraft {
                 title,
                 start,
@@ -772,7 +787,8 @@ pub(crate) fn build(
                 location: non_empty(location_row.text().to_string()),
                 notes: non_empty(notes.text()),
                 recurrence: Frequency::from_picker_index(repeat_row.selected()),
-                reminder_minutes: notify::from_picker_index(alert_row.selected()),
+                reminder_minutes: reminders.next(),
+                additional_reminders: reminders.collect(),
                 attendees: match editing.as_ref() {
                     Some(event) => event.attendees.clone(),
                     None => match parse_invitees(&invitees_row.text()) {

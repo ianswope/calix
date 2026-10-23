@@ -131,6 +131,7 @@ fn same_edit(a: &EventDraft, b: &EventDraft) -> bool {
         && a.notes == b.notes
         && a.recurrence == b.recurrence
         && a.reminder_minutes == b.reminder_minutes
+        && a.additional_reminders == b.additional_reminders
 }
 
 /// The database write that carries out one undo or redo step.
@@ -279,6 +280,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
     }

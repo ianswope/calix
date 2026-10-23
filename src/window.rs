@@ -3236,6 +3236,7 @@ fn moved_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     }
 }
@@ -3309,6 +3310,7 @@ fn resized_start_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     })
 }
@@ -3337,6 +3339,7 @@ fn resized_end_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     })
 }
@@ -5398,6 +5401,7 @@ mod tests {
             attendees: Vec::new(),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
         }
     }
 

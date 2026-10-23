@@ -109,6 +109,7 @@ fn event(id: i64, start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -
         attendees: Vec::new(),
         recurrence: None,
         reminder_minutes: None,
+        additional_reminders: Vec::new(),
     }
 }
 

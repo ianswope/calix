@@ -956,6 +956,7 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
             // arrives as its own one-off VEVENT without an RRULE.
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: attendees.clone(),
         },
         attendees,
@@ -2629,6 +2630,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2660,6 +2662,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2718,6 +2721,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2746,6 +2750,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2779,6 +2784,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2802,6 +2808,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2858,6 +2865,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
     }
@@ -3022,6 +3030,7 @@ END:VCALENDAR"#;
             notes: Some("New agenda".to_string()),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 

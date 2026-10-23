@@ -52,10 +52,14 @@ pub fn due_alerts(events: &[Event], after: DateTime<Local>, up_to: DateTime<Loca
     events
         .iter()
         .filter(|event| {
-            event.reminder_minutes.is_some_and(|minutes| {
-                let alert_at = event.start - chrono::Duration::minutes(minutes);
-                after < alert_at && alert_at <= up_to
-            })
+            event
+                .reminder_minutes
+                .iter()
+                .chain(event.additional_reminders.iter())
+                .any(|&minutes| {
+                    let alert_at = event.start - chrono::Duration::minutes(minutes);
+                    after < alert_at && alert_at <= up_to
+                })
         })
         .cloned()
         .collect()
@@ -136,7 +140,41 @@ mod tests {
             attendees: Vec::new(),
             recurrence: None,
             reminder_minutes,
+            additional_reminders: Vec::new(),
         }
+    }
+
+    #[test]
+    fn every_reminder_fires_in_its_own_window_without_duplicate_alerts() {
+        let start = at(2026, 10, 23, 12, 0);
+        let mut event = event_at(start, Some(10));
+        event.additional_reminders = vec![60, 60, 10];
+        assert_eq!(
+            due_alerts(
+                &[event.clone()],
+                start - Duration::minutes(61),
+                start - Duration::minutes(60)
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            due_alerts(
+                &[event.clone()],
+                start - Duration::minutes(11),
+                start - Duration::minutes(10)
+            )
+            .len(),
+            1
+        );
+        assert!(
+            due_alerts(
+                &[event],
+                start - Duration::minutes(60),
+                start - Duration::minutes(11)
+            )
+            .is_empty()
+        );
     }
 
     #[test]

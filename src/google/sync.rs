@@ -169,6 +169,7 @@ fn event_draft(event: &calendar_api::EventItem) -> Option<EventDraft> {
         // already expanded as its own one-off item.
         recurrence: None,
         reminder_minutes: None,
+        additional_reminders: Vec::new(),
         attendees: event.invitees(),
     })
 }

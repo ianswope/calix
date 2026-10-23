@@ -303,6 +303,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
     }
