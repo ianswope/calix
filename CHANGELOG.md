@@ -37,6 +37,10 @@ sync failure is announced once, with a button that opens Accounts.
   shifts the whole series from the occurrence you grabbed, after you confirm.
 - A sync that finds nothing new no longer rewrites the calendars or redraws the
   window. The writes for one account land in a single transaction.
+- Text on an Omarchy theme's accent and red is black or white by whichever
+  stands out more. A fixed brightness cutoff put white on mid tones where black
+  reads far better — 2.7:1 against 7.7:1 on Everforest's red, which every
+  delete button is filled with.
 
 ### Fixed
 

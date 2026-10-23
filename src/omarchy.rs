@@ -258,10 +258,28 @@ fn elevate(base: Rgb, level: f32, dark: bool) -> Rgb {
     mix(base, if dark { WHITE } else { BLACK }, level)
 }
 
-/// A legible ink color to place *on* `c` — black over light fills, white over
-/// dark ones (the palette only gives us the fill, not its contrasting pair).
+/// WCAG relative luminance: channels are linearized from sRGB before weighting,
+/// unlike `luminance`, which only needs to tell light backgrounds from dark.
+fn relative_luminance(c: Rgb) -> f32 {
+    let linear = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
+}
+
+/// A legible ink color to place *on* `c`: whichever of black or white has the
+/// higher WCAG contrast ratio against it (the palette only gives us the fill,
+/// not its contrasting pair).
 fn on_color(c: Rgb) -> Rgb {
-    if luminance(c) > 0.6 { BLACK } else { WHITE }
+    let l = relative_luminance(c);
+    let on_black = (l + 0.05) / 0.05;
+    let on_white = 1.05 / (l + 0.05);
+    if on_black > on_white { BLACK } else { WHITE }
 }
 
 #[cfg(test)]
@@ -504,5 +522,15 @@ padding.x = 14
         // Black text over a light fill, white text over a dark one.
         assert_eq!(to_hex(on_color(WHITE)), to_hex(BLACK));
         assert_eq!(to_hex(on_color(BLACK)), to_hex(WHITE));
+    }
+
+    #[test]
+    fn on_color_picks_the_ink_with_more_contrast_on_a_mid_tone() {
+        // #8f8f8f: black is 6.5:1, white only 3.2:1 (below WCAG AA).
+        let grey = parse_hex("#8f8f8f").unwrap();
+        assert_eq!(to_hex(on_color(grey)), to_hex(BLACK));
+        // Everforest's red, which destructive buttons fill with: 7.7:1 vs 2.7:1.
+        let red = parse_hex("#e67e80").unwrap();
+        assert_eq!(to_hex(on_color(red)), to_hex(BLACK));
     }
 }
