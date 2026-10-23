@@ -11,6 +11,7 @@ use crate::event_dialog;
 use crate::event_popover;
 use crate::google;
 use crate::icloud;
+use crate::locale;
 use crate::provider::{self, Provider};
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
@@ -542,7 +543,7 @@ impl State {
     fn title(&self) -> String {
         match self.view_mode {
             ViewMode::Year => self.period_anchor().format("%Y").to_string(),
-            ViewMode::Month => self.period_anchor().format("%B %Y").to_string(),
+            ViewMode::Month => locale::month_title(self.period_anchor()),
             ViewMode::Week => {
                 let days = week_dates(self.current_date);
                 let (start, end) = (days[0], days[6]);
@@ -693,11 +694,59 @@ impl Ui {
             return;
         };
         if undo::needs_a_remote_create(&write, self.calendar_is_local(change.calendar_id)) {
-            self.discard(step);
-            self.toast("Calix can't put a synced event back on its calendar yet");
+            if let undo::Write::Insert { calendar_id, draft } = write {
+                self.restore_remote_event(step, calendar_id, draft);
+            }
             return;
         }
         self.apply_history_write(step, write, current);
+    }
+
+    fn restore_remote_event(
+        self: &Rc<Self>,
+        step: HistoryStep,
+        calendar_id: i64,
+        draft: EventDraft,
+    ) {
+        let Some(choice) = create_targets(self)
+            .into_iter()
+            .find(|choice| choice.target.calendar_id() == calendar_id)
+        else {
+            self.toast("That event's calendar is no longer available");
+            return;
+        };
+        if let event_dialog::CreateTarget::Unavailable { error, .. } = &choice.target {
+            self.toast(error);
+            return;
+        }
+        self.history_busy.set(true);
+        let ui_for_change = self.clone();
+        let ui = self.clone();
+        event_dialog::create_event_async(
+            self.store.clone(),
+            choice.target,
+            draft,
+            Rc::new(move |created| {
+                let mut history = ui_for_change.history.borrow_mut();
+                match step {
+                    HistoryStep::Undo => history.commit_undo(created.id),
+                    HistoryStep::Redo => history.commit_redo(created.id),
+                }
+            }),
+            move |outcome| {
+                ui.history_busy.set(false);
+                match outcome {
+                    Ok(saved) => ui.apply_saved(saved),
+                    Err((message, retryable)) => {
+                        if !retryable {
+                            ui.discard(step);
+                            ui.request_background_sync();
+                        }
+                        ui.toast(&message);
+                    }
+                }
+            },
+        );
     }
 
     /// Drops a change that can no longer be applied, so the next keypress
@@ -1267,7 +1316,7 @@ impl Ui {
         for button in [&prev, &next] {
             button.add_css_class("flat");
         }
-        let title = gtk::Label::new(Some(&anchor.format("%B %Y").to_string()));
+        let title = gtk::Label::new(Some(&locale::month_title(anchor)));
         title.add_css_class("heading");
         title.set_hexpand(true);
         title.set_xalign(0.0);
@@ -2758,6 +2807,12 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
                 token_key,
                 calendar_id,
                 event_id,
+                series_id: match ui.store.google_series_id(event.id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return Some(event_dialog::RemoteEvent::Unavailable(error.to_string()));
+                    }
+                },
             })
         }
         Some(provider @ ("icloud" | "caldav")) => {
@@ -3181,6 +3236,7 @@ fn moved_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     }
 }
@@ -3254,6 +3310,7 @@ fn resized_start_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     })
 }
@@ -3282,6 +3339,7 @@ fn resized_end_draft(
         notes: event.notes.clone(),
         recurrence: event.recurrence,
         reminder_minutes: event.reminder_minutes,
+        additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
     })
 }
@@ -5343,6 +5401,7 @@ mod tests {
             attendees: Vec::new(),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
         }
     }
 

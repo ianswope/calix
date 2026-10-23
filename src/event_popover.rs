@@ -526,6 +526,7 @@ mod tests {
             attendees: Vec::new(),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
         }
     }
 

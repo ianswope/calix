@@ -131,6 +131,7 @@ fn same_edit(a: &EventDraft, b: &EventDraft) -> bool {
         && a.notes == b.notes
         && a.recurrence == b.recurrence
         && a.reminder_minutes == b.reminder_minutes
+        && a.additional_reminders == b.additional_reminders
 }
 
 /// The database write that carries out one undo or redo step.
@@ -174,8 +175,23 @@ pub fn apply(store: &Store, write: &Write) -> rusqlite::Result<Option<i64>> {
     }
 }
 
+/// Caches a provider-confirmed creation, retaining its identity for later sync and redo.
+pub fn cache_remote_creation(
+    store: &Store,
+    calendar_id: i64,
+    draft: &EventDraft,
+    is_google: bool,
+    remote_id: &str,
+) -> rusqlite::Result<i64> {
+    if is_google {
+        store.upsert_google_event(calendar_id, remote_id, draft, &draft.attendees)
+    } else {
+        store.upsert_caldav_event(calendar_id, remote_id, draft, &draft.attendees)
+    }
+}
+
 /// Whether carrying out `write` would mean re-creating an event on a provider,
-/// which Calix cannot do yet.
+/// so it must go through the provider creation path before caching the row.
 ///
 /// Restoring a deleted event is the only step that can hit this: putting the row
 /// back in the local cache alone would leave it there until the next sync
@@ -264,6 +280,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
     }
@@ -300,6 +317,29 @@ mod tests {
             .id
             .and_then(|id| store.event_by_id(id).expect("the query to run"))
             .map(|event| event.draft())
+    }
+
+    #[test]
+    fn restoring_a_remote_event_keeps_its_provider_identity_for_redo_and_sync() {
+        for google in [true, false] {
+            let store = Store::open_in_memory().unwrap();
+            let written = draft("Dentist", 15);
+            let mut history = History::default();
+            history.record(Change::deleted(1, written.clone()));
+            let id = cache_remote_creation(&store, 1, &written, google, "restored-id").unwrap();
+            history.commit_undo(Some(id));
+            let restored = store.event_by_id(id).unwrap().unwrap();
+            let remote_id = if google {
+                &restored.google_event_id
+            } else {
+                &restored.icloud_event_id
+            };
+            assert_eq!(remote_id.as_deref(), Some("restored-id"));
+            assert_eq!(
+                history.peek_redo().unwrap().redo(Some(&restored.draft())),
+                Ok(Write::Delete { id })
+            );
+        }
     }
 
     #[test]

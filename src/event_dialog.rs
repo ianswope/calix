@@ -29,6 +29,7 @@ pub enum RemoteEvent {
         token_key: String,
         calendar_id: String,
         event_id: String,
+        series_id: Option<String>,
     },
     Caldav {
         base_url: String,
@@ -191,6 +192,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let token = google::oauth::get_access_token(config, token_key)
                     .map_err(|error| error.to_string())?
@@ -224,6 +226,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let access_token = google::oauth::get_access_token(config, token_key)
                     .map_err(|e| e.to_string())?
@@ -246,6 +249,13 @@ impl RemoteEvent {
     /// i.e. a case where "this event" vs "all events" is a meaningful choice.
     pub fn is_series_instance(&self) -> bool {
         matches!(self, Self::Caldav { event_href, .. } if event_href.contains('#'))
+            || matches!(
+                self,
+                Self::Google {
+                    series_id: Some(_),
+                    ..
+                }
+            )
     }
 
     /// Applies an edit to every occurrence of a series, moving the series by
@@ -256,6 +266,19 @@ impl RemoteEvent {
         shift: caldav::SeriesShift,
     ) -> Result<(), String> {
         match self {
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                series_id: Some(series_id),
+                ..
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Google account is not connected")?;
+                google::calendar_api::update_series(&token, calendar_id, series_id, shift, draft)
+            }
+
             Self::Caldav {
                 base_url,
                 username,
@@ -279,6 +302,7 @@ impl RemoteEvent {
                 token_key,
                 calendar_id,
                 event_id,
+                ..
             } => {
                 let access_token = google::oauth::get_access_token(config, token_key)
                     .map_err(|e| e.to_string())?
@@ -301,6 +325,19 @@ impl RemoteEvent {
     /// the one occurrence [`Self::delete`] would drop for a CalDAV instance.
     fn delete_all_events(&self) -> Result<(), String> {
         match self {
+            Self::Google {
+                config,
+                token_key,
+                calendar_id,
+                series_id: Some(series_id),
+                ..
+            } => {
+                let token = google::oauth::get_access_token(config, token_key)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Google account is not connected")?;
+                google::calendar_api::delete_event(&token, calendar_id, series_id)
+            }
+
             Self::Caldav {
                 base_url,
                 username,
@@ -424,21 +461,34 @@ pub(crate) fn build(
     // Frequency::picker_index / from_picker_index.
     let repeat_labels: Vec<&str> = std::iter::once("Does not repeat")
         .chain(Frequency::ALL.iter().map(|freq| freq.label()))
+        .chain(std::iter::once("Custom…"))
         .collect();
     let repeat_row = adw::ComboRow::builder()
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
-    // Alert choices in notify::ALERT_CHOICES order — matching
-    // notify::picker_index / from_picker_index.
-    let alert_labels: Vec<&str> = notify::ALERT_CHOICES
-        .iter()
-        .map(|(label, _)| *label)
-        .collect();
-    let alert_row = adw::ComboRow::builder()
-        .title("Alert")
-        .model(&gtk::StringList::new(&alert_labels))
+    let custom_repeat = crate::recurrence_picker::CustomRepeat::new();
+    custom_repeat.row.set_visible(false);
+    let custom_row = custom_repeat.row.clone();
+    let alert_row = adw::ExpanderRow::builder()
+        .title("Alerts")
+        .subtitle("Choose one or more reminders")
         .build();
+    let alert_buttons: Vec<(i64, gtk::CheckButton)> = notify::ALERT_CHOICES
+        .iter()
+        .filter_map(|(label, minutes)| {
+            minutes.map(|minutes| {
+                let button = gtk::CheckButton::new();
+                let row = adw::ActionRow::builder()
+                    .title(*label)
+                    .activatable_widget(&button)
+                    .build();
+                row.add_suffix(&button);
+                alert_row.add_row(&row);
+                (minutes, button)
+            })
+        })
+        .collect();
     // Shown only when editing one occurrence of a series: governs whether Save
     // and Delete affect just this occurrence or the whole series (0 = this, 1
     // = all).
@@ -453,6 +503,16 @@ pub(crate) fn build(
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
+    repeat_row.connect_selected_notify(clone!(
+        #[weak]
+        custom_row,
+        #[weak]
+        error_label,
+        move |repeat| {
+            custom_row.set_visible(repeat.selected() == Frequency::CUSTOM_PICKER_INDEX);
+            error_label.set_label("");
+        }
+    ));
     let calendar_name = editing
         .as_ref()
         .map(|event| event.calendar_name.clone())
@@ -514,11 +574,18 @@ pub(crate) fn build(
             set_time_rows(&start_row, &end_row, event.start, event.end, event.all_day);
             location_row.set_text(event.location.as_deref().unwrap_or(""));
             notes.set_text(event.notes.as_deref().unwrap_or(""));
-            // The repeat row is hidden while editing, but keeping it in sync
-            // means the save handler reads back the event's existing rule
-            // unchanged instead of clearing it.
+            // Selecting the stored rule keeps Save from clearing it. A custom
+            // rule also fills the controls the row reveals.
             repeat_row.set_selected(Frequency::picker_index(event.recurrence));
-            alert_row.set_selected(notify::picker_index(event.reminder_minutes));
+            if let Some(Frequency::Custom(rule)) = event.recurrence {
+                custom_repeat.set_rule(rule);
+            }
+            for (minutes, button) in &alert_buttons {
+                button.set_active(
+                    event.reminder_minutes == Some(*minutes)
+                        || event.additional_reminders.contains(minutes),
+                );
+            }
         }
         None => {
             set_time_rows(
@@ -554,10 +621,11 @@ pub(crate) fn build(
     group.add(&all_day_row);
     group.add(&start_row);
     group.add(&end_row);
-    // Authoring a recurrence is create-only for now; editing an existing
-    // series (or a synced expanded instance) is a separate feature.
-    if editing.is_none() {
+    // A local event, new or already saved, can set its own repeat. A synced
+    // event keeps the rule its provider expanded, so the row stays off it.
+    if remote_event.is_none() {
         group.add(&repeat_row);
+        group.add(&custom_repeat.row);
     }
     if editing_series_instance {
         group.add(&scope_row);
@@ -727,6 +795,18 @@ pub(crate) fn build(
                 return;
             }
 
+            let recurrence = if repeat_row.selected() == Frequency::CUSTOM_PICKER_INDEX {
+                match custom_repeat.value() {
+                    Ok(rule) => Some(rule),
+                    Err(message) => {
+                        error_label.set_label(message);
+                        return;
+                    }
+                }
+            } else {
+                Frequency::from_picker_index(repeat_row.selected())
+            };
+            let mut reminders = alert_buttons.iter().filter(|(_, button)| button.is_active()).map(|(minutes, _)| *minutes);
             let draft = EventDraft {
                 title,
                 start,
@@ -734,8 +814,9 @@ pub(crate) fn build(
                 all_day,
                 location: non_empty(location_row.text().to_string()),
                 notes: non_empty(notes.text()),
-                recurrence: Frequency::from_picker_index(repeat_row.selected()),
-                reminder_minutes: notify::from_picker_index(alert_row.selected()),
+                recurrence,
+                reminder_minutes: reminders.next(),
+                additional_reminders: reminders.collect(),
                 attendees: match editing.as_ref() {
                     Some(event) => event.attendees.clone(),
                     None => match parse_invitees(&invitees_row.text()) {
@@ -1272,18 +1353,13 @@ pub(crate) fn create_event_async(
             glib::ControlFlow::Break
         }
         Ok(Ok(Some((is_google, remote_id)))) => {
-            // A just-created event has no invitees — Calix has no flow for
-            // sending invites.
-            let result = if is_google {
-                store.upsert_google_event(
-                    target.calendar_id(),
-                    &remote_id,
-                    &draft,
-                    &draft.attendees,
-                )
-            } else {
-                store.upsert_caldav_event(target.calendar_id(), &remote_id, &draft, &[])
-            };
+            let result = undo::cache_remote_creation(
+                &store,
+                target.calendar_id(),
+                &draft,
+                is_google,
+                &remote_id,
+            );
             match result {
                 Ok(id) => {
                     // A repeat is a series operation: the cached row is one

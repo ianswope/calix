@@ -294,6 +294,89 @@ pub fn update_event(
     )
 }
 
+/// Edits the master rather than re-anchoring it on the clicked occurrence.
+pub fn update_series(
+    access_token: &str,
+    calendar_id: &str,
+    series_id: &str,
+    shift: crate::caldav::SeriesShift,
+    draft: &crate::store::EventDraft,
+) -> Result<(), String> {
+    let url = event_url_notifying(calendar_id, series_id)?;
+    let master: serde_json::Value =
+        serde_json::from_str(&get(access_token, url.as_str())?).map_err(|e| e.to_string())?;
+    let patch = series_patch(&master, shift, draft)?;
+    let mut request = crate::http::client()?
+        .patch(url)
+        .bearer_auth(access_token)
+        .header("Content-Type", "application/json")
+        .body(patch.to_string());
+    if let Some(etag) = master["etag"].as_str() {
+        request = request.header("If-Match", etag);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Google API error ({status}): {}",
+            response.text().map_err(|e| e.to_string())?
+        ));
+    }
+    Ok(())
+}
+
+fn series_patch(
+    master: &serde_json::Value,
+    shift: crate::caldav::SeriesShift,
+    draft: &crate::store::EventDraft,
+) -> Result<serde_json::Value, String> {
+    let mut patch = serde_json::to_value(GoogleEventPatch::from_draft(draft, false))
+        .map_err(|e| e.to_string())?;
+    // An expanded occurrence has no rule of its own. Preserve even rules Calix
+    // cannot author, along with the master's exception dates and invitees.
+    patch.as_object_mut().unwrap().remove("recurrence");
+    let start: EventDateTime =
+        serde_json::from_value(master["start"].clone()).map_err(|e| e.to_string())?;
+    if let Some(date) = start.date {
+        if !draft.all_day {
+            return Err(
+                "Change the series time type in Google Calendar before editing it here".into(),
+            );
+        }
+        let day = NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|e| e.to_string())?
+            + chrono::Duration::days(shift.wall_clock.num_days());
+        let span = (draft.end.date_naive() - draft.start.date_naive())
+            .num_days()
+            .max(1);
+        patch["start"] = serde_json::json!({"date": day.to_string()});
+        patch["end"] =
+            serde_json::json!({"date": (day + chrono::Duration::days(span)).to_string()});
+    } else {
+        if draft.all_day {
+            return Err(
+                "Change the series time type in Google Calendar before editing it here".into(),
+            );
+        }
+        let zone_name = start
+            .time_zone
+            .as_deref()
+            .ok_or("Google series has no time zone")?;
+        let zone = zone_name
+            .parse::<chrono_tz::Tz>()
+            .map_err(|e| e.to_string())?;
+        let (instant, _) = start
+            .to_local()
+            .ok_or("Google series has no readable start")?;
+        let shifted = instant.with_timezone(&zone).naive_local() + shift.wall_clock;
+        let instant = crate::date_util::resolve_forward(&zone, shifted);
+        let end = instant + (draft.end - draft.start);
+        patch["start"] =
+            serde_json::json!({"dateTime": instant.to_rfc3339(), "timeZone": zone_name});
+        patch["end"] = serde_json::json!({"dateTime": end.to_rfc3339(), "timeZone": zone_name});
+    }
+    Ok(patch)
+}
+
 /// Changes only the signed-in user's reply while preserving every invitee.
 pub fn respond_to_event(
     access_token: &str,
@@ -442,9 +525,12 @@ impl GoogleEventPatch {
             description: draft.notes.clone(),
             start: GoogleEventDateTime::from_start(draft),
             end: GoogleEventDateTime::from_end(draft),
-            recurrence: draft
-                .recurrence
-                .map(|freq| vec![format!("RRULE:{}", freq.to_rrule())]),
+            recurrence: draft.recurrence.map(|freq| {
+                vec![format!(
+                    "RRULE:{}",
+                    freq.to_provider_rrule(draft.all_day, &draft.start)
+                )]
+            }),
             attendees: draft
                 .attendees
                 .iter()
@@ -503,6 +589,70 @@ fn date_string(date: DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn series_fixture() -> (serde_json::Value, crate::store::EventDraft) {
+        let master = serde_json::json!({
+            "start": {"dateTime": "2026-03-01T09:00:00-05:00", "timeZone": "America/New_York"},
+            "end": {"dateTime": "2026-03-01T10:00:00-05:00", "timeZone": "America/New_York"},
+            "recurrence": ["RRULE:FREQ=WEEKLY;COUNT=20"]
+        });
+        let start = DateTime::parse_from_rfc3339("2026-03-15T10:00:00-04:00")
+            .unwrap()
+            .with_timezone(&Local);
+        (
+            master,
+            crate::store::EventDraft {
+                title: "Moved".into(),
+                start,
+                end: start + chrono::Duration::hours(2),
+                all_day: false,
+                location: None,
+                notes: None,
+                recurrence: None,
+                reminder_minutes: None,
+                additional_reminders: Vec::new(),
+                attendees: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn editing_a_google_series_shifts_the_master_in_its_zone_and_keeps_its_rule() {
+        let (master, draft) = series_fixture();
+        let shift = crate::caldav::SeriesShift::between(
+            draft.start - chrono::Duration::hours(1),
+            draft.start,
+        );
+        let patch = series_patch(&master, shift, &draft).unwrap();
+        assert_eq!(patch["start"]["dateTime"], "2026-03-01T10:00:00-05:00");
+        assert_eq!(patch["end"]["dateTime"], "2026-03-01T12:00:00-05:00");
+        assert_eq!(patch["start"]["timeZone"], "America/New_York");
+        assert!(
+            patch.get("recurrence").is_none(),
+            "PATCH must preserve the provider's rule"
+        );
+    }
+
+    #[test]
+    fn an_all_day_google_series_moves_by_civil_days_across_dst() {
+        let (mut master, mut draft) = series_fixture();
+        master["start"] = serde_json::json!({"date": "2026-03-01"});
+        master["end"] = serde_json::json!({"date": "2026-03-02"});
+        let zone = chrono_tz::America::New_York;
+        let from = zone.with_ymd_and_hms(2026, 3, 8, 0, 0, 0).unwrap();
+        let to = zone.with_ymd_and_hms(2026, 3, 9, 0, 0, 0).unwrap();
+        draft.all_day = true;
+        draft.start = to.with_timezone(&Local);
+        draft.end = (to + chrono::Duration::days(2)).with_timezone(&Local);
+        let patch = series_patch(
+            &master,
+            crate::caldav::SeriesShift::between(from, to),
+            &draft,
+        )
+        .unwrap();
+        assert_eq!(patch["start"]["date"], "2026-03-02");
+        assert_eq!(patch["end"]["date"], "2026-03-04");
+    }
 
     #[test]
     fn invitees_normalize_statuses_and_drop_non_people() {
@@ -618,6 +768,7 @@ mod tests {
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -639,11 +790,26 @@ mod tests {
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
         assert_eq!(json["recurrence"], serde_json::json!(["RRULE:FREQ=WEEKLY"]));
+
+        // A stop date on a timed event is a UTC instant, not the stored date.
+        let until =
+            crate::recurrence::Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20260731")
+                .unwrap();
+        draft.recurrence = Some(until);
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
+        assert_eq!(
+            json["recurrence"],
+            serde_json::json!([format!(
+                "RRULE:{}",
+                until.to_provider_rrule(draft.all_day, &draft.start)
+            )])
+        );
 
         // A one-off event omits the field so its payload is unchanged.
         draft.recurrence = None;

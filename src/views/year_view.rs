@@ -4,16 +4,13 @@
 //! the sidebar wants exactly this widget for date-jumping — building it once
 //! here means the two can't drift into looking like different products.
 
-use crate::date_util::{month_grid, year_months};
+use crate::date_util::{first_weekday, month_grid, weekdays_from, year_months};
+use crate::locale;
 use crate::store::Event;
 use crate::views::event_occurs_on_day;
 use chrono::{Datelike, Local, NaiveDate};
 use gtk::prelude::*;
 use std::rc::Rc;
-
-/// Weekday initials above each thumbnail, starting on the same day
-/// `week_start` uses.
-const WEEKDAY_INITIALS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
 
 /// One cell of a month thumbnail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +58,13 @@ pub fn build(anchor: NaiveDate, events: &[Event], on_pick: Rc<dyn Fn(NaiveDate)>
 
     let today = Local::now().date_naive();
     for (index, month) in year_months(anchor).into_iter().enumerate() {
-        let thumbnail = month_thumbnail(month, events, today, on_pick.clone());
-        grid.attach(&thumbnail, index as i32 % 4, index as i32 / 4, 1, 1);
+        let cell = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let name = gtk::Label::new(Some(&locale::month_name(month)));
+        name.add_css_class("heading");
+        name.set_xalign(0.0);
+        cell.append(&name);
+        cell.append(&month_thumbnail(month, events, today, on_pick.clone()));
+        grid.attach(&cell, index as i32 % 4, index as i32 / 4, 1, 1);
     }
 
     let scrolled = gtk::ScrolledWindow::builder()
@@ -74,7 +76,8 @@ pub fn build(anchor: NaiveDate, events: &[Event], on_pick: Rc<dyn Fn(NaiveDate)>
     scrolled.upcast()
 }
 
-/// One month as a compact, clickable day grid.
+/// One month as a compact, clickable day grid, without a title: the year view
+/// labels each month, and the sidebar mini month has its own header.
 pub(crate) fn month_thumbnail(
     month: NaiveDate,
     events: &[Event],
@@ -84,17 +87,12 @@ pub(crate) fn month_thumbnail(
     let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
     column.add_css_class("year-month");
 
-    let name = gtk::Label::new(Some(&month.format("%B").to_string()));
-    name.add_css_class("heading");
-    name.set_xalign(0.0);
-    column.append(&name);
-
     let days = gtk::Grid::new();
     days.set_row_homogeneous(true);
     days.set_column_homogeneous(true);
 
-    for (index, initial) in WEEKDAY_INITIALS.iter().enumerate() {
-        let label = gtk::Label::new(Some(initial));
+    for (index, day) in weekdays_from(first_weekday()).into_iter().enumerate() {
+        let label = gtk::Label::new(Some(&locale::weekday_initial(day)));
         label.add_css_class("caption");
         label.add_css_class("dim-label");
         days.attach(&label, index as i32, 0, 1, 1);
@@ -173,6 +171,7 @@ mod tests {
             attendees: Vec::new(),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
         }
     }
 

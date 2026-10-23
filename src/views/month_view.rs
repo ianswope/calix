@@ -1,4 +1,5 @@
-use crate::date_util::month_grid;
+use crate::date_util::{first_weekday, month_grid, weekdays_from};
+use crate::locale;
 use crate::store::Event;
 use crate::views::{
     MoveFn, PageActions, Slot, SlotGrain, add_slot_menu, drag::parse_drag_payload,
@@ -7,7 +8,6 @@ use crate::views::{
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use gtk::prelude::*;
 
-const WEEKDAY_LABELS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MAX_CHIPS_PER_CELL: usize = 3;
 
 /// Builds a full month-grid page (weekday header + 6x7 day cells) anchored
@@ -23,8 +23,8 @@ pub fn build(anchor: NaiveDate, events: &[Event], actions: PageActions) -> gtk::
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     header.set_homogeneous(true);
     header.set_hexpand(true);
-    for label in WEEKDAY_LABELS {
-        let weekday_label = gtk::Label::new(Some(label));
+    for day in weekdays_from(first_weekday()) {
+        let weekday_label = gtk::Label::new(Some(&locale::weekday_abbreviation(day)));
         weekday_label.add_css_class("caption-heading");
         weekday_label.add_css_class("dim-label");
         weekday_label.add_css_class("month-weekday");

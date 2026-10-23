@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Events can repeat on a custom interval, on chosen weekdays, for a set number of times, or until a date.
+- Events can have several reminders, selected individually in the event dialog.
+- Weekday and month names follow the system locale.
+- Google recurring events offer This event and All events for edits and deletes.
+- Undo can recreate deleted events on synced calendars and retain their new provider identities.
+
+### Changed
+
+- Weeks begin on the system locale's first weekday.
+- Event notes use a multiline editor.
+- Calendar screenshots include month, week and year views.
+
+### Fixed
+
+- Primary and destructive buttons keep readable fills on light accents.
+- Accent text uses the higher-contrast choice of black or white.
+- The sidebar mini month no longer repeats its month title.
+
+### Security
+
+- Updated rustls to 0.23.46 for GHSA-2mjx-qc3c-rqvc.
+
 ## 0.8.0 — 2026-10-21
 
 Events follow the pointer when you drag them: into the next day, up into the

@@ -376,7 +376,7 @@ fn reply_to_invitation(ics: &str, attendee_email: &str, partstat: &str) -> Resul
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeriesShift {
     exact: chrono::Duration,
-    wall_clock: chrono::Duration,
+    pub(crate) wall_clock: chrono::Duration,
 }
 
 impl SeriesShift {
@@ -956,6 +956,7 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
             // arrives as its own one-off VEVENT without an RRULE.
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: attendees.clone(),
         },
         attendees,
@@ -1656,7 +1657,10 @@ fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
         format!("{end_key}:{end_value}"),
     ];
     if let Some(freq) = draft.recurrence {
-        lines.push(format!("RRULE:{}", freq.to_rrule()));
+        lines.push(format!(
+            "RRULE:{}",
+            freq.to_provider_rrule(draft.all_day, &draft.start)
+        ));
     }
     if let Some(location) = &draft.location {
         lines.push(format!("LOCATION:{}", escape_ics_text(location)));
@@ -2629,6 +2633,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2660,6 +2665,7 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2718,6 +2724,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2746,6 +2753,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2779,6 +2787,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
@@ -2802,11 +2811,19 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: Some(crate::recurrence::Frequency::Weekly),
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
         let ics = new_event_ics("uid-1", &draft);
         assert!(ics.contains("RRULE:FREQ=WEEKLY"));
+
+        let until =
+            crate::recurrence::Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20260731")
+                .unwrap();
+        draft.recurrence = Some(until);
+        let ics = new_event_ics("uid-1", &draft);
+        assert!(ics.contains(&until.to_provider_rrule(draft.all_day, &draft.start)));
 
         draft.recurrence = None;
         let ics = new_event_ics("uid-1", &draft);
@@ -2858,6 +2875,7 @@ END:VCALENDAR"#;
             notes: None,
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         }
     }
@@ -3022,6 +3040,7 @@ END:VCALENDAR"#;
             notes: Some("New agenda".to_string()),
             recurrence: None,
             reminder_minutes: None,
+            additional_reminders: Vec::new(),
             attendees: Vec::new(),
         };
 
