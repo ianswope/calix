@@ -69,6 +69,17 @@ silently failing.
   </picture>
 </details>
 
+These screenshots were captured from the 0.7.0 development source on Omarchy, using fictional local calendars. They do not demonstrate the later 0.8.0 drag-and-drop changes.
+
+<details>
+  <summary><strong>See the year view</strong></summary>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/year-dark.png">
+    <img alt="Calix year view" src="docs/screenshots/year.png">
+  </picture>
+</details>
+
 See [what changed in Calix 0.8.0](CHANGELOG.md).
 
 ## Install (recommended)
