@@ -416,7 +416,7 @@ pub(crate) fn build(
     // Suggestions from this calendar's own locations and, unless it is switched
     // off, a geocoder — see `location_completion`.
     crate::location_completion::attach(&location_row, store.clone());
-    let notes_row = adw::EntryRow::builder().title("Notes").build();
+    let notes = NotesField::new();
     let invitees_row = adw::EntryRow::builder()
         .title("Invitees (email addresses, comma separated)")
         .build();
@@ -513,7 +513,7 @@ pub(crate) fn build(
             all_day_row.set_active(event.all_day);
             set_time_rows(&start_row, &end_row, event.start, event.end, event.all_day);
             location_row.set_text(event.location.as_deref().unwrap_or(""));
-            notes_row.set_text(event.notes.as_deref().unwrap_or(""));
+            notes.set_text(event.notes.as_deref().unwrap_or(""));
             // The repeat row is hidden while editing, but keeping it in sync
             // means the save handler reads back the event's existing rule
             // unchanged instead of clearing it.
@@ -564,7 +564,7 @@ pub(crate) fn build(
     }
     group.add(&alert_row);
     group.add(&location_row);
-    group.add(&notes_row);
+    group.add(notes.widget());
     if editing.is_none() {
         group.add(&invitees_row);
     }
@@ -733,7 +733,7 @@ pub(crate) fn build(
                 end,
                 all_day,
                 location: non_empty(location_row.text().to_string()),
-                notes: non_empty(notes_row.text().to_string()),
+                notes: non_empty(notes.text()),
                 recurrence: Frequency::from_picker_index(repeat_row.selected()),
                 reminder_minutes: notify::from_picker_index(alert_row.selected()),
                 attendees: match editing.as_ref() {
@@ -981,6 +981,61 @@ fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {
         NaiveDateTime::parse_from_str(text, DATETIME_FORMAT).ok()
     }?;
     naive.and_local_timezone(Local).single()
+}
+
+/// The dialog's notes field: a caption over a multi-line text box that grows
+/// with what it holds. Invites carry whole paragraphs and links, which a
+/// one-line entry ran together into a single strip that had to be scrolled
+/// sideways to read. It has no scroller of its own: the dialog body already
+/// scrolls, and a scroller inside a scroller sized itself to its minimum.
+pub(crate) struct NotesField {
+    row: adw::PreferencesRow,
+    buffer: gtk::TextBuffer,
+}
+
+const NOTES_MIN_HEIGHT: i32 = 72;
+
+impl NotesField {
+    pub(crate) fn new() -> Self {
+        let caption = gtk::Label::new(Some("Notes"));
+        caption.add_css_class("caption");
+        caption.add_css_class("dim-label");
+        caption.set_xalign(0.0);
+
+        let view = gtk::TextView::new();
+        view.set_wrap_mode(gtk::WrapMode::WordChar);
+        // Tab moves on to the next field, as it does from every other row.
+        view.set_accepts_tab(false);
+        view.add_css_class("inline");
+        view.set_size_request(-1, NOTES_MIN_HEIGHT);
+        let buffer = view.buffer();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.append(&caption);
+        content.append(&view);
+
+        let row = adw::PreferencesRow::builder().title("Notes").build();
+        row.set_activatable(false);
+        row.set_child(Some(&content));
+        Self { row, buffer }
+    }
+
+    pub(crate) fn widget(&self) -> &gtk::Widget {
+        self.row.upcast_ref()
+    }
+
+    pub(crate) fn set_text(&self, text: &str) {
+        self.buffer.set_text(text);
+    }
+
+    pub(crate) fn text(&self) -> String {
+        let (start, end) = self.buffer.bounds();
+        self.buffer.text(&start, &end, false).to_string()
+    }
 }
 
 fn non_empty(value: String) -> Option<String> {

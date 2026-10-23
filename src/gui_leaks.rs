@@ -413,6 +413,23 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         "long notes must scroll, not stretch the inspector to {natural_height}px"
     );
 
+    // The edit dialog's notes are edited where they can be read: an invite's
+    // lines on lines, not run together in a one-line entry.
+    let notes = event_dialog::NotesField::new();
+    let one_line = notes.widget().measure(gtk::Orientation::Vertical, 400).1;
+    let invite =
+        "Microsoft Teams meeting\nJoin: https://teams.microsoft.com/meet/1\n\nPasscode: x\n"
+            .repeat(3);
+    notes.set_text(&invite);
+    assert_eq!(notes.text(), invite, "notes must come back exactly as set");
+    // A text view lays its lines out from the main loop, not on set_text.
+    drain();
+    let (_, natural_height, ..) = notes.widget().measure(gtk::Orientation::Vertical, 400);
+    assert!(
+        natural_height > one_line,
+        "a dozen lines of notes must be taller than one ({natural_height}px vs {one_line}px)"
+    );
+
     let mut leaks = Vec::new();
     for (name, build) in scenarios {
         let alive = survivors(build);
