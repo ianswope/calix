@@ -4,6 +4,7 @@
 
 ### Added
 
+- Events can repeat on a custom interval, on chosen weekdays, for a set number of times, or until a date.
 - Events can have several reminders, selected individually in the event dialog.
 - Weekday and month names follow the system locale.
 - Google recurring events offer This event and All events for edits and deletes.
