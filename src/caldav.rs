@@ -402,7 +402,7 @@ pub fn update_series(
     event_href: &str,
     shift: SeriesShift,
     draft: &EventDraft,
-) -> Result<(), String> {
+) -> Result<(String, String), String> {
     let resource_href = event_href
         .split_once('#')
         .map_or(event_href, |(href, _)| href);
@@ -410,14 +410,14 @@ pub fn update_series(
     let (existing_ics, etag) = fetch_event(credentials, &url)?;
     let ics = edit_master_series(&existing_ics, shift, draft)?;
     put_event(credentials, &url, &ics, etag.as_deref())?;
-    Ok(())
+    Ok((existing_ics, ics))
 }
 
 pub fn create_event(
     credentials: &Credentials,
     calendar_href: &str,
     draft: &EventDraft,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let uid = format!(
         "calix-{}-{}",
         chrono::Utc::now().timestamp_micros(),
@@ -431,10 +431,40 @@ pub fn create_event(
         &ics,
         None,
     )?;
-    Ok(event_href)
+    Ok((event_href, ics))
+}
+
+/// The iCalendar resource at `href`, or `None` when the server no longer has it.
+pub fn read_resource(credentials: &Credentials, href: &str) -> Result<Option<String>, String> {
+    let url = absolute_url(&credentials.base_url, href)?;
+    Ok(fetch_event_if_present(credentials, &url)?.map(|(body, _)| body))
+}
+
+/// Removes a whole resource and returns the iCalendar it held, overrides included.
+pub fn delete_resource(credentials: &Credentials, href: &str) -> Result<String, String> {
+    let url = absolute_url(&credentials.base_url, href)?;
+    let (ics, etag) = fetch_event(credentials, &url)?;
+    delete_url(credentials, &url, etag.as_deref())?;
+    Ok(ics)
+}
+
+/// Writes `ics` back to `href`, matching the current etag when the resource
+/// is still there and creating it when it is not.
+pub fn write_resource(credentials: &Credentials, href: &str, ics: &str) -> Result<(), String> {
+    let url = absolute_url(&credentials.base_url, href)?;
+    let etag = fetch_event_if_present(credentials, &url)?.and_then(|(_, etag)| etag);
+    put_event(credentials, &url, ics, etag.as_deref())
 }
 
 fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<String>), String> {
+    fetch_event_if_present(credentials, url)?
+        .ok_or_else(|| "CalDAV error (404): event not found".to_string())
+}
+
+fn fetch_event_if_present(
+    credentials: &Credentials,
+    url: &str,
+) -> Result<Option<(String, Option<String>)>, String> {
     let client = crate::http::client()?;
     let response = client
         .get(url)
@@ -448,10 +478,30 @@ fn fetch_event(credentials: &Credentials, url: &str) -> Result<(String, Option<S
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let body = response.text().map_err(|e| e.to_string())?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
     if !status.is_success() {
         return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
     }
-    Ok((body, etag))
+    Ok(Some((body, etag)))
+}
+
+fn delete_url(credentials: &Credentials, url: &str, etag: Option<&str>) -> Result<(), String> {
+    let client = crate::http::client()?;
+    let mut request = client
+        .delete(url)
+        .basic_auth(&credentials.username, Some(&credentials.password));
+    if let Some(etag) = etag {
+        request = request.header("If-Match", etag);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
+    }
+    Ok(())
 }
 
 fn put_event(
@@ -490,20 +540,7 @@ pub fn delete_event(credentials: &Credentials, event_href: &str) -> Result<(), S
     }
     let url = absolute_url(&credentials.base_url, event_href)?;
     let (_, etag) = fetch_event(credentials, &url)?;
-    let client = crate::http::client()?;
-    let mut request = client
-        .delete(&url)
-        .basic_auth(&credentials.username, Some(&credentials.password));
-    if let Some(etag) = etag.as_deref() {
-        request = request.header("If-Match", etag);
-    }
-    let response = request.send().map_err(|e| e.to_string())?;
-    let status = response.status();
-    let body = response.text().map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(http_error(status.as_u16(), &body, is_icloud(credentials)));
-    }
-    Ok(())
+    delete_url(credentials, &url, etag.as_deref())
 }
 
 fn current_user_principal(credentials: &Credentials) -> Result<String, String> {
@@ -2918,6 +2955,30 @@ END:VCALENDAR"#;
         assert!(updated.contains("SUMMARY:Moved one"));
         assert!(updated.contains("DTSTART;TZID=America/New_York:20260708T100000"));
         assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+    }
+
+    #[test]
+    fn an_all_events_edit_undoes_back_to_the_override_it_left_in_place() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260701T090000\r\nDTEND;TZID=America/New_York:20260701T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID;TZID=America/New_York:20260708T090000\r\nSUMMARY:Moved one\r\nDTSTART;TZID=America/New_York:20260708T100000\r\nDTEND;TZID=America/New_York:20260708T103000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let updated = edit_master_series(ics, shift_of_hours(1), &series_draft("Renamed")).unwrap();
+        let change = crate::undo::SeriesChange::edited(
+            crate::undo::SeriesDocument::ics(ics),
+            crate::undo::SeriesDocument::ics(&updated),
+        );
+
+        let restored = change
+            .undo(Some(&crate::undo::SeriesDocument::ics(&updated)))
+            .unwrap();
+        let crate::undo::SeriesWrite::RestoreMaster(document) = restored else {
+            panic!("undo should put the master back");
+        };
+        assert!(document.master.contains("SUMMARY:Standup"));
+        assert!(document.master.contains("SUMMARY:Moved one"));
+        assert!(
+            document
+                .master
+                .contains("RECURRENCE-ID;TZID=America/New_York:20260708T090000")
+        );
     }
 
     /// One day forward in New York, starting `day` March 2026 at `hour`, chosen
