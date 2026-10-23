@@ -49,11 +49,22 @@ button:hover {
     background-color: alpha(@window_fg_color, 0.08);
 }
 
+/* Pressed and checked buttons invert. Primary and destructive actions stay
+   filled at rest too: libadwaita colours their label for the fill, and on the
+   transparent ground above that label is unreadable once the accent or the red
+   is light. */
 button:active,
-button:checked {
+button:checked,
+button.suggested-action {
     background-color: @accent_bg_color;
     color: @accent_fg_color;
     border-color: @accent_bg_color;
+}
+
+button.destructive-action {
+    background-color: @destructive_bg_color;
+    color: @destructive_fg_color;
+    border-color: @destructive_bg_color;
 }
 
 /* Flat buttons carry no border at all until pointed at — used for the grid's

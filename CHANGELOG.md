@@ -40,6 +40,11 @@ sync failure is announced once, with a button that opens Accounts.
 
 ### Fixed
 
+- Primary and destructive buttons — **Connect an account**, **Save and sign
+  in**, **Edit**, **Delete Event** — are readable on a light accent. The
+  terminal styling cleared their fill but kept the label coloured for it, so on
+  a theme like Everforest the label sat dark on the dark window. They are
+  filled again, the primary ones in the same inverse video as a pressed button.
 - Launching Calix while it is already running in the background no longer
   leaves a second, windowless `calix` process behind. The launcher forwarded
   its command line to the running instance and presented the window, but then
