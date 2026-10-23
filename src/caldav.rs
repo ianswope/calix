@@ -1657,7 +1657,10 @@ fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
         format!("{end_key}:{end_value}"),
     ];
     if let Some(freq) = draft.recurrence {
-        lines.push(format!("RRULE:{}", freq.to_rrule()));
+        lines.push(format!(
+            "RRULE:{}",
+            freq.to_provider_rrule(draft.all_day, &draft.start)
+        ));
     }
     if let Some(location) = &draft.location {
         lines.push(format!("LOCATION:{}", escape_ics_text(location)));
@@ -2814,6 +2817,13 @@ END:VCALENDAR"#;
 
         let ics = new_event_ics("uid-1", &draft);
         assert!(ics.contains("RRULE:FREQ=WEEKLY"));
+
+        let until =
+            crate::recurrence::Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20260731")
+                .unwrap();
+        draft.recurrence = Some(until);
+        let ics = new_event_ics("uid-1", &draft);
+        assert!(ics.contains(&until.to_provider_rrule(draft.all_day, &draft.start)));
 
         draft.recurrence = None;
         let ics = new_event_ics("uid-1", &draft);

@@ -525,9 +525,12 @@ impl GoogleEventPatch {
             description: draft.notes.clone(),
             start: GoogleEventDateTime::from_start(draft),
             end: GoogleEventDateTime::from_end(draft),
-            recurrence: draft
-                .recurrence
-                .map(|freq| vec![format!("RRULE:{}", freq.to_rrule())]),
+            recurrence: draft.recurrence.map(|freq| {
+                vec![format!(
+                    "RRULE:{}",
+                    freq.to_provider_rrule(draft.all_day, &draft.start)
+                )]
+            }),
             attendees: draft
                 .attendees
                 .iter()
@@ -793,6 +796,20 @@ mod tests {
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
         assert_eq!(json["recurrence"], serde_json::json!(["RRULE:FREQ=WEEKLY"]));
+
+        // A stop date on a timed event is a UTC instant, not the stored date.
+        let until =
+            crate::recurrence::Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20260731")
+                .unwrap();
+        draft.recurrence = Some(until);
+        let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
+        assert_eq!(
+            json["recurrence"],
+            serde_json::json!([format!(
+                "RRULE:{}",
+                until.to_provider_rrule(draft.all_day, &draft.start)
+            )])
+        );
 
         // A one-off event omits the field so its payload is unchanged.
         draft.recurrence = None;

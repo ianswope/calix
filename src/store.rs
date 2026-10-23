@@ -2366,6 +2366,36 @@ mod tests {
     }
 
     #[test]
+    fn a_fortnightly_local_event_round_trips_and_lands_on_its_weeks() {
+        let store = Store::open_in_memory().unwrap();
+        // 2026-07-07 is a Tuesday.
+        let base = Local
+            .with_ymd_and_hms(2026, 7, 7, 9, 0, 0)
+            .single()
+            .unwrap();
+        let fortnightly = Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2").unwrap();
+        let mut draft = draft("Planning", base, base + Duration::hours(1));
+        draft.recurrence = Some(fortnightly);
+        store
+            .create_event(store.default_calendar_id(), &draft)
+            .unwrap();
+
+        let range_start = Local
+            .with_ymd_and_hms(2026, 7, 21, 0, 0, 0)
+            .single()
+            .unwrap();
+        let events = store
+            .events_between(range_start, range_start + Duration::days(1))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recurrence, Some(fortnightly));
+        assert_eq!(
+            events[0].start.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 7, 21).unwrap()
+        );
+    }
+
+    #[test]
     fn a_weekly_local_event_expands_into_weeks_beyond_the_masters_own() {
         let store = Store::open_in_memory().unwrap();
         // 2026-07-02 is a Thursday.

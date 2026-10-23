@@ -41,6 +41,8 @@ mod locale;
 #[cfg(feature = "gui")]
 mod location_completion;
 #[cfg(feature = "gui")]
+mod recurrence_picker;
+#[cfg(feature = "gui")]
 mod search;
 #[cfg(feature = "gui")]
 mod style;

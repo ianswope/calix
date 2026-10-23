@@ -19,6 +19,8 @@
 //!
 //! One test function rather than one per scenario, because GTK refuses to be
 //! initialized from a second thread and the harness gives every test its own.
+//! That same function drives the new-event dialog: a second test could not
+//! initialize GTK again.
 
 use crate::event_dialog::{self, CreateTarget, RemoteEvent, TargetChoice};
 use crate::store::{Attendee, Event, Store};
@@ -26,9 +28,9 @@ use crate::views::{
     EventSelection, PageActions, PasteAction, SlotSelection, month_view, week_view, year_view,
 };
 use crate::{event_popover, location_completion, search};
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use adw::prelude::*;
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Weekday};
 use gtk::glib;
-use gtk::prelude::*;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -44,6 +46,20 @@ fn watch(root: &gtk::Widget) -> Vec<(String, glib::WeakRef<gtk::Widget>)> {
     while let Some(widget) = child {
         watched.extend(watch(&widget));
         child = widget.next_sibling();
+    }
+    // AdwDialog keeps its content in the child property, and that widget is
+    // not a GTK child until the dialog is presented. Without this, the leak
+    // sweep never sees the rows.
+    if let Some(content) = root
+        .downcast_ref::<adw::Dialog>()
+        .and_then(|dialog| dialog.child())
+    {
+        let already = watched
+            .iter()
+            .any(|(_, weak)| weak.upgrade().is_some_and(|widget| widget == content));
+        if !already {
+            watched.extend(watch(&content));
+        }
     }
     watched
 }
@@ -63,21 +79,434 @@ pub(crate) fn drain() {
     }
 }
 
-fn survivors(build: impl FnOnce() -> gtk::Widget) -> Vec<String> {
-    let root = build();
-    let watched = watch(&root);
-    drop(root);
+fn alive(root: &gtk::Widget) -> Vec<gtk::Widget> {
+    watch(root)
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect()
+}
+
+fn combo(widgets: &[gtk::Widget], title: &str) -> adw::ComboRow {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let row = widget.downcast_ref::<adw::ComboRow>()?;
+            (row.title() == title).then(|| row.clone())
+        })
+        .unwrap_or_else(|| panic!("no combo row titled {title}"))
+}
+
+fn spin(widgets: &[gtk::Widget], title: &str) -> adw::SpinRow {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let row = widget.downcast_ref::<adw::SpinRow>()?;
+            (row.title() == title).then(|| row.clone())
+        })
+        .unwrap_or_else(|| panic!("no spin row titled {title}"))
+}
+
+fn entry(widgets: &[gtk::Widget], title: &str) -> adw::EntryRow {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let row = widget.downcast_ref::<adw::EntryRow>()?;
+            (row.title() == title).then(|| row.clone())
+        })
+        .unwrap_or_else(|| panic!("no entry row titled {title}"))
+}
+
+fn action(widgets: &[gtk::Widget], title: &str) -> adw::ActionRow {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let row = widget.downcast_ref::<adw::ActionRow>()?;
+            (row.title() == title).then(|| row.clone())
+        })
+        .unwrap_or_else(|| panic!("no row titled {title}"))
+}
+
+fn expander(widgets: &[gtk::Widget], title: &str) -> adw::ExpanderRow {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let row = widget.downcast_ref::<adw::ExpanderRow>()?;
+            (row.title() == title).then(|| row.clone())
+        })
+        .unwrap_or_else(|| panic!("no expander titled {title}"))
+}
+
+fn button_labeled(widgets: &[gtk::Widget], label: &str) -> gtk::Button {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            if widget.type_().name() != "GtkButton" {
+                return None;
+            }
+            let button = widget.downcast_ref::<gtk::Button>()?;
+            (button.label().as_deref() == Some(label)).then(|| button.clone())
+        })
+        .unwrap_or_else(|| panic!("no button labeled {label}"))
+}
+
+fn error_label(widgets: &[gtk::Widget]) -> gtk::Label {
+    widgets
+        .iter()
+        .find_map(|widget| {
+            let label = widget.downcast_ref::<gtk::Label>()?;
+            label.has_css_class("error").then(|| label.clone())
+        })
+        .expect("the dialog's error label")
+}
+
+/// Weekday toggles, in the order they are laid out. Alert checks have no label.
+fn weekday_toggles(widgets: &[gtk::Widget]) -> Vec<gtk::CheckButton> {
+    widgets
+        .iter()
+        .filter_map(|widget| {
+            let button = widget.downcast_ref::<gtk::CheckButton>()?;
+            button.label().is_some().then(|| button.clone())
+        })
+        .collect()
+}
+
+fn press_weekday(buttons: &[gtk::CheckButton], day: Weekday) {
+    let name = crate::locale::weekday_abbreviation(day);
+    buttons
+        .iter()
+        .find(|button| button.label().as_deref() == Some(name.as_str()))
+        .unwrap_or_else(|| panic!("a {name} button"))
+        .set_active(true);
+}
+
+fn september_days(store: &Store) -> Vec<NaiveDate> {
+    store
+        .events_between(at(2026, 9, 1, 0), at(2026, 10, 1, 0))
+        .expect("September reads")
+        .into_iter()
+        .map(|event| event.start.date_naive())
+        .collect()
+}
+
+/// Block until the save poll writes an event, or two seconds pass. The create
+/// path waits 100ms on the main loop, and `iteration(true)` would sit forever
+/// once that source is gone, so a watchdog wakes the loop either way.
+fn wait_for_september(store: &Store) -> bool {
+    let timed_out = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = timed_out.clone();
+    let watchdog = glib::timeout_add_local(std::time::Duration::from_secs(2), move || {
+        flag.set(true);
+        glib::ControlFlow::Break
+    });
+    let context = glib::MainContext::default();
+    let mut saved = false;
+    while !timed_out.get() {
+        context.iteration(true);
+        if !september_days(store).is_empty() {
+            saved = true;
+            break;
+        }
+    }
+    if saved {
+        watchdog.remove();
+    }
+    saved
+}
+
+/// What the custom repeat controls promise, exercised on the dialog Save uses.
+///
+/// Monday is set first. The unset default is Sunday, and a button row that
+/// ignored the first weekday would still match that default.
+fn saving_a_custom_repeat_stores_the_rule_the_dialog_described() {
+    crate::date_util::set_first_weekday(Weekday::Mon);
+    assert_eq!(
+        crate::date_util::first_weekday(),
+        Weekday::Mon,
+        "this check has to run before anything else chooses the first weekday"
+    );
+
+    let store = Rc::new(Store::open_in_memory().expect("an in-memory database"));
+    let dialog = event_dialog::build(
+        store.clone(),
+        local_target(),
+        None,
+        at(2026, 9, 1, 9),
+        None,
+        |_| {},
+        |_| {},
+        None,
+    );
+    // Save closes the dialog. Closing one that was never presented is a
+    // critical from libadwaita, so host it on a window for the click.
+    let window = gtk::Window::new();
+    dialog.present(Some(&window));
+    let widgets = alive(dialog.upcast_ref());
+    let repeat = combo(&widgets, "Repeat");
+    let custom = expander(&widgets, "Custom repeat");
+    assert!(
+        !custom.is_visible(),
+        "custom repeat stays hidden until chosen"
+    );
+    repeat.set_selected(crate::recurrence::Frequency::CUSTOM_PICKER_INDEX);
+    assert!(custom.is_visible());
+    assert!(custom.is_expanded());
+    assert_eq!(custom.subtitle_lines(), 2);
+    assert_eq!(custom.subtitle(), "Every 2 weeks on the event's weekday");
+
+    let interval = spin(&widgets, "Repeat every (weeks)");
+    assert_eq!(interval.value(), 2.0);
+    let frequency = combo(&widgets, "Frequency");
+    for (index, title) in [
+        (0, "Repeat every (days)"),
+        (1, "Repeat every (weeks)"),
+        (2, "Repeat every (months)"),
+        (3, "Repeat every (years)"),
+    ] {
+        frequency.set_selected(index);
+        assert_eq!(interval.title(), title);
+    }
+    frequency.set_selected(1);
+
+    let days = action(&widgets, "On these days");
+    assert!(days.is_visible());
+    assert_eq!(
+        days.subtitle().as_deref(),
+        Some("Leave empty to use the event's weekday")
+    );
+    let toggles = weekday_toggles(&widgets);
+    let expected: Vec<String> = crate::date_util::weekdays_from(Weekday::Mon)
+        .into_iter()
+        .map(crate::locale::weekday_abbreviation)
+        .collect();
+    let labels: Vec<String> = toggles
+        .iter()
+        .map(|button| button.label().expect("a labeled toggle").to_string())
+        .collect();
+    assert_eq!(labels, expected, "weekday buttons follow the first weekday");
+
+    let ends = combo(&widgets, "Ends");
+    let count = spin(&widgets, "Number of events");
+    let until = entry(&widgets, "Stop on (YYYY-MM-DD)");
+    let week = combo(&widgets, "Week of the month");
+    assert_eq!(ends.selected(), 0);
+    assert!(!count.is_visible());
+    assert!(!until.is_visible());
+    assert!(!week.is_visible());
+    ends.set_selected(1);
+    assert!(count.is_visible());
+    assert!(!until.is_visible());
+    assert_eq!(
+        custom.subtitle(),
+        "Every 2 weeks on the event's weekday, 10 times"
+    );
+    ends.set_selected(0);
+
+    frequency.set_selected(2);
+    week.set_selected(1);
+    assert!(week.is_visible());
+    assert_eq!(days.subtitle().as_deref(), Some("Choose one or more"));
+    assert_eq!(custom.subtitle(), "Choose at least one weekday");
+    entry(&widgets, "Title").set_text("Fortnightly");
+    let error = error_label(&widgets);
+    button_labeled(&widgets, "Save").emit_clicked();
+    assert_eq!(error.label(), "Choose at least one weekday");
+    assert!(
+        september_days(&store).is_empty(),
+        "a monthly weekday with no day chosen is not saved"
+    );
+
+    frequency.set_selected(1);
+    assert_eq!(
+        days.subtitle().as_deref(),
+        Some("Leave empty to use the event's weekday")
+    );
+    ends.set_selected(2);
+    assert!(!count.is_visible());
+    assert!(until.is_visible());
+    assert_eq!(custom.subtitle(), "Enter the stop date as YYYY-MM-DD");
+    until.set_text("September 30");
+    assert_eq!(custom.subtitle(), "Enter the stop date as YYYY-MM-DD");
+    button_labeled(&widgets, "Save").emit_clicked();
+    assert_eq!(error.label(), "Enter the stop date as YYYY-MM-DD");
+    assert!(
+        september_days(&store).is_empty(),
+        "a stop date that is not YYYY-MM-DD is not saved"
+    );
+
+    until.set_text("2026-09-30");
+    assert_eq!(
+        custom.subtitle(),
+        "Every 2 weeks on the event's weekday, until September 30, 2026"
+    );
+    press_weekday(&toggles, Weekday::Mon);
+    press_weekday(&toggles, Weekday::Wed);
+    assert_eq!(
+        custom.subtitle(),
+        "Every 2 weeks on Monday and Wednesday, until September 30, 2026"
+    );
+    button_labeled(&widgets, "Save").emit_clicked();
+    assert!(
+        wait_for_september(&store),
+        "saving did not write the series ({})",
+        error.label()
+    );
+    assert_eq!(
+        september_days(&store),
+        vec![
+            NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 14).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+        ]
+    );
+    let events = store
+        .events_between(at(2026, 9, 1, 0), at(2026, 10, 1, 0))
+        .expect("September reads");
+    let rule = "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20260930";
+    assert!(
+        events.iter().all(|event| {
+            event.title == "Fortnightly"
+                && !event.all_day
+                && event.start.format("%H:%M").to_string() == "09:00"
+                && event
+                    .recurrence
+                    .map(crate::recurrence::Frequency::to_rrule)
+                    .as_deref()
+                    == Some(rule)
+        }),
+        "each occurrence keeps the saved series"
+    );
+    let master = store
+        .event_by_id(events[0].id)
+        .expect("the master reads")
+        .expect("the master was stored");
+    assert_eq!(
+        master.start.date_naive(),
+        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        "the series stays anchored on the day that was open"
+    );
+    assert_eq!(
+        master
+            .recurrence
+            .map(crate::recurrence::Frequency::to_rrule)
+            .as_deref(),
+        Some(rule)
+    );
+
+    let edit = event_dialog::build(
+        store.clone(),
+        Vec::new(),
+        Some(master),
+        at(2026, 9, 1, 9),
+        None,
+        |_| {},
+        |_| {},
+        None,
+    );
+    let edited = alive(edit.upcast_ref());
+    assert_eq!(
+        combo(&edited, "Repeat").selected(),
+        crate::recurrence::Frequency::CUSTOM_PICKER_INDEX
+    );
+    let restored = expander(&edited, "Custom repeat");
+    assert!(restored.is_visible());
+    assert_eq!(
+        restored.subtitle(),
+        "Every 2 weeks on Monday and Wednesday, until September 30, 2026"
+    );
+    assert_eq!(combo(&edited, "Frequency").selected(), 1);
+    assert_eq!(spin(&edited, "Repeat every (weeks)").value(), 2.0);
+    assert_eq!(combo(&edited, "Ends").selected(), 2);
+    assert_eq!(entry(&edited, "Stop on (YYYY-MM-DD)").text(), "2026-09-30");
+    for button in weekday_toggles(&edited) {
+        let name = button.label().expect("a labeled toggle");
+        let on = name.as_str() == crate::locale::weekday_abbreviation(Weekday::Mon)
+            || name.as_str() == crate::locale::weekday_abbreviation(Weekday::Wed);
+        assert_eq!(
+            button.is_active(),
+            on,
+            "{name} restored from the saved rule"
+        );
+    }
+
+    let (invited, remote) = invitation(80, at(2026, 9, 1, 9));
+    let start = invited.start;
+    let synced = event_dialog::build(
+        store.clone(),
+        Vec::new(),
+        Some(invited),
+        start,
+        None,
+        |_| {},
+        |_| {},
+        Some(remote),
+    );
+    let synced_widgets = alive(synced.upcast_ref());
+    assert!(
+        synced_widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<adw::ComboRow>()
+                .is_some_and(|row| row.title() == "Apply to")
+        }),
+        "the series scope row is part of this dialog"
+    );
+    assert!(
+        synced_widgets.iter().all(|widget| {
+            widget
+                .downcast_ref::<adw::PreferencesRow>()
+                .is_none_or(|row| {
+                    let title = row.title();
+                    title != "Repeat" && title != "Custom repeat"
+                })
+        }),
+        "a synced event keeps the repeat rule its provider expanded"
+    );
+
+    drop((dialog, edit, synced, window));
     drain();
+}
+
+fn tally(watched: &[(String, glib::WeakRef<gtk::Widget>)]) -> Vec<String> {
     let mut by_type: BTreeMap<String, usize> = BTreeMap::new();
     for (name, weak) in watched {
         if weak.upgrade().is_some() {
-            *by_type.entry(name).or_default() += 1;
+            *by_type.entry(name.clone()).or_default() += 1;
         }
     }
     by_type
         .into_iter()
         .map(|(name, count)| format!("{name} ×{count}"))
         .collect()
+}
+
+fn survivors(build: impl FnOnce() -> gtk::Widget) -> Vec<String> {
+    let root = build();
+    let watched = watch(&root);
+    drop(root);
+    drain();
+    let mut alive = tally(&watched);
+    if !alive.is_empty() {
+        // The location field starts a lookup when an edit fills it in. The
+        // popover stays alive until that debounce and request finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let context = glib::MainContext::default();
+        while !alive.is_empty() && std::time::Instant::now() < deadline {
+            let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+            let flag = fired.clone();
+            let source = glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                flag.set(true);
+                glib::ControlFlow::Break
+            });
+            context.iteration(true);
+            if !fired.get() {
+                source.remove();
+            }
+            drain();
+            alive = tally(&watched);
+        }
+    }
+    alive
 }
 
 fn at(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Local> {
@@ -168,6 +597,7 @@ fn local_target() -> Vec<TargetChoice> {
 fn dropping_a_widget_tree_frees_every_widget_in_it() {
     gtk::init().expect("a display to initialize GTK against");
     adw::init().expect("libadwaita to initialize");
+    saving_a_custom_repeat_stores_the_rule_the_dialog_described();
     let store = Rc::new(Store::open_in_memory().expect("an in-memory database"));
 
     let day = NaiveDate::from_ymd_opt(2026, 9, 1).expect("a real date");

@@ -461,11 +461,15 @@ pub(crate) fn build(
     // Frequency::picker_index / from_picker_index.
     let repeat_labels: Vec<&str> = std::iter::once("Does not repeat")
         .chain(Frequency::ALL.iter().map(|freq| freq.label()))
+        .chain(std::iter::once("Custom…"))
         .collect();
     let repeat_row = adw::ComboRow::builder()
         .title("Repeat")
         .model(&gtk::StringList::new(&repeat_labels))
         .build();
+    let custom_repeat = crate::recurrence_picker::CustomRepeat::new();
+    custom_repeat.row.set_visible(false);
+    let custom_row = custom_repeat.row.clone();
     let alert_row = adw::ExpanderRow::builder()
         .title("Alerts")
         .subtitle("Choose one or more reminders")
@@ -499,6 +503,16 @@ pub(crate) fn build(
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
     error_label.set_wrap(true);
+    repeat_row.connect_selected_notify(clone!(
+        #[weak]
+        custom_row,
+        #[weak]
+        error_label,
+        move |repeat| {
+            custom_row.set_visible(repeat.selected() == Frequency::CUSTOM_PICKER_INDEX);
+            error_label.set_label("");
+        }
+    ));
     let calendar_name = editing
         .as_ref()
         .map(|event| event.calendar_name.clone())
@@ -560,10 +574,12 @@ pub(crate) fn build(
             set_time_rows(&start_row, &end_row, event.start, event.end, event.all_day);
             location_row.set_text(event.location.as_deref().unwrap_or(""));
             notes.set_text(event.notes.as_deref().unwrap_or(""));
-            // The repeat row is hidden while editing, but keeping it in sync
-            // means the save handler reads back the event's existing rule
-            // unchanged instead of clearing it.
+            // Selecting the stored rule keeps Save from clearing it. A custom
+            // rule also fills the controls the row reveals.
             repeat_row.set_selected(Frequency::picker_index(event.recurrence));
+            if let Some(Frequency::Custom(rule)) = event.recurrence {
+                custom_repeat.set_rule(rule);
+            }
             for (minutes, button) in &alert_buttons {
                 button.set_active(
                     event.reminder_minutes == Some(*minutes)
@@ -605,10 +621,11 @@ pub(crate) fn build(
     group.add(&all_day_row);
     group.add(&start_row);
     group.add(&end_row);
-    // Authoring a recurrence is create-only for now; editing an existing
-    // series (or a synced expanded instance) is a separate feature.
-    if editing.is_none() {
+    // A local event, new or already saved, can set its own repeat. A synced
+    // event keeps the rule its provider expanded, so the row stays off it.
+    if remote_event.is_none() {
         group.add(&repeat_row);
+        group.add(&custom_repeat.row);
     }
     if editing_series_instance {
         group.add(&scope_row);
@@ -778,6 +795,17 @@ pub(crate) fn build(
                 return;
             }
 
+            let recurrence = if repeat_row.selected() == Frequency::CUSTOM_PICKER_INDEX {
+                match custom_repeat.value() {
+                    Ok(rule) => Some(rule),
+                    Err(message) => {
+                        error_label.set_label(message);
+                        return;
+                    }
+                }
+            } else {
+                Frequency::from_picker_index(repeat_row.selected())
+            };
             let mut reminders = alert_buttons.iter().filter(|(_, button)| button.is_active()).map(|(minutes, _)| *minutes);
             let draft = EventDraft {
                 title,
@@ -786,7 +814,7 @@ pub(crate) fn build(
                 all_day,
                 location: non_empty(location_row.text().to_string()),
                 notes: non_empty(notes.text()),
-                recurrence: Frequency::from_picker_index(repeat_row.selected()),
+                recurrence,
                 reminder_minutes: reminders.next(),
                 additional_reminders: reminders.collect(),
                 attendees: match editing.as_ref() {
