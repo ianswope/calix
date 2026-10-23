@@ -9,6 +9,7 @@
 - Weekday and month names follow the system locale.
 - Google recurring events offer This event and All events for edits and deletes.
 - Undo can recreate deleted events on synced calendars and retain their new provider identities.
+- Undo covers an all-events edit or delete, and creating a repeating event on a synced calendar. Taking one back puts the provider's series back, including per-occurrence overrides.
 
 ### Changed
 

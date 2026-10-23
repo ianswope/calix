@@ -1,19 +1,20 @@
-//! Undo and redo for single-event changes.
+//! Undo and redo for event changes, one event or a whole series.
 //!
-//! A change records the row on both sides of an edit — what it held before,
-//! what it held after — so undo and redo are one operation run in opposite
-//! directions, and a create, an edit and a delete are the same shape with one
-//! side left empty.
+//! A change records both sides of an edit — what it held before, what it held
+//! after — so undo and redo are one operation run in opposite directions, and
+//! a create, an edit and a delete are the same shape with one side left empty.
 //!
-//! Nothing here touches the database. A change only *describes* the write that
-//! would reverse it, and refuses when the row no longer holds what the change
-//! left behind. That refusal is the whole point: it keeps an undo from throwing
-//! away a newer edit, which is the same rule the failed-drag rollback in
-//! `window.rs` follows, generalized to every kind of change.
+//! Nothing here touches the database or a provider. A change only *describes*
+//! the write that would reverse it, and refuses when what is there now is no
+//! longer what the change left behind. That refusal is the whole point: it
+//! keeps an undo from throwing away a newer edit, which is the same rule the
+//! failed-drag rollback in `window.rs` follows, generalized to every kind of
+//! change.
 //!
-//! Whole-series edits are deliberately not recorded. Reversing one means
-//! rewriting a provider's master recurrence resource, which is a different and
-//! much larger problem than putting a single row back.
+//! A series is not one row. CalDAV keeps the master and its per-occurrence
+//! overrides in a single iCalendar resource; Google keeps the overrides as
+//! their own events beside the master. Either way the undo entry stores that
+//! whole set, not just the repeat rule, and reversing it puts the set back.
 
 use crate::store::{EventDraft, Store};
 
@@ -190,6 +191,16 @@ pub fn cache_remote_creation(
     }
 }
 
+/// Whether this delete removes the whole series.
+///
+/// "All events" does. So does deleting the one cached row of a series that
+/// sync has not expanded yet: that row still carries the repeat rule, and on
+/// the provider it is the master, so a single-row delete would remove the
+/// series and leave undo with nothing to put back.
+pub fn deletes_whole_series(apply_to_all: bool, series_instance: bool, repeats: bool) -> bool {
+    apply_to_all || (!series_instance && repeats)
+}
+
 /// Whether carrying out `write` would mean re-creating an event on a provider,
 /// so it must go through the provider creation path before caching the row.
 ///
@@ -200,18 +211,362 @@ pub fn needs_a_remote_create(write: &Write, calendar_is_local: bool) -> bool {
     matches!(write, Write::Insert { .. }) && !calendar_is_local
 }
 
+/// Which provider a series document came from. The two don't compare equal:
+/// an iCalendar resource and a Google event are different shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeriesKind {
+    /// One iCalendar resource. Overrides are further `VEVENT`s in `master`;
+    /// `exceptions` is empty.
+    Ics,
+    /// A Google series event in `master`, plus each modified instance in
+    /// `exceptions`.
+    Google,
+}
+
+/// The provider's copy of a series: the master and any per-occurrence overrides.
+///
+/// This is the whole set an "All events" change rewrites, which is what an undo
+/// has to put back. A repeat rule on its own would restore the schedule and
+/// lose a moved or cancelled occurrence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeriesDocument {
+    pub kind: SeriesKind,
+    pub master: String,
+    pub exceptions: Vec<String>,
+}
+
+impl SeriesDocument {
+    pub fn ics(master: impl Into<String>) -> Self {
+        Self {
+            kind: SeriesKind::Ics,
+            master: master.into(),
+            exceptions: Vec::new(),
+        }
+    }
+
+    pub fn google(master: impl Into<String>, exceptions: Vec<String>) -> Self {
+        Self {
+            kind: SeriesKind::Google,
+            master: master.into(),
+            exceptions,
+        }
+    }
+
+    /// Whether `other` is still the series this document left behind.
+    ///
+    /// Providers rewrite timestamps, etags and sequence numbers on every save,
+    /// so a byte compare would refuse an undo of our own edit. The comparison
+    /// is the fields an all-events change actually writes, and the overrides.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.kind == other.kind && series_signature(self) == series_signature(other)
+    }
+}
+
+/// Where a series lives on its provider. Enough to read it back and write it,
+/// without the secret itself — `token_key` is the keyring entry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SeriesLocator {
+    Google {
+        token_key: String,
+        google_calendar_id: String,
+        series_id: String,
+    },
+    Caldav {
+        base_url: String,
+        username: String,
+        token_key: String,
+        /// The resource href, without an `#instance` suffix.
+        href: String,
+    },
+}
+
+/// One reversible change to a whole series.
+///
+/// `before` is `None` when the change created the series, `after` when it
+/// deleted one. [`SeriesLocator`] says where to read and write it; the
+/// decision of *what* to write doesn't use it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeriesChange {
+    pub before: Option<SeriesDocument>,
+    pub after: Option<SeriesDocument>,
+    pub locator: SeriesLocator,
+    /// The local row a create cached. Series undo talks to the provider and
+    /// leaves this alone; a single-event undo that had to recreate a repeating
+    /// event uses it to follow the new row.
+    pub cached_id: Option<i64>,
+}
+
+impl SeriesChange {
+    pub fn edited(before: SeriesDocument, after: SeriesDocument) -> Self {
+        Self {
+            before: Some(before),
+            after: Some(after),
+            locator: SeriesLocator::unlocated(),
+            cached_id: None,
+        }
+    }
+
+    pub fn deleted(before: SeriesDocument) -> Self {
+        Self {
+            before: Some(before),
+            after: None,
+            locator: SeriesLocator::unlocated(),
+            cached_id: None,
+        }
+    }
+
+    pub fn created(after: SeriesDocument) -> Self {
+        Self {
+            before: None,
+            after: Some(after),
+            locator: SeriesLocator::unlocated(),
+            cached_id: None,
+        }
+    }
+
+    /// The provider coordinates the window uses to carry the write out.
+    pub fn locate(mut self, locator: SeriesLocator) -> Self {
+        self.locator = locator;
+        self
+    }
+
+    /// Remembers the row this create cached, so a caller updating an existing
+    /// history entry can retarget it.
+    pub fn remember_row(mut self, id: i64) -> Self {
+        self.cached_id = Some(id);
+        self
+    }
+
+    pub fn undo(&self, current: Option<&SeriesDocument>) -> Result<SeriesWrite, Stale> {
+        self.step(self.after.as_ref(), self.before.as_ref(), current)
+    }
+
+    pub fn redo(&self, current: Option<&SeriesDocument>) -> Result<SeriesWrite, Stale> {
+        self.step(self.before.as_ref(), self.after.as_ref(), current)
+    }
+
+    fn step(
+        &self,
+        expected: Option<&SeriesDocument>,
+        target: Option<&SeriesDocument>,
+        current: Option<&SeriesDocument>,
+    ) -> Result<SeriesWrite, Stale> {
+        // The series must still be what this change left it as. Anything else
+        // — a later edit, or the series coming back after a delete — is kept.
+        match (expected, current) {
+            (None, None) => {}
+            (Some(expected), Some(current)) if expected.matches(current) => {}
+            (Some(_), None) => return Err(Stale::Gone),
+            _ => return Err(Stale::ChangedSince),
+        }
+        match target {
+            // The series is gone, so this step has to recreate it, overrides
+            // included. Rewriting a series that is still there only puts the
+            // master back; its overrides were never removed.
+            Some(document) if expected.is_none() => Ok(SeriesWrite::RestoreAll(document.clone())),
+            Some(document) => Ok(SeriesWrite::RestoreMaster(document.clone())),
+            None => Ok(SeriesWrite::Delete),
+        }
+    }
+}
+
+impl SeriesLocator {
+    /// A placeholder for a change whose write is being decided and not sent.
+    fn unlocated() -> Self {
+        Self::Google {
+            token_key: String::new(),
+            google_calendar_id: String::new(),
+            series_id: String::new(),
+        }
+    }
+}
+
+/// The provider write that carries out one series undo or redo.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SeriesWrite {
+    /// The series is still there. Put the master back and leave its overrides
+    /// in place — the change never removed them.
+    RestoreMaster(SeriesDocument),
+    /// The series is gone. Put the master and its overrides back.
+    RestoreAll(SeriesDocument),
+    /// Remove the series.
+    Delete,
+}
+
+/// One entry in the undo stack: a single row, or a whole series.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Record {
+    Event(Change),
+    Series(SeriesChange),
+}
+
+impl Record {
+    #[cfg(test)]
+    fn as_event(&self) -> Option<&Change> {
+        match self {
+            Self::Event(change) => Some(change),
+            Self::Series(_) => None,
+        }
+    }
+}
+
+/// The parts of a series an all-events change writes, stable across the
+/// bookkeeping a provider adds on save.
+fn series_signature(document: &SeriesDocument) -> Option<String> {
+    match document.kind {
+        SeriesKind::Ics => Some(ics_signature(&document.master)),
+        SeriesKind::Google => google_signature(&document.master, &document.exceptions),
+    }
+}
+
+/// Properties that distinguish one series from a later edit of it. A server's
+/// `DTSTAMP` and `SEQUENCE` change on every save and say nothing about the
+/// series, so they are left out.
+const ICS_FIELDS: &[&str] = &[
+    "UID",
+    "SUMMARY",
+    "LOCATION",
+    "DESCRIPTION",
+    "DTSTART",
+    "DTEND",
+    "RRULE",
+    "EXDATE",
+    "STATUS",
+    "RECURRENCE-ID",
+];
+
+fn ics_signature(ics: &str) -> String {
+    let mut components = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut in_event = false;
+    for line in unfold_lines(ics) {
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("BEGIN:VEVENT") {
+            in_event = true;
+            current.clear();
+            continue;
+        }
+        if upper.starts_with("END:VEVENT") {
+            current.sort();
+            components.push(current.join("\n"));
+            in_event = false;
+            continue;
+        }
+        if in_event && ics_field(&line).is_some_and(|name| ICS_FIELDS.contains(&name)) {
+            current.push(line);
+        }
+    }
+    components.sort();
+    components.join("\n---\n")
+}
+
+fn ics_field(line: &str) -> Option<&str> {
+    let name = line.split_once([';', ':'])?.0;
+    Some(name)
+}
+
+fn unfold_lines(ics: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in ics.replace("\r\n", "\n").lines() {
+        if (line.starts_with(' ') || line.starts_with('\t'))
+            && let Some(previous) = lines.last_mut()
+        {
+            previous.push_str(line.trim_start());
+        } else if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+fn google_signature(master: &str, exceptions: &[String]) -> Option<String> {
+    let master: serde_json::Value = serde_json::from_str(master).ok()?;
+    let mut parts = vec![google_event_signature(&master)];
+    let mut overrides: Vec<String> = exceptions
+        .iter()
+        .map(|exception| {
+            serde_json::from_str::<serde_json::Value>(exception)
+                .map(|event| google_event_signature(&event))
+                .unwrap_or_else(|_| exception.clone())
+        })
+        .collect();
+    overrides.sort();
+    parts.extend(overrides);
+    Some(parts.join("\n---\n"))
+}
+
+/// Fields of one Google event that an edit can change. An id, an etag and a
+/// time zone the server filled in are not among them. A missing status is the
+/// same as `confirmed`, which is what Google writes back onto a create.
+fn google_event_signature(event: &serde_json::Value) -> String {
+    let status = match event.get("status").and_then(|value| value.as_str()) {
+        None | Some("confirmed") => "confirmed",
+        Some(other) => other,
+    };
+    let mut rules: Vec<String> = event
+        .get("recurrence")
+        .and_then(|value| value.as_array())
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|rule| rule.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    rules.sort();
+    format!(
+        "summary={}\nlocation={}\ndescription={}\nstatus={status}\nstart={}\nend={}\noriginal={}\nrecurrence={}",
+        json_text(event.get("summary")),
+        json_text(event.get("location")),
+        json_text(event.get("description")),
+        json_text(
+            event
+                .pointer("/start/date")
+                .or_else(|| event.pointer("/start/dateTime"))
+        ),
+        json_text(
+            event
+                .pointer("/end/date")
+                .or_else(|| event.pointer("/end/dateTime"))
+        ),
+        json_text(
+            event
+                .pointer("/originalStartTime/date")
+                .or_else(|| event.pointer("/originalStartTime/dateTime"))
+        ),
+        rules.join(",")
+    )
+}
+
+fn json_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
 /// The undo and redo stacks for one window.
 #[derive(Default)]
 pub struct History {
-    done: Vec<Change>,
-    undone: Vec<Change>,
+    done: Vec<Record>,
+    undone: Vec<Record>,
 }
 
 impl History {
-    /// Records a change the user just made. This is a new branch of history,
-    /// so anything that had been undone can no longer be redone.
+    /// Records a single-event change the user just made. This is a new branch
+    /// of history, so anything that had been undone can no longer be redone.
     pub fn record(&mut self, change: Change) {
-        self.done.push(change);
+        self.push(Record::Event(change));
+    }
+
+    /// Records a whole-series change. Same branching rule as [`Self::record`].
+    pub fn record_series(&mut self, change: SeriesChange) {
+        self.push(Record::Series(change));
+    }
+
+    fn push(&mut self, record: Record) {
+        self.done.push(record);
         if self.done.len() > DEPTH {
             self.done.remove(0);
         }
@@ -219,30 +574,35 @@ impl History {
     }
 
     /// The change an undo would reverse, without taking it off the stack.
-    pub fn peek_undo(&self) -> Option<&Change> {
+    pub fn peek_undo(&self) -> Option<&Record> {
         self.done.last()
     }
 
     /// The change a redo would re-apply.
-    pub fn peek_redo(&self) -> Option<&Change> {
+    pub fn peek_redo(&self) -> Option<&Record> {
         self.undone.last()
     }
 
     /// Moves the top change over to the redo side after its write went
     /// through. `id` is the row's id now — a re-created row has a new one, and
-    /// a deleted row has none.
+    /// a deleted row has none. A series keeps its provider identity, so `id`
+    /// is ignored for one.
     pub fn commit_undo(&mut self, id: Option<i64>) {
-        if let Some(mut change) = self.done.pop() {
-            change.id = id;
-            self.undone.push(change);
+        if let Some(mut record) = self.done.pop() {
+            if let Record::Event(change) = &mut record {
+                change.id = id;
+            }
+            self.undone.push(record);
         }
     }
 
     /// Moves the top redo back to the undo side after its write went through.
     pub fn commit_redo(&mut self, id: Option<i64>) {
-        if let Some(mut change) = self.undone.pop() {
-            change.id = id;
-            self.done.push(change);
+        if let Some(mut record) = self.undone.pop() {
+            if let Record::Event(change) = &mut record {
+                change.id = id;
+            }
+            self.done.push(record);
         }
     }
 
@@ -291,6 +651,7 @@ mod tests {
     fn undo_once(store: &Store, history: &mut History) -> Result<(), Stale> {
         let change = history
             .peek_undo()
+            .and_then(Record::as_event)
             .cloned()
             .expect("a change waiting to be undone");
         let current = current_draft(store, &change);
@@ -303,6 +664,7 @@ mod tests {
     fn redo_once(store: &Store, history: &mut History) -> Result<(), Stale> {
         let change = history
             .peek_redo()
+            .and_then(Record::as_event)
             .cloned()
             .expect("a change waiting to be redone");
         let current = current_draft(store, &change);
@@ -336,7 +698,11 @@ mod tests {
             };
             assert_eq!(remote_id.as_deref(), Some("restored-id"));
             assert_eq!(
-                history.peek_redo().unwrap().redo(Some(&restored.draft())),
+                history
+                    .peek_redo()
+                    .and_then(Record::as_event)
+                    .unwrap()
+                    .redo(Some(&restored.draft())),
                 Ok(Write::Delete { id })
             );
         }
@@ -359,6 +725,7 @@ mod tests {
         redo_once(&store, &mut history).expect("nothing has taken its place");
         let back = history
             .peek_undo()
+            .and_then(Record::as_event)
             .and_then(|change| change.id)
             .and_then(|id| store.event_by_id(id).unwrap())
             .expect("the event is back, at whatever id SQLite gave it");
@@ -394,6 +761,7 @@ mod tests {
         undo_once(&store, &mut history).expect("nothing is in its place");
         let restored_id = history
             .peek_redo()
+            .and_then(Record::as_event)
             .and_then(|change| change.id)
             .expect("the restored row has an id");
         assert_eq!(
@@ -565,6 +933,7 @@ mod tests {
         assert_eq!(
             history
                 .peek_redo()
+                .and_then(Record::as_event)
                 .expect("the undone delete can be redone")
                 .redo(Some(&draft("Dentist", 15))),
             Ok(Write::Delete { id: 31 })
@@ -595,7 +964,10 @@ mod tests {
         history.commit_undo(Some(7));
         history.commit_redo(Some(7));
 
-        assert_eq!(history.peek_undo(), Some(&change));
+        assert_eq!(
+            history.peek_undo().and_then(Record::as_event),
+            Some(&change)
+        );
         assert!(history.peek_redo().is_none());
     }
 
@@ -608,7 +980,10 @@ mod tests {
         history.discard_undo();
 
         assert_eq!(
-            history.peek_undo().and_then(|change| change.id),
+            history
+                .peek_undo()
+                .and_then(Record::as_event)
+                .and_then(|change| change.id),
             Some(7),
             "the next undo reaches the change behind the one dropped"
         );
@@ -623,9 +998,180 @@ mod tests {
 
         assert_eq!(history.done.len(), DEPTH);
         assert_eq!(
-            history.peek_undo().and_then(|change| change.id),
+            history
+                .peek_undo()
+                .and_then(Record::as_event)
+                .and_then(|change| change.id),
             Some((DEPTH + 9) as i64),
             "the newest change is still the one an undo reaches first"
+        );
+    }
+
+    fn weekly_with_override(summary: &str) -> SeriesDocument {
+        SeriesDocument::ics(format!(
+            "BEGIN:VCALENDAR\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:s\r\n\
+             DTSTAMP:20260101T000000Z\r\n\
+             SUMMARY:{summary}\r\n\
+             DTSTART:20260701T090000Z\r\n\
+             DTEND:20260701T100000Z\r\n\
+             RRULE:FREQ=WEEKLY\r\n\
+             END:VEVENT\r\n\
+             BEGIN:VEVENT\r\n\
+             UID:s\r\n\
+             RECURRENCE-ID:20260708T090000Z\r\n\
+             SUMMARY:Moved one\r\n\
+             DTSTART:20260708T110000Z\r\n\
+             DTEND:20260708T120000Z\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n"
+        ))
+    }
+
+    #[test]
+    fn undoing_an_all_events_edit_restores_the_previous_series_and_its_override() {
+        let before = weekly_with_override("Standup");
+        let after = weekly_with_override("Moved");
+        let change = SeriesChange::edited(before.clone(), after.clone());
+
+        assert_eq!(
+            change.undo(Some(&after)),
+            Ok(SeriesWrite::RestoreMaster(before))
+        );
+    }
+
+    #[test]
+    fn undoing_an_all_events_edit_refuses_once_the_series_has_changed_again() {
+        let before = weekly_with_override("Standup");
+        let after = weekly_with_override("Moved");
+        let since = weekly_with_override("Renamed on the phone");
+        let change = SeriesChange::edited(before, after);
+
+        assert_eq!(change.undo(Some(&since)), Err(Stale::ChangedSince));
+    }
+
+    #[test]
+    fn a_server_timestamp_does_not_make_our_own_series_edit_look_newer() {
+        let before = weekly_with_override("Standup");
+        let after = weekly_with_override("Moved");
+        let mut fetched = after
+            .master
+            .replace("DTSTAMP:20260101T000000Z", "DTSTAMP:20260202T030405Z");
+        fetched = fetched.replace("SUMMARY:Moved\r\n", "SUMMARY:Moved\r\nSEQUENCE:3\r\n");
+        let change = SeriesChange::edited(before.clone(), after);
+
+        assert_eq!(
+            change.undo(Some(&SeriesDocument::ics(fetched))),
+            Ok(SeriesWrite::RestoreMaster(before))
+        );
+    }
+
+    #[test]
+    fn undoing_a_deleted_series_puts_back_the_whole_set_when_it_is_gone() {
+        let before = weekly_with_override("Standup");
+        let change = SeriesChange::deleted(before.clone());
+
+        assert_eq!(change.undo(None), Ok(SeriesWrite::RestoreAll(before)));
+    }
+
+    #[test]
+    fn undoing_a_deleted_series_refuses_when_it_has_already_come_back() {
+        let before = weekly_with_override("Standup");
+        let change = SeriesChange::deleted(before.clone());
+
+        assert_eq!(change.undo(Some(&before)), Err(Stale::ChangedSince));
+    }
+
+    #[test]
+    fn undoing_a_created_series_deletes_it_while_it_still_matches() {
+        let created = SeriesDocument::google(
+            r#"{"summary":"Standup","start":{"dateTime":"2026-07-01T09:00:00-04:00"},"end":{"dateTime":"2026-07-01T10:00:00-04:00"},"recurrence":["RRULE:FREQ=WEEKLY"]}"#,
+            Vec::new(),
+        );
+        // What Google hands back adds an id, an etag and a status the create
+        // body never sent. None of those is a later edit.
+        let fetched = SeriesDocument::google(
+            r#"{"id":"series-1","etag":"\"abc\"","status":"confirmed","summary":"Standup","start":{"dateTime":"2026-07-01T09:00:00-04:00","timeZone":"America/New_York"},"end":{"dateTime":"2026-07-01T10:00:00-04:00","timeZone":"America/New_York"},"recurrence":["RRULE:FREQ=WEEKLY"]}"#,
+            Vec::new(),
+        );
+        let change = SeriesChange::created(created);
+
+        assert_eq!(change.undo(Some(&fetched)), Ok(SeriesWrite::Delete));
+    }
+
+    #[test]
+    fn undoing_a_created_series_refuses_once_someone_has_edited_it() {
+        let created = SeriesDocument::google(
+            r#"{"summary":"Standup","recurrence":["RRULE:FREQ=WEEKLY"]}"#,
+            Vec::new(),
+        );
+        let edited = SeriesDocument::google(
+            r#"{"summary":"Standup (moved)","recurrence":["RRULE:FREQ=WEEKLY"]}"#,
+            Vec::new(),
+        );
+        let change = SeriesChange::created(created);
+
+        assert_eq!(change.undo(Some(&edited)), Err(Stale::ChangedSince));
+    }
+
+    #[test]
+    fn a_changed_google_exception_blocks_undoing_the_series() {
+        let master = r#"{"summary":"Standup","recurrence":["RRULE:FREQ=WEEKLY"]}"#;
+        let exception = r#"{"id":"ex-1","recurringEventId":"series-1","originalStartTime":{"dateTime":"2026-07-08T09:00:00-04:00"},"summary":"Moved one","status":"confirmed"}"#;
+        let renamed = r#"{"id":"ex-1","etag":"\"new\"","recurringEventId":"series-1","originalStartTime":{"dateTime":"2026-07-08T09:00:00-04:00"},"summary":"Renamed one","status":"confirmed"}"#;
+        let change = SeriesChange::edited(
+            SeriesDocument::google(master, vec![exception.into()]),
+            SeriesDocument::google(master, vec![exception.into()]),
+        );
+
+        assert_eq!(
+            change.undo(Some(&SeriesDocument::google(master, vec![renamed.into()]))),
+            Err(Stale::ChangedSince)
+        );
+    }
+
+    #[test]
+    fn redoing_a_deleted_series_removes_it_again() {
+        let before = weekly_with_override("Standup");
+        let change = SeriesChange::deleted(before.clone());
+
+        assert_eq!(change.redo(Some(&before)), Ok(SeriesWrite::Delete));
+    }
+
+    #[test]
+    fn deleting_the_unexpanded_master_removes_the_whole_series() {
+        // Right after a create, the only cached row still carries the rule and
+        // it is the master on the provider. There is no "this event" to keep.
+        assert!(deletes_whole_series(false, false, true));
+    }
+
+    #[test]
+    fn deleting_one_occurrence_keeps_the_rest_of_the_series() {
+        assert!(!deletes_whole_series(false, true, false));
+        // A repeat picked in the dialog does not turn "this event" into "all".
+        assert!(!deletes_whole_series(false, true, true));
+    }
+
+    #[test]
+    fn choosing_all_events_removes_the_whole_series() {
+        assert!(deletes_whole_series(true, true, false));
+    }
+
+    #[test]
+    fn a_series_change_is_what_undo_reaches_ahead_of_an_older_single_event() {
+        let mut history = History::default();
+        history.record(Change::edited(
+            1,
+            7,
+            draft("Standup", 9),
+            draft("Standup", 11),
+        ));
+        history.record_series(SeriesChange::created(weekly_with_override("Standup")));
+
+        assert!(
+            matches!(history.peek_undo(), Some(Record::Series(_))),
+            "the series change is the last thing that happened, so it is undone first"
         );
     }
 }

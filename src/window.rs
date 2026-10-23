@@ -676,8 +676,12 @@ impl Ui {
                 HistoryStep::Redo => history.peek_redo().cloned(),
             }
         };
-        let Some(change) = change else {
+        let Some(record) = change else {
             self.toast(step.nothing_to_do());
+            return;
+        };
+        let undo::Record::Event(change) = record else {
+            self.step_series(step, record);
             return;
         };
         let current = change
@@ -700,6 +704,72 @@ impl Ui {
             return;
         }
         self.apply_history_write(step, write, current);
+    }
+
+    /// Reverses a whole-series change on the provider, then lets a sync put the
+    /// cached occurrences back. The local rows are the expanded series, so
+    /// rewriting one of them would not undo it.
+    fn step_series(self: &Rc<Self>, step: HistoryStep, record: undo::Record) {
+        let undo::Record::Series(change) = record else {
+            return;
+        };
+        self.history_busy.set(true);
+        let config = self.config.borrow().google.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = match event_dialog::current_series(config.clone(), &change.locator) {
+                Err(error) => SeriesStep::Failed(error),
+                Ok(current) => {
+                    let write = match step {
+                        HistoryStep::Undo => change.undo(current.as_ref()),
+                        HistoryStep::Redo => change.redo(current.as_ref()),
+                    };
+                    match write {
+                        Err(_) => SeriesStep::Stale,
+                        Ok(write) => {
+                            match event_dialog::apply_series_write(config, &change.locator, &write)
+                            {
+                                Ok(()) => SeriesStep::Done,
+                                Err(error) => SeriesStep::Failed(error),
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = tx.send(outcome);
+        });
+        let ui = self.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
+            Ok(SeriesStep::Done) => {
+                ui.history_busy.set(false);
+                let mut history = ui.history.borrow_mut();
+                match step {
+                    HistoryStep::Undo => history.commit_undo(None),
+                    HistoryStep::Redo => history.commit_redo(None),
+                }
+                drop(history);
+                ui.reset_keeping_scroll();
+                ui.request_background_sync();
+                glib::ControlFlow::Break
+            }
+            Ok(SeriesStep::Stale) => {
+                ui.history_busy.set(false);
+                ui.discard(step);
+                ui.toast(step.changed_since());
+                glib::ControlFlow::Break
+            }
+            Ok(SeriesStep::Failed(error)) => {
+                ui.history_busy.set(false);
+                ui.toast(&format!("Couldn't {}: {error}", step.verb()));
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                ui.history_busy.set(false);
+                ui.toast("That change stopped unexpectedly");
+                glib::ControlFlow::Break
+            }
+        });
     }
 
     fn restore_remote_event(
@@ -727,10 +797,17 @@ impl Ui {
             choice.target,
             draft,
             Rc::new(move |created| {
+                // Recreating a repeating event records the series. The entry
+                // being finished is still the single-event delete, and it has
+                // to follow the row that came back.
+                let id = match &created {
+                    undo::Record::Event(change) => change.id,
+                    undo::Record::Series(change) => change.cached_id,
+                };
                 let mut history = ui_for_change.history.borrow_mut();
                 match step {
-                    HistoryStep::Undo => history.commit_undo(created.id),
-                    HistoryStep::Redo => history.commit_redo(created.id),
+                    HistoryStep::Undo => history.commit_undo(id),
+                    HistoryStep::Redo => history.commit_redo(id),
                 }
             }),
             move |outcome| {
@@ -842,9 +919,21 @@ impl Ui {
     }
 
     /// Remembers a change the user just made, so it can be taken back.
-    fn record(&self, change: undo::Change) {
-        self.history.borrow_mut().record(change);
+    fn record(&self, record: undo::Record) {
+        let mut history = self.history.borrow_mut();
+        match record {
+            undo::Record::Event(change) => history.record(change),
+            undo::Record::Series(change) => history.record_series(change),
+        }
     }
+}
+
+/// How a series undo or redo finished. A stale series is dropped; a failure
+/// stays on the stack so the next keypress can try it again.
+enum SeriesStep {
+    Done,
+    Stale,
+    Failed(String),
 }
 
 impl Ui {
@@ -3003,12 +3092,12 @@ fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
                     move || match rx.try_recv() {
                         Ok(Ok(())) => {
                             let _ = ui.store.clear_local_edit(event.id);
-                            ui.record(undo::Change::edited(
+                            ui.record(undo::Record::Event(undo::Change::edited(
                                 event.calendar_id,
                                 event.id,
                                 original.clone(),
                                 draft.clone(),
-                            ));
+                            )));
                             glib::ControlFlow::Break
                         }
                         Ok(Err(error)) => {
@@ -3034,12 +3123,12 @@ fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
                 ui.toast_overlay
                     .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
             } else {
-                ui.record(undo::Change::edited(
+                ui.record(undo::Record::Event(undo::Change::edited(
                     event.calendar_id,
                     event.id,
                     original,
                     draft,
-                ));
+                )));
                 ui.reset_keeping_scroll();
             }
         }
