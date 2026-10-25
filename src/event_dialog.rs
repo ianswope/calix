@@ -124,7 +124,7 @@ impl CreateTarget {
         }
     }
 
-    fn create(&self, draft: &EventDraft) -> Result<Option<(bool, String)>, String> {
+    fn create(&self, draft: &EventDraft) -> Result<Option<CreatedRemote>, String> {
         match self {
             Self::Local { .. } => Ok(None),
             Self::Google {
@@ -138,7 +138,19 @@ impl CreateTarget {
                     .ok_or_else(|| "Google account is not connected".to_string())?;
                 let event_id =
                     google::calendar_api::create_event(&token, google_calendar_id, draft)?;
-                Ok(Some((true, event_id)))
+                let series = draft.recurrence.map(|_| {
+                    google::calendar_api::created_event_json(draft)
+                        .map(|master| undo::SeriesDocument::google(master, Vec::new()))
+                });
+                let series = match series {
+                    Some(result) => Some(result?),
+                    None => None,
+                };
+                Ok(Some(CreatedRemote {
+                    is_google: true,
+                    remote_id: event_id,
+                    series,
+                }))
             }
             Self::Caldav {
                 base_url,
@@ -148,12 +160,51 @@ impl CreateTarget {
                 ..
             } => {
                 let credentials = caldav_credentials(base_url, username, token_key)?;
-                let event_id = caldav::create_event(&credentials, calendar_href, draft)?;
-                Ok(Some((false, event_id)))
+                let (event_id, ics) = caldav::create_event(&credentials, calendar_href, draft)?;
+                Ok(Some(CreatedRemote {
+                    is_google: false,
+                    remote_id: event_id,
+                    series: draft.recurrence.map(|_| undo::SeriesDocument::ics(ics)),
+                }))
             }
             Self::Unavailable { error, .. } => Err(error.clone()),
         }
     }
+
+    /// Where a series created on this calendar can be read back.
+    fn series_locator(&self, remote_id: &str) -> Option<undo::SeriesLocator> {
+        match self {
+            Self::Google {
+                token_key,
+                google_calendar_id,
+                ..
+            } => Some(undo::SeriesLocator::Google {
+                token_key: token_key.clone(),
+                google_calendar_id: google_calendar_id.clone(),
+                series_id: remote_id.to_string(),
+            }),
+            Self::Caldav {
+                base_url,
+                username,
+                token_key,
+                ..
+            } => Some(undo::SeriesLocator::Caldav {
+                base_url: base_url.clone(),
+                username: username.clone(),
+                token_key: token_key.clone(),
+                href: remote_id.to_string(),
+            }),
+            Self::Local { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// A provider event that was just created, and the series document when the
+/// draft repeats — undoing that deletes the series, not the one cached row.
+struct CreatedRemote {
+    is_google: bool,
+    remote_id: String,
+    series: Option<undo::SeriesDocument>,
 }
 
 /// Rebuilds CalDAV connection details from a stored account, reading the
@@ -264,7 +315,7 @@ impl RemoteEvent {
         &self,
         draft: &EventDraft,
         shift: caldav::SeriesShift,
-    ) -> Result<(), String> {
+    ) -> Result<Option<CapturedSeries>, String> {
         match self {
             Self::Google {
                 config,
@@ -276,7 +327,17 @@ impl RemoteEvent {
                 let token = google::oauth::get_access_token(config, token_key)
                     .map_err(|error| error.to_string())?
                     .ok_or("Google account is not connected")?;
-                google::calendar_api::update_series(&token, calendar_id, series_id, shift, draft)
+                let (before, exceptions, after) = google::calendar_api::update_series(
+                    &token,
+                    calendar_id,
+                    series_id,
+                    shift,
+                    draft,
+                )?;
+                Ok(Some(CapturedSeries {
+                    before: undo::SeriesDocument::google(before, exceptions.clone()),
+                    after: undo::SeriesDocument::google(after, exceptions),
+                }))
             }
 
             Self::Caldav {
@@ -286,11 +347,53 @@ impl RemoteEvent {
                 event_href,
             } => {
                 let credentials = caldav_credentials(base_url, username, token_key)?;
-                caldav::update_series(&credentials, event_href, shift, draft)
+                let (before, after) =
+                    caldav::update_series(&credentials, event_href, shift, draft)?;
+                Ok(Some(CapturedSeries {
+                    before: undo::SeriesDocument::ics(before),
+                    after: undo::SeriesDocument::ics(after),
+                }))
             }
-            // Only CalDAV series expose the choice today; anything else edits
-            // in place as usual.
-            _ => self.update(draft),
+            // Not a series. The caller records an ordinary single-event edit.
+            _ => self.update(draft).map(|()| None),
+        }
+    }
+
+    /// Where this series can be read back. `None` when the event has no provider.
+    ///
+    /// A Google series that has not been expanded yet has no separate series id;
+    /// its event id is the master.
+    fn series_locator(&self) -> Option<undo::SeriesLocator> {
+        match self {
+            Self::Google {
+                token_key,
+                calendar_id,
+                event_id,
+                series_id,
+                ..
+            } => Some(undo::SeriesLocator::Google {
+                token_key: token_key.clone(),
+                google_calendar_id: calendar_id.clone(),
+                // An expanded instance points at its master. A series created
+                // here and not yet expanded is that master, under its event id.
+                series_id: series_id.clone().unwrap_or_else(|| event_id.clone()),
+            }),
+            Self::Caldav {
+                base_url,
+                username,
+                token_key,
+                event_href,
+            } => Some(undo::SeriesLocator::Caldav {
+                base_url: base_url.clone(),
+                username: username.clone(),
+                token_key: token_key.clone(),
+                href: event_href
+                    .split_once('#')
+                    .map(|(href, _)| href)
+                    .unwrap_or(event_href)
+                    .to_string(),
+            }),
+            _ => None,
         }
     }
 
@@ -323,19 +426,26 @@ impl RemoteEvent {
 
     /// Deletes an entire series (an "all events" delete) rather than excluding
     /// the one occurrence [`Self::delete`] would drop for a CalDAV instance.
-    fn delete_all_events(&self) -> Result<(), String> {
+    ///
+    /// The document is what was removed, so an undo can put the whole set back.
+    /// `None` means this wasn't a series and the caller records a single-row delete.
+    fn delete_all_events(&self) -> Result<Option<undo::SeriesDocument>, String> {
         match self {
             Self::Google {
                 config,
                 token_key,
                 calendar_id,
-                series_id: Some(series_id),
+                event_id,
+                series_id,
                 ..
             } => {
                 let token = google::oauth::get_access_token(config, token_key)
                     .map_err(|error| error.to_string())?
                     .ok_or("Google account is not connected")?;
-                google::calendar_api::delete_event(&token, calendar_id, series_id)
+                let series_id = series_id.as_deref().unwrap_or(event_id.as_str());
+                let (master, exceptions) =
+                    google::calendar_api::delete_series(&token, calendar_id, series_id)?;
+                Ok(Some(undo::SeriesDocument::google(master, exceptions)))
             }
 
             Self::Caldav {
@@ -349,11 +459,18 @@ impl RemoteEvent {
                 let resource_href = event_href
                     .split_once('#')
                     .map_or(event_href.as_str(), |(href, _)| href);
-                caldav::delete_event(&credentials, resource_href)
+                let ics = caldav::delete_resource(&credentials, resource_href)?;
+                Ok(Some(undo::SeriesDocument::ics(ics)))
             }
-            _ => self.delete(),
+            _ => self.delete().map(|()| None),
         }
     }
+}
+
+/// The provider's series before and after an all-events edit.
+pub(crate) struct CapturedSeries {
+    before: undo::SeriesDocument,
+    after: undo::SeriesDocument,
 }
 
 /// Opens a create/edit dialog for an event. Remote changes are completed in a
@@ -367,7 +484,7 @@ pub fn open(
     initial_start: DateTime<Local>,
     initial_end: Option<DateTime<Local>>,
     on_saved: impl Fn(Saved) + 'static,
-    on_change: impl Fn(undo::Change) + 'static,
+    on_change: impl Fn(undo::Record) + 'static,
     remote_event: Option<RemoteEvent>,
 ) {
     build(
@@ -403,9 +520,8 @@ pub(crate) fn build(
     // Called once a save, delete or create has landed, with what the local cache
     // is worth afterwards — see [`Saved`].
     on_saved: impl Fn(Saved) + 'static,
-    // Called with the change the user just made, for the undo history. Only
-    // single-event operations report one: see [`crate::undo`].
-    on_change: impl Fn(undo::Change) + 'static,
+    // Called with the change the user just made, for the undo history.
+    on_change: impl Fn(undo::Record) + 'static,
     remote_event: Option<RemoteEvent>,
 ) -> adw::Dialog {
     let on_saved = Rc::new(on_saved);
@@ -687,16 +803,22 @@ pub(crate) fn build(
             error_label,
             move |_| {
                 delete_button.set_sensitive(false);
+                let repeats = deleted
+                    .before
+                    .as_ref()
+                    .is_some_and(|draft| draft.recurrence.is_some());
+                let series_instance = remote_event
+                    .as_ref()
+                    .is_some_and(RemoteEvent::is_series_instance);
                 delete_event_async(
                     store.clone(),
                     remote_event.clone(),
                     event_id,
                     deleted.clone(),
                     on_change.clone(),
-                    // "All events" removes the whole series; otherwise just
-                    // this occurrence (the picker only shows for a series
-                    // instance).
-                    scope_row.selected() == 1,
+                    // "All events" removes the whole series. So does deleting
+                    // the one row of a series sync has not expanded yet.
+                    undo::deletes_whole_series(scope_row.selected() == 1, series_instance, repeats),
                     clone!(
                         #[strong]
                         dialog,
@@ -882,13 +1004,14 @@ pub(crate) fn build(
                 // start moved; anything else edits just this occurrence.
                 let all_events = scope_row.selected() == 1;
                 let shift = caldav::SeriesShift::between(event.start, draft.start);
+                let series_locator = remote_event.series_locator();
                 let (tx, rx) = mpsc::channel();
                 let remote_draft = draft.clone();
                 std::thread::spawn(move || {
                     let result = if all_events {
                         remote_event.update_all_events(&remote_draft, shift)
                     } else {
-                        remote_event.update(&remote_draft)
+                        remote_event.update(&remote_draft).map(|()| None)
                     };
                     let _ = tx.send(result);
                 });
@@ -907,19 +1030,30 @@ pub(crate) fn build(
                         save_button,
                         #[strong]
                         error_label,
+                        #[strong]
+                        series_locator,
                         move || match rx.try_recv() {
-                            Ok(Ok(())) => match store
+                            Ok(Ok(captured)) => match store
                                 .update_event(event_id, &draft)
                                 .and_then(|()| store.update_event_attendees(event_id, &draft.attendees))
                             {
                                 Ok(()) => {
-                                    if !all_events {
-                                        on_change(undo::Change::edited(
+                                    match (captured, series_locator.clone()) {
+                                        (Some(captured), Some(locator)) => {
+                                            on_change(undo::Record::Series(
+                                                undo::SeriesChange::edited(
+                                                    captured.before,
+                                                    captured.after,
+                                                )
+                                                .locate(locator),
+                                            ));
+                                        }
+                                        _ => on_change(undo::Record::Event(undo::Change::edited(
                                             edited_calendar,
                                             event_id,
                                             edited_from.clone(),
                                             draft.clone(),
-                                        ));
+                                        ))),
                                     }
                                     // "All events" moved every occurrence on the
                                     // server; only the clicked row moved locally.
@@ -952,12 +1086,12 @@ pub(crate) fn build(
             } else {
                 match store.update_event(event.id, &draft) {
                     Ok(()) => {
-                        on_change(undo::Change::edited(
+                        on_change(undo::Record::Event(undo::Change::edited(
                             event.calendar_id,
                             event.id,
                             event.draft(),
                             draft.clone(),
-                        ));
+                        )));
                         on_saved(Saved::Cached);
                         dialog.close();
                     }
@@ -1240,13 +1374,91 @@ pub(crate) fn attendee_status_label(status: &str) -> &str {
     }
 }
 
-/// The message to show for a failed save, and whether Save may be pressed
-/// again.
-///
-/// Once the provider has created the event, a retry is not a retry: creation
-/// isn't idempotent and there is no key to repeat it under, so pressing Save
-/// again produces a second event on the server. The remote copy is already
-/// what the user asked for, so the local cache catches up at the next sync.
+/// The series at `locator` as the provider has it now, or `None` when it is gone.
+pub(crate) fn current_series(
+    config: Option<GoogleConfig>,
+    locator: &undo::SeriesLocator,
+) -> Result<Option<undo::SeriesDocument>, String> {
+    match locator {
+        undo::SeriesLocator::Google {
+            token_key,
+            google_calendar_id,
+            series_id,
+        } => {
+            let config = config.ok_or("Google is not configured on this machine")?;
+            let token = google::oauth::get_access_token(&config, token_key)
+                .map_err(|error| error.to_string())?
+                .ok_or("Google account is not connected")?;
+            Ok(
+                google::calendar_api::load_series(&token, google_calendar_id, series_id)?
+                    .map(|(master, exceptions)| undo::SeriesDocument::google(master, exceptions)),
+            )
+        }
+        undo::SeriesLocator::Caldav {
+            base_url,
+            username,
+            token_key,
+            href,
+        } => {
+            let credentials = caldav_credentials(base_url, username, token_key)?;
+            Ok(caldav::read_resource(&credentials, href)?.map(undo::SeriesDocument::ics))
+        }
+    }
+}
+
+/// Carries out the provider write a series undo or redo decided on.
+pub(crate) fn apply_series_write(
+    config: Option<GoogleConfig>,
+    locator: &undo::SeriesLocator,
+    write: &undo::SeriesWrite,
+) -> Result<(), String> {
+    match locator {
+        undo::SeriesLocator::Google {
+            token_key,
+            google_calendar_id,
+            series_id,
+        } => {
+            let config = config.ok_or("Google is not configured on this machine")?;
+            let token = google::oauth::get_access_token(&config, token_key)
+                .map_err(|error| error.to_string())?
+                .ok_or("Google account is not connected")?;
+            match write {
+                undo::SeriesWrite::RestoreMaster(document) => google::calendar_api::restore_master(
+                    &token,
+                    google_calendar_id,
+                    series_id,
+                    &document.master,
+                ),
+                undo::SeriesWrite::RestoreAll(document) => google::calendar_api::restore_series(
+                    &token,
+                    google_calendar_id,
+                    series_id,
+                    &document.master,
+                    &document.exceptions,
+                ),
+                undo::SeriesWrite::Delete => {
+                    google::calendar_api::delete_event(&token, google_calendar_id, series_id)
+                }
+            }
+        }
+        undo::SeriesLocator::Caldav {
+            base_url,
+            username,
+            token_key,
+            href,
+        } => {
+            let credentials = caldav_credentials(base_url, username, token_key)?;
+            match write {
+                undo::SeriesWrite::RestoreMaster(document)
+                | undo::SeriesWrite::RestoreAll(document) => {
+                    caldav::write_resource(&credentials, href, &document.master)
+                }
+                undo::SeriesWrite::Delete => caldav::delete_event(&credentials, href),
+            }
+        }
+    }
+}
+
 /// Deletes an event: the provider first when it lives on one — on a worker
 /// thread the main loop polls — and then this device's copy. `on_done` fires
 /// exactly once, on the main thread.
@@ -1260,14 +1472,14 @@ pub(crate) fn delete_event_async(
     remote_event: Option<RemoteEvent>,
     event_id: i64,
     deleted: undo::Change,
-    on_change: Rc<dyn Fn(undo::Change)>,
+    on_change: Rc<dyn Fn(undo::Record)>,
     all_events: bool,
     on_done: impl Fn(Result<Saved, String>) + 'static,
 ) {
     let Some(remote_event) = remote_event else {
         on_done(match store.delete_event(event_id) {
             Ok(()) => {
-                on_change(deleted);
+                on_change(undo::Record::Event(deleted));
                 Ok(Saved::Cached)
             }
             Err(error) => Err(format!("Couldn't delete event: {error}")),
@@ -1275,21 +1487,25 @@ pub(crate) fn delete_event_async(
         return;
     };
 
+    let series_locator = remote_event.series_locator();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let result = if all_events {
             remote_event.delete_all_events()
         } else {
-            remote_event.delete()
+            remote_event.delete().map(|()| None)
         };
         let _ = tx.send(result);
     });
     glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
-        Ok(Ok(())) => {
+        Ok(Ok(captured)) => {
             on_done(match store.delete_event(event_id) {
                 Ok(()) => {
-                    if !all_events {
-                        on_change(deleted.clone());
+                    match (captured, series_locator.clone()) {
+                        (Some(document), Some(locator)) => on_change(undo::Record::Series(
+                            undo::SeriesChange::deleted(document).locate(locator),
+                        )),
+                        _ => on_change(undo::Record::Event(deleted.clone())),
                     }
                     // Deleting a whole remote series takes one cached
                     // occurrence with it; the rest are separate rows only a
@@ -1328,7 +1544,7 @@ pub(crate) fn create_event_async(
     store: Rc<Store>,
     target: CreateTarget,
     draft: EventDraft,
-    on_change: Rc<dyn Fn(undo::Change)>,
+    on_change: Rc<dyn Fn(undo::Record)>,
     on_done: impl Fn(Result<Saved, (String, bool)>) + 'static,
 ) {
     let (tx, rx) = mpsc::channel();
@@ -1341,36 +1557,45 @@ pub(crate) fn create_event_async(
         Ok(Ok(None)) => {
             match store.create_event(target.calendar_id(), &draft) {
                 Ok(id) => {
-                    on_change(undo::Change::created(
+                    on_change(undo::Record::Event(undo::Change::created(
                         target.calendar_id(),
                         id,
                         draft.clone(),
-                    ));
+                    )));
                     on_done(Ok(Saved::Cached));
                 }
                 Err(error) => on_done(Err(save_failure(&error.to_string(), false))),
             }
             glib::ControlFlow::Break
         }
-        Ok(Ok(Some((is_google, remote_id)))) => {
+        Ok(Ok(Some(created))) => {
             let result = undo::cache_remote_creation(
                 &store,
                 target.calendar_id(),
                 &draft,
-                is_google,
-                &remote_id,
+                created.is_google,
+                &created.remote_id,
             );
             match result {
                 Ok(id) => {
-                    // A repeat is a series operation: the cached row is one
-                    // occurrence of what the server built, so taking it back is
-                    // not a single-row write and isn't recorded.
-                    if draft.recurrence.is_none() {
-                        on_change(undo::Change::created(
+                    match created.series {
+                        Some(document) => match target.series_locator(&created.remote_id) {
+                            Some(locator) => on_change(undo::Record::Series(
+                                undo::SeriesChange::created(document)
+                                    .locate(locator)
+                                    .remember_row(id),
+                            )),
+                            None => on_change(undo::Record::Event(undo::Change::created(
+                                target.calendar_id(),
+                                id,
+                                draft.clone(),
+                            ))),
+                        },
+                        None => on_change(undo::Record::Event(undo::Change::created(
                             target.calendar_id(),
                             id,
                             draft.clone(),
-                        ));
+                        ))),
                     }
                     // A recurring event was created on the server as a series;
                     // the row just cached is one occurrence of it.
@@ -1395,6 +1620,13 @@ pub(crate) fn create_event_async(
     });
 }
 
+/// The message to show for a failed save, and whether Save may be pressed
+/// again.
+///
+/// Once the provider has created the event, a retry is not a retry: creation
+/// isn't idempotent and there is no key to repeat it under, so pressing Save
+/// again produces a second event on the server. The remote copy is already
+/// what the user asked for, so the local cache catches up at the next sync.
 fn save_failure(error: &str, created_remotely: bool) -> (String, bool) {
     if created_remotely {
         return (
@@ -1454,6 +1686,27 @@ mod tests {
     #[test]
     fn acting_on_a_whole_remote_series_needs_a_sync_before_the_grid_is_right() {
         assert_eq!(saved_state(true, true), Saved::StaleUntilSync);
+    }
+
+    #[test]
+    fn an_unexpanded_google_series_is_addressed_by_its_event_id() {
+        let remote = RemoteEvent::Google {
+            config: crate::config::GoogleConfig {
+                client_id: String::new(),
+                client_secret: String::new(),
+            },
+            token_key: "token".into(),
+            calendar_id: "cal".into(),
+            event_id: "master-1".into(),
+            series_id: None,
+        };
+
+        match remote.series_locator() {
+            Some(undo::SeriesLocator::Google { series_id, .. }) => {
+                assert_eq!(series_id, "master-1");
+            }
+            other => panic!("expected the event id as the series id, got {other:?}"),
+        }
     }
 
     #[test]

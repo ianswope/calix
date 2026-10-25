@@ -295,16 +295,20 @@ pub fn update_event(
 }
 
 /// Edits the master rather than re-anchoring it on the clicked occurrence.
+///
+/// Returns the series as it was, its exception events, and the master as the
+/// patch leaves it — what an undo compares against and puts back.
 pub fn update_series(
     access_token: &str,
     calendar_id: &str,
     series_id: &str,
     shift: crate::caldav::SeriesShift,
     draft: &crate::store::EventDraft,
-) -> Result<(), String> {
+) -> Result<(String, Vec<String>, String), String> {
     let url = event_url_notifying(calendar_id, series_id)?;
     let master: serde_json::Value =
         serde_json::from_str(&get(access_token, url.as_str())?).map_err(|e| e.to_string())?;
+    let exceptions = exception_events(access_token, calendar_id, &master)?;
     let patch = series_patch(&master, shift, draft)?;
     let mut request = crate::http::client()?
         .patch(url)
@@ -322,7 +326,261 @@ pub fn update_series(
             response.text().map_err(|e| e.to_string())?
         ));
     }
+    let after = projected_master(&master, &patch);
+    Ok((master.to_string(), exceptions, after.to_string()))
+}
+
+/// The master with `patch`'s fields laid over it. Recurrence stays the master's:
+/// an all-events patch deliberately omits it so Google keeps the rule.
+pub fn projected_master(
+    master: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let mut projected = master.clone();
+    if let Some(object) = projected.as_object_mut() {
+        for key in ["summary", "location", "description", "start", "end"] {
+            if let Some(value) = patch.get(key) {
+                object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    projected
+}
+
+/// Exception instances of `master_id` from an events list. The master itself
+/// and every unrelated event are left out.
+pub fn exceptions_of(master_id: &str, events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .get("recurringEventId")
+                .and_then(|value| value.as_str())
+                == Some(master_id)
+        })
+        .cloned()
+        .collect()
+}
+
+/// A Google event body an `events.import` will take. Read-only fields the GET
+/// included are dropped; `id` is set when the caller knows the one to reuse.
+pub fn importable_event(event: &serde_json::Value, id: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    for key in [
+        "iCalUID",
+        "summary",
+        "location",
+        "description",
+        "start",
+        "end",
+        "recurrence",
+        "recurringEventId",
+        "originalStartTime",
+        "status",
+    ] {
+        if let Some(value) = event.get(key) {
+            body.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(id) = id {
+        body.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    } else if let Some(id) = event.get("id") {
+        body.insert("id".to_string(), id.clone());
+    }
+    serde_json::Value::Object(body)
+}
+
+/// The PATCH that puts a stored master back, including a null where a field
+/// the edit may have filled is absent — otherwise Google would keep the new
+/// location. Recurrence is sent only when we have it, so a body that never
+/// carried the rule cannot wipe one.
+pub fn master_restore_body(master: &serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    for key in ["summary", "location", "description", "start", "end"] {
+        body.insert(
+            key.to_string(),
+            master.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    if let Some(recurrence) = master.get("recurrence") {
+        body.insert("recurrence".to_string(), recurrence.clone());
+    }
+    serde_json::Value::Object(body)
+}
+
+/// The JSON body `create_event` posts, kept so undoing that create can
+/// recognise the series Google stored.
+pub fn created_event_json(draft: &crate::store::EventDraft) -> Result<String, String> {
+    serde_json::to_string(&GoogleEventPatch::from_draft(draft, true)).map_err(|e| e.to_string())
+}
+
+/// The series master and its exception events, or `None` when Google no longer
+/// has the master.
+pub fn load_series(
+    access_token: &str,
+    calendar_id: &str,
+    series_id: &str,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let Some(master) = get_event(access_token, calendar_id, series_id)? else {
+        return Ok(None);
+    };
+    let exceptions = exception_events(access_token, calendar_id, &master)?;
+    Ok(Some((master.to_string(), exceptions)))
+}
+
+/// Deletes a series and returns the master and exceptions it removed.
+pub fn delete_series(
+    access_token: &str,
+    calendar_id: &str,
+    series_id: &str,
+) -> Result<(String, Vec<String>), String> {
+    let (master, exceptions) = load_series(access_token, calendar_id, series_id)?
+        .ok_or_else(|| "That series is already gone".to_string())?;
+    delete_event(access_token, calendar_id, series_id)?;
+    Ok((master, exceptions))
+}
+
+/// Puts a stored master back onto a series that is still there.
+pub fn restore_master(
+    access_token: &str,
+    calendar_id: &str,
+    series_id: &str,
+    master_json: &str,
+) -> Result<(), String> {
+    let master: serde_json::Value = serde_json::from_str(master_json).map_err(|e| e.to_string())?;
+    let url = event_url_notifying(calendar_id, series_id)?;
+    request_json(
+        access_token,
+        reqwest::Method::PATCH,
+        url.as_str(),
+        Some(&master_restore_body(&master)),
+    )
+}
+
+/// Puts a deleted series back: the master, then each exception.
+pub fn restore_series(
+    access_token: &str,
+    calendar_id: &str,
+    series_id: &str,
+    master_json: &str,
+    exceptions: &[String],
+) -> Result<(), String> {
+    let master: serde_json::Value = serde_json::from_str(master_json).map_err(|e| e.to_string())?;
+    import_event(
+        access_token,
+        calendar_id,
+        &importable_event(&master, Some(series_id)),
+    )?;
+    for exception in exceptions {
+        let event: serde_json::Value =
+            serde_json::from_str(exception).map_err(|e| e.to_string())?;
+        import_event(access_token, calendar_id, &importable_event(&event, None))?;
+    }
     Ok(())
+}
+
+fn exception_events(
+    access_token: &str,
+    calendar_id: &str,
+    master: &serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let Some(ical_uid) = master.get("iCalUID").and_then(|value| value.as_str()) else {
+        return Ok(Vec::new());
+    };
+    let master_id = master
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let events = list_events_by_ical_uid(access_token, calendar_id, ical_uid)?;
+    Ok(exceptions_of(master_id, &events)
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect())
+}
+
+fn get_event(
+    access_token: &str,
+    calendar_id: &str,
+    event_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let url = event_url(calendar_id, event_id)?;
+    let client = crate::http::client()?;
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = response.status();
+    if status.as_u16() == 404 || status.as_u16() == 410 {
+        return Ok(None);
+    }
+    let body = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("Google API error ({status}): {body}"));
+    }
+    serde_json::from_str(&body)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+fn list_events_by_ical_uid(
+    access_token: &str,
+    calendar_id: &str,
+    ical_uid: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars")
+        .map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid calendar API base URL".to_string())?
+        .push(calendar_id)
+        .push("events");
+    url.query_pairs_mut()
+        .append_pair("iCalUID", ical_uid)
+        .append_pair("singleEvents", "false")
+        .append_pair("maxResults", "250");
+    let mut events = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut page_url = url.clone();
+        if let Some(page_token) = &page_token {
+            page_url
+                .query_pairs_mut()
+                .append_pair("pageToken", page_token);
+        }
+        let body = get(access_token, page_url.as_str())?;
+        let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        if let Some(items) = parsed.get("items").and_then(|items| items.as_array()) {
+            events.extend(items.iter().cloned());
+        }
+        page_token = parsed
+            .get("nextPageToken")
+            .and_then(|token| token.as_str())
+            .map(str::to_string);
+        if page_token.is_none() {
+            break;
+        }
+    }
+    Ok(events)
+}
+
+fn import_event(
+    access_token: &str,
+    calendar_id: &str,
+    event: &serde_json::Value,
+) -> Result<(), String> {
+    let mut url = Url::parse("https://www.googleapis.com/calendar/v3/calendars")
+        .map_err(|e| e.to_string())?;
+    url.path_segments_mut()
+        .map_err(|_| "invalid calendar API base URL".to_string())?
+        .push(calendar_id)
+        .push("events")
+        .push("import");
+    request_json(
+        access_token,
+        reqwest::Method::POST,
+        url.as_str(),
+        Some(event),
+    )
 }
 
 fn series_patch(
@@ -841,6 +1099,74 @@ mod tests {
             url.query_pairs()
                 .any(|(key, value)| key == "sendUpdates" && value == "all"),
             "RSVP must send sendUpdates=all so the organizer is notified: {url}"
+        );
+    }
+
+    #[test]
+    fn projecting_a_series_patch_keeps_the_rule_and_lays_the_new_fields_over() {
+        let (master, draft) = series_fixture();
+        let shift = crate::caldav::SeriesShift::between(
+            draft.start - chrono::Duration::hours(1),
+            draft.start,
+        );
+        let patch = series_patch(&master, shift, &draft).unwrap();
+        let projected = projected_master(&master, &patch);
+
+        assert_eq!(projected["summary"], "Moved");
+        assert_eq!(projected["start"]["dateTime"], "2026-03-01T10:00:00-05:00");
+        assert_eq!(
+            projected["recurrence"],
+            serde_json::json!(["RRULE:FREQ=WEEKLY;COUNT=20"])
+        );
+    }
+
+    #[test]
+    fn exceptions_of_a_series_are_the_events_that_point_at_its_master() {
+        let events = vec![
+            serde_json::json!({"id": "series-1", "summary": "Standup"}),
+            serde_json::json!({"id": "ex-1", "recurringEventId": "series-1", "summary": "Moved"}),
+            serde_json::json!({"id": "other", "summary": "Dentist"}),
+        ];
+
+        let exceptions = exceptions_of("series-1", &events);
+
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0]["id"], "ex-1");
+    }
+
+    #[test]
+    fn restoring_a_master_sends_a_null_for_a_location_it_did_not_have() {
+        let master = serde_json::json!({
+            "summary": "Standup",
+            "recurrence": ["RRULE:FREQ=WEEKLY"]
+        });
+
+        let body = master_restore_body(&master);
+
+        assert!(body["location"].is_null());
+        assert_eq!(body["recurrence"], serde_json::json!(["RRULE:FREQ=WEEKLY"]));
+    }
+
+    #[test]
+    fn an_imported_exception_keeps_its_identity_and_drops_the_etag() {
+        let event = serde_json::json!({
+            "id": "ex-1",
+            "etag": "\"abc\"",
+            "htmlLink": "https://calendar.google.com/event?eid=ex-1",
+            "recurringEventId": "series-1",
+            "originalStartTime": {"dateTime": "2026-07-08T09:00:00-04:00"},
+            "summary": "Moved one"
+        });
+
+        let body = importable_event(&event, None);
+
+        assert!(body.get("etag").is_none());
+        assert!(body.get("htmlLink").is_none());
+        assert_eq!(body["id"], "ex-1");
+        assert_eq!(body["recurringEventId"], "series-1");
+        assert_eq!(
+            body["originalStartTime"]["dateTime"],
+            "2026-07-08T09:00:00-04:00"
         );
     }
 }
