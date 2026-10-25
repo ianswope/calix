@@ -652,9 +652,23 @@ fn calendar_list(
         }
     }
 
+    // One unreadable neighbor leaves the calendars from this response in place.
+    // The error still surfaces when this response had no calendars of its own.
+    let mut nested_error = None;
     for href in child_collections {
         let child_url = absolute_url(&credentials.base_url, &href)?;
-        calendars.extend(calendar_list(credentials, &child_url, depth + 1, visited)?);
+        match calendar_list(credentials, &child_url, depth + 1, visited) {
+            Ok(found) => calendars.extend(found),
+            Err(error) => {
+                eprintln!("calix: skipping CalDAV collection {child_url}: {error}");
+                nested_error = Some(error);
+            }
+        }
+    }
+    if calendars.is_empty()
+        && let Some(error) = nested_error
+    {
+        return Err(error);
     }
 
     Ok(calendars)
@@ -677,8 +691,15 @@ fn is_collection_response(response: &str) -> bool {
 }
 
 fn should_skip_calendar_collection(href: &str) -> bool {
+    // These sit beside calendars. Nextcloud's trashbin answers a depth-1
+    // PROPFIND of `trashbin/objects` with 501. iCloud has the same kind of
+    // neighbor in `notification` and `outbox`.
     let trimmed = href.trim_end_matches('/');
-    trimmed.ends_with("/notification") || trimmed.ends_with("/outbox")
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    matches!(
+        name,
+        "notification" | "notifications" | "outbox" | "trashbin"
+    )
 }
 
 fn same_collection(collection_url: &str, href: &str) -> bool {
@@ -1814,6 +1835,11 @@ fn unescape_ics_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn reading_an_invitation_preserves_quoted_attendee_names() {
@@ -2131,6 +2157,306 @@ ATTENDEE;CN=\"Smith: Jo; Work\";PARTSTAT=ACCEPTED:mailto:jo@example.com\r\nEND:V
         assert!(!should_skip_calendar_collection(
             "/99509935/calendars/personal/"
         ));
+    }
+
+    #[test]
+    fn a_nextcloud_trashbin_or_notifications_folder_is_not_opened() {
+        assert!(should_skip_calendar_collection(
+            "/remote.php/dav/calendars/me/trashbin/"
+        ));
+        assert!(should_skip_calendar_collection(
+            "/remote.php/dav/calendars/me/notifications/"
+        ));
+        assert!(!should_skip_calendar_collection(
+            "/remote.php/dav/calendars/me/personal/"
+        ));
+    }
+
+    #[test]
+    fn listing_a_nextcloud_home_does_not_open_the_trashbin_that_answers_501() {
+        let trashbin_probes = Arc::new(AtomicUsize::new(0));
+        let probes = Arc::clone(&trashbin_probes);
+        let server = spawn_propfind_server(move |path| {
+            let path = path.trim_end_matches('/');
+            if path.ends_with("/trashbin/objects") {
+                probes.fetch_add(1, Ordering::SeqCst);
+                (501, sabre_not_implemented())
+            } else if path.ends_with("/trashbin") {
+                probes.fetch_add(1, Ordering::SeqCst);
+                (
+                    207,
+                    propfind_document(&[dav_response(
+                        "/dav/calendars/me/trashbin/objects/",
+                        "<d:resourcetype><d:collection/></d:resourcetype>",
+                    )]),
+                )
+            } else if path.ends_with("/calendars/me") {
+                (
+                    207,
+                    propfind_document(&[
+                        dav_response(
+                            "/dav/calendars/me/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/me/personal/",
+                            "<d:displayname>Personal</d:displayname>\
+                             <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/me/trashbin/",
+                            "<d:resourcetype><d:collection/><nc:trash-bin/></d:resourcetype>",
+                        ),
+                    ]),
+                )
+            } else {
+                (404, format!("no fixture for {path}"))
+            }
+        });
+
+        let calendars = list_calendars_at(&server, "/dav/calendars/me/");
+
+        assert_eq!(calendar_names(&calendars), vec!["Personal"]);
+        assert_eq!(
+            trashbin_probes.load(Ordering::SeqCst),
+            0,
+            "the trashbin collection answers 501 and must not be opened"
+        );
+    }
+
+    #[test]
+    fn a_broken_neighbor_collection_does_not_drop_calendars_already_found() {
+        let server = spawn_propfind_server(|path| {
+            let path = path.trim_end_matches('/');
+            if path.ends_with("/legacy") {
+                (501, sabre_not_implemented())
+            } else if path.ends_with("/calendars/with-broken") {
+                (
+                    207,
+                    propfind_document(&[
+                        dav_response(
+                            "/dav/calendars/with-broken/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/with-broken/personal/",
+                            "<d:displayname>Personal</d:displayname>\
+                             <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/with-broken/legacy/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                    ]),
+                )
+            } else {
+                (404, format!("no fixture for {path}"))
+            }
+        });
+
+        let calendars = list_calendars_at(&server, "/dav/calendars/with-broken/");
+
+        assert_eq!(calendar_names(&calendars), vec!["Personal"]);
+    }
+
+    #[test]
+    fn a_home_whose_only_collection_fails_still_reports_that_error() {
+        let server = spawn_propfind_server(|path| {
+            let path = path.trim_end_matches('/');
+            if path.ends_with("/legacy") {
+                (501, sabre_not_implemented())
+            } else if path.ends_with("/calendars/only-broken") {
+                (
+                    207,
+                    propfind_document(&[
+                        dav_response(
+                            "/dav/calendars/only-broken/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/only-broken/legacy/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                    ]),
+                )
+            } else {
+                (404, format!("no fixture for {path}"))
+            }
+        });
+
+        let mut visited = HashSet::new();
+        let error = match calendar_list(
+            &credentials_for(&server.base_url),
+            &format!("{}{}", server.base_url, "/dav/calendars/only-broken/"),
+            0,
+            &mut visited,
+        ) {
+            Ok(calendars) => panic!(
+                "a home with no readable calendar still fails, found {}",
+                calendars.len()
+            ),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.contains("501"),
+            "the server status has to stay visible: {error}"
+        );
+    }
+
+    fn list_calendars_at(server: &PropfindServer, path: &str) -> Vec<RemoteCalendar> {
+        let mut visited = HashSet::new();
+        calendar_list(
+            &credentials_for(&server.base_url),
+            &format!("{}{path}", server.base_url),
+            0,
+            &mut visited,
+        )
+        .unwrap_or_else(|error| panic!("calendar list failed: {error}"))
+    }
+
+    fn calendar_names(calendars: &[RemoteCalendar]) -> Vec<&str> {
+        calendars
+            .iter()
+            .map(|calendar| calendar.name.as_str())
+            .collect()
+    }
+
+    fn sabre_not_implemented() -> String {
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
+  <s:exception>Sabre\DAV\Exception\NotImplemented</s:exception>
+  <s:message></s:message>
+</d:error>"#
+            .to_string()
+    }
+
+    fn dav_response(href: &str, properties: &str) -> String {
+        format!(
+            "<d:response><d:href>{href}</d:href><d:propstat><d:prop>{properties}</d:prop>\
+             <d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        )
+    }
+
+    fn propfind_document(responses: &[String]) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <d:multistatus xmlns:d=\"DAV:\" xmlns:cal=\"urn:ietf:params:xml:ns:caldav\" \
+             xmlns:nc=\"http://nextcloud.org/ns\">{}</d:multistatus>",
+            responses.concat()
+        )
+    }
+
+    struct PropfindServer {
+        base_url: String,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl Drop for PropfindServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn spawn_propfind_server(
+        respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+    ) -> PropfindServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local CalDAV fixture");
+        let address = listener.local_addr().expect("fixture address");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let request = read_http_request(&mut stream);
+                        let path = request_path(&request);
+                        let (status, body) = respond(&path);
+                        write_http_response(&mut stream, status, &body);
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        PropfindServer {
+            base_url: format!("http://{address}"),
+            shutdown,
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(read) => {
+                    buf.extend_from_slice(&tmp[..read]);
+                    if let Some(header_end) =
+                        buf.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&buf[..header_end]);
+                        let length = content_length(&headers);
+                        if buf.len() >= header_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.kind() == ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn request_path(request: &str) -> String {
+        request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+        let reason = match status {
+            207 => "Multi-Status",
+            404 => "Not Found",
+            501 => "Not Implemented",
+            _ => "OK",
+        };
+        let header = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/xml; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(body.as_bytes());
+        let _ = stream.flush();
     }
 
     #[test]
