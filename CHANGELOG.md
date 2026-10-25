@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Connecting a Nextcloud account no longer fails calendar discovery when the server's trashbin collection answers 501. Calendars listed beside an unreadable collection stay available.
 - Primary and destructive buttons keep readable fills on light accents.
 - Accent text uses the higher-contrast choice of black or white.
 - The sidebar mini month no longer repeats its month title.
