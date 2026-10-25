@@ -995,6 +995,10 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: attendees.clone(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         },
         attendees,
     })
@@ -2672,6 +2676,10 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();
@@ -2704,6 +2712,10 @@ DTSTART;VALUE=DATE:20260709\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let updated = replace_recurrence_instance(ics, "20260709T140000Z", &draft).unwrap();
@@ -2763,6 +2775,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let updated =
@@ -2792,6 +2808,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let updated =
@@ -2826,6 +2846,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
@@ -2850,6 +2874,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let ics = new_event_ics("uid-1", &draft);
@@ -2914,6 +2942,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 
@@ -3103,6 +3135,10 @@ END:VCALENDAR"#;
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let updated = replace_event_fields(ics, &draft).unwrap();

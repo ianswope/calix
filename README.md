@@ -393,7 +393,7 @@ than guessing from an empty list.
 - [x] Recurring event creation (daily/weekly/monthly/yearly), expanded on the grid
 - [x] Automatic background sync (on launch and every 15 minutes)
 - [x] Recurrence editing for synced CalDAV/iCloud series — edit or delete one occurrence or the whole series
-- [ ] Per-occurrence editing for local recurring events; whole-series edits for Google recurring events
+- [x] Per-occurrence editing for local repeating events
 - [x] Event alerts / desktop notifications (local to the machine, while Calix runs)
 - [x] Event search
 - [x] Copy, cut and paste an event onto a selected day or hour

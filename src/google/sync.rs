@@ -171,6 +171,10 @@ fn event_draft(event: &calendar_api::EventItem) -> Option<EventDraft> {
         reminder_minutes: None,
         additional_reminders: Vec::new(),
         attendees: event.invitees(),
+
+        instance_of: None,
+        original_start: None,
+        cancelled: false,
     })
 }
 

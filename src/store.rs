@@ -1,8 +1,9 @@
 use crate::recurrence::Frequency;
-use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, SecondsFormat, Timelike, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Someone invited to an event. Attendee lists are read-only here: they come
@@ -76,6 +77,16 @@ pub struct Event {
     /// Everyone invited, as last seen on the provider. Empty for local events
     /// and for remote events with no invitees.
     pub attendees: Vec<Attendee>,
+    /// The local series this event is one occurrence of. Set on an expanded
+    /// occurrence and on a stored exception; `None` on the series itself and
+    /// on an ordinary event.
+    pub instance_of: Option<i64>,
+    /// The occurrence this row replaces. It stays put when that occurrence is
+    /// moved, so the series can tell which date the exception stands in for.
+    pub original_start: Option<DateTime<Local>>,
+    /// A skipped occurrence. The row exists so the series knows to leave that
+    /// date out; it is not itself an event on the grid.
+    pub cancelled: bool,
 }
 
 /// Fields for creating or updating an event; `id`/`calendar_id` are handled
@@ -98,6 +109,24 @@ pub struct EventDraft {
     /// Invitees to send with a remote event. Local calendars retain these as
     /// event metadata but cannot deliver invitations.
     pub attendees: Vec<Attendee>,
+    /// Set when this draft is one occurrence of a local series. `None` on the
+    /// series itself and on an ordinary event.
+    pub instance_of: Option<i64>,
+    /// Which occurrence of `instance_of` this draft replaces.
+    pub original_start: Option<DateTime<Local>>,
+    /// This occurrence was removed from the series.
+    pub cancelled: bool,
+}
+
+/// What [`Store::save_occurrence`] wrote, so the caller can record an undo
+/// entry that round-trips through the same row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OccurrenceSaved {
+    pub id: i64,
+    /// The exception row's fields before this save, when one already existed.
+    pub previous: Option<EventDraft>,
+    /// The fields now stored, including which series and occurrence they belong to.
+    pub written: EventDraft,
 }
 
 impl Event {
@@ -116,6 +145,9 @@ impl Event {
             reminder_minutes: self.reminder_minutes,
             additional_reminders: self.additional_reminders.clone(),
             attendees: self.attendees.clone(),
+            instance_of: self.instance_of,
+            original_start: self.original_start,
+            cancelled: self.cancelled,
         }
     }
 }
@@ -358,6 +390,12 @@ impl Store {
         // JSON array of `Attendee`, written only by sync. `update_event` never
         // touches it, so editing an event locally keeps the provider's list.
         ensure_column(&conn, "events", "attendees", "TEXT")?;
+        // A local series is one row with an RRULE. One occurrence can diverge
+        // from it: `series_event_id` names the series, `original_start` names
+        // the date it replaces, and `cancelled` drops that date entirely.
+        ensure_column(&conn, "events", "series_event_id", "INTEGER")?;
+        ensure_column(&conn, "events", "original_start", "TEXT")?;
+        ensure_column(&conn, "events", "cancelled", "INTEGER NOT NULL DEFAULT 0")?;
         // Set by a local create/edit that has not yet been confirmed by a
         // successful remote write. Sync upserts and prunes skip these rows so
         // an in-flight drag cannot be overwritten by a concurrent pull.
@@ -386,6 +424,11 @@ impl Store {
                 WHERE account_id IS NOT NULL AND icloud_calendar_id IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS events_icloud_calendar_id
                 ON events(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS events_series_event_id
+                ON events(series_event_id) WHERE series_event_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS events_series_occurrence
+                ON events(series_event_id, original_start)
+                WHERE series_event_id IS NOT NULL AND original_start IS NOT NULL;
             ",
         )?;
 
@@ -762,6 +805,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "{EVENT_SELECT}
              WHERE events.recurrence IS NULL
+               AND events.cancelled = 0
                AND events.start_at < ?1 AND events.end_at > ?2
                AND calendars.visible != 0"
         ))?;
@@ -777,7 +821,10 @@ impl Store {
 
         // Recurring events have no server to expand them, and a master's own
         // stored span may fall outside the range, so fetch them all (unfiltered
-        // by date) and expand client-side into the range.
+        // by date) and expand client-side into the range. Dates that have an
+        // exception row are left out; that row is already in `events` unless
+        // the occurrence was cancelled.
+        let replaced = self.replaced_occurrences()?;
         let mut recurring = self.conn.prepare(&format!(
             "{EVENT_SELECT} WHERE events.recurrence IS NOT NULL AND calendars.visible != 0"
         ))?;
@@ -785,7 +832,7 @@ impl Store {
             .query_map([], row_to_event)?
             .collect::<rusqlite::Result<Vec<Option<Event>>>>()?;
         for master in masters.into_iter().flatten() {
-            events.extend(expand_recurring(&master, range_start, range_end));
+            events.extend(expand_recurring(&master, range_start, range_end, &replaced));
         }
 
         events.sort_by_key(|event| event.start);
@@ -816,6 +863,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "{EVENT_SELECT}
              WHERE calendars.visible != 0
+               AND events.cancelled = 0
                AND (events.title LIKE ?1 ESCAPE '\\'
                     OR IFNULL(events.location, '') LIKE ?1 ESCAPE '\\'
                     OR IFNULL(events.notes, '') LIKE ?1 ESCAPE '\\')
@@ -876,8 +924,8 @@ impl Store {
 
     pub fn create_event(&self, calendar_id: i64, draft: &EventDraft) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence, reminder_minutes, additional_reminders)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO events (calendar_id, title, start_at, end_at, all_day, location, notes, recurrence, reminder_minutes, additional_reminders, series_event_id, original_start, cancelled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 calendar_id,
                 draft.title,
@@ -889,15 +937,22 @@ impl Store {
                 draft.recurrence.map(Frequency::to_rrule),
                 draft.reminder_minutes,
                 serde_json::to_string(&draft.additional_reminders).unwrap(),
+                draft.instance_of,
+                draft.original_start.as_ref().map(stored_timestamp),
+                draft.cancelled as i64,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub fn update_event(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
+        let previous = self.event_by_id(id)?;
         self.conn.execute(
             "UPDATE events SET title = ?1, start_at = ?2, end_at = ?3, all_day = ?4,
-             location = ?5, notes = ?6, recurrence = ?7, reminder_minutes = ?8, additional_reminders = ?10 WHERE id = ?9",
+             location = ?5, notes = ?6, recurrence = ?7, reminder_minutes = ?8,
+             additional_reminders = ?10, series_event_id = ?11, original_start = ?12,
+             cancelled = ?13
+             WHERE id = ?9",
             params![
                 draft.title,
                 stored_timestamp(&draft.start),
@@ -909,8 +964,133 @@ impl Store {
                 draft.reminder_minutes,
                 id,
                 serde_json::to_string(&draft.additional_reminders).unwrap(),
+                draft.instance_of,
+                draft.original_start.as_ref().map(stored_timestamp),
+                draft.cancelled as i64,
             ],
         )?;
+        // Moving a series has to take its exceptions with it, or a date that
+        // was replaced no longer lines up with the occurrence it replaced.
+        if let Some(previous) = previous
+            && previous.recurrence.is_some()
+            && draft.recurrence.is_some()
+        {
+            self.shift_overrides(&previous, draft)?;
+        }
+        Ok(())
+    }
+
+    /// Writes one occurrence of a local series without touching the others.
+    ///
+    /// The series keeps its rule. This date is stored as its own row, and the
+    /// expanded copy of the series no longer appears on top of it. A second
+    /// save of the same date updates that row.
+    pub fn save_occurrence(
+        &self,
+        master_id: i64,
+        original_start: DateTime<Local>,
+        draft: &EventDraft,
+    ) -> rusqlite::Result<OccurrenceSaved> {
+        let Some(master) = self.event_by_id(master_id)? else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        let mut written = draft.clone();
+        written.instance_of = Some(master_id);
+        written.original_start = Some(original_start);
+        written.recurrence = None;
+        let existing = self.occurrence_id(master_id, original_start)?;
+        if let Some(id) = existing {
+            let previous = self.event_by_id(id)?.map(|event| event.draft());
+            self.update_event(id, &written)?;
+            Ok(OccurrenceSaved {
+                id,
+                previous,
+                written,
+            })
+        } else {
+            let id = self.create_event(master.calendar_id, &written)?;
+            Ok(OccurrenceSaved {
+                id,
+                previous: None,
+                written,
+            })
+        }
+    }
+
+    /// The exception rows of a local series, skipped dates included.
+    ///
+    /// Undo of deleting the series puts these back onto the new master id.
+    /// The caller rewrites [`EventDraft::instance_of`] to that id.
+    pub fn series_overrides(&self, master_id: i64) -> rusqlite::Result<Vec<EventDraft>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{EVENT_SELECT} WHERE events.series_event_id = ?1"))?;
+        Ok(stmt
+            .query_map(params![master_id], row_to_event)?
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?
+            .into_iter()
+            .flatten()
+            .map(|event| event.draft())
+            .collect())
+    }
+
+    fn occurrence_id(
+        &self,
+        master_id: i64,
+        original_start: DateTime<Local>,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM events WHERE series_event_id = ?1 AND original_start = ?2",
+                params![master_id, stored_timestamp(&original_start)],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Every series date that has an exception, including skipped ones.
+    fn replaced_occurrences(&self) -> rusqlite::Result<HashSet<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT series_event_id, original_start FROM events
+             WHERE series_event_id IS NOT NULL AND original_start IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// Slides every exception of `previous` by the same calendar-day and clock
+    /// change that took the series to `draft`.
+    fn shift_overrides(&self, previous: &Event, draft: &EventDraft) -> rusqlite::Result<()> {
+        let day_delta =
+            days_as_i32((draft.start.date_naive() - previous.start.date_naive()).num_days());
+        let clock_delta = if previous.all_day || draft.all_day {
+            Duration::zero()
+        } else {
+            Duration::seconds(
+                i64::from(draft.start.time().num_seconds_from_midnight())
+                    - i64::from(previous.start.time().num_seconds_from_midnight()),
+            )
+        };
+        if day_delta == 0 && clock_delta.is_zero() {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{EVENT_SELECT} WHERE events.series_event_id = ?1"))?;
+        let overrides = stmt
+            .query_map(params![previous.id], row_to_event)?
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?;
+        for event in overrides.into_iter().flatten() {
+            let mut override_draft = event.draft();
+            override_draft.start = shift_wall(override_draft.start, day_delta, clock_delta);
+            override_draft.end = shift_wall(override_draft.end, day_delta, clock_delta);
+            if let Some(original) = override_draft.original_start {
+                override_draft.original_start = Some(shift_wall(original, day_delta, clock_delta));
+            }
+            // An exception does not itself repeat, so this update does not
+            // come back through here.
+            self.update_event(event.id, &override_draft)?;
+        }
         Ok(())
     }
 
@@ -944,6 +1124,10 @@ impl Store {
     }
 
     pub fn delete_event(&self, id: i64) -> rusqlite::Result<()> {
+        // Exceptions point at the series. Drop them with it, or deleting the
+        // series would leave those dates behind as ordinary events.
+        self.conn
+            .execute("DELETE FROM events WHERE series_event_id = ?1", params![id])?;
         self.conn
             .execute("DELETE FROM events WHERE id = ?1", params![id])?;
         Ok(())
@@ -1337,20 +1521,21 @@ const EVENT_SELECT: &str = "SELECT events.id, events.calendar_id, calendars.name
             events.end_at, events.all_day, events.location, events.notes,
             events.google_event_id, events.icloud_event_id,
             accounts.server_url, events.recurrence, events.reminder_minutes,
-            events.attendees, events.additional_reminders
+            events.attendees, events.additional_reminders,
+            events.series_event_id, events.original_start, events.cancelled
      FROM events
      JOIN calendars ON calendars.id = events.calendar_id
      LEFT JOIN accounts ON accounts.id = calendars.account_id";
 
 /// The occurrences of a recurring `master` overlapping the range. Each is a
-/// clone carrying the master's id and recurrence, so clicking any occurrence
-/// opens the series. Dragging one shifts the whole series by that same amount
-/// (`shift_series`); it does not retarget the master onto the copy that was
-/// grabbed.
+/// clone carrying the master's id and recurrence, plus which date it is, so
+/// one of them can be edited without the others. Dates in `replaced` already
+/// have an exception row and are left out.
 fn expand_recurring(
     master: &Event,
     range_start: DateTime<Local>,
     range_end: DateTime<Local>,
+    replaced: &HashSet<(i64, String)>,
 ) -> Vec<Event> {
     let Some(freq) = master.recurrence else {
         return Vec::new();
@@ -1379,13 +1564,98 @@ fn expand_recurring(
         end_at,
     )
     .into_iter()
+    .filter(|start| !replaced.contains(&(master.id, stored_timestamp(start))))
     .map(|start| {
         let mut occurrence = master.clone();
         occurrence.end = end_at(&start);
         occurrence.start = start;
+        occurrence.instance_of = Some(master.id);
+        occurrence.original_start = Some(start);
+        occurrence.cancelled = false;
         occurrence
     })
     .collect()
+}
+
+fn days_as_i32(days: i64) -> i32 {
+    i32::try_from(days).unwrap_or(if days.is_negative() {
+        i32::MIN
+    } else {
+        i32::MAX
+    })
+}
+
+/// The master row after one occurrence was edited.
+///
+/// The stored row is the first occurrence, not the block that was dragged.
+/// The series keeps its shape: the same calendar-day distance and the same
+/// clock change, measured from the grabbed occurrence to where it landed.
+/// The day is applied first and the clock second, so a 23:00 dragged to 01:00
+/// the next morning is one day forward and 22 hours back — 01:00, not a
+/// second day earlier from also counting the midnight wrap.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) fn shift_series(master: &Event, occurrence: &Event, edited: &EventDraft) -> EventDraft {
+    let day_delta =
+        days_as_i32((edited.start.date_naive() - occurrence.start.date_naive()).num_days());
+    if edited.all_day {
+        let span_days = days_as_i32(
+            (edited.end.date_naive() - edited.start.date_naive())
+                .num_days()
+                .max(1),
+        );
+        let start_date = crate::date_util::shift_days(master.start.date_naive(), day_delta);
+        return EventDraft {
+            start: day_start(start_date),
+            end: day_start(crate::date_util::shift_days(start_date, span_days)),
+            all_day: true,
+            ..master.draft()
+        };
+    }
+
+    let clock_delta = Duration::seconds(
+        i64::from(edited.start.time().num_seconds_from_midnight())
+            - i64::from(occurrence.start.time().num_seconds_from_midnight()),
+    );
+    let start_date = crate::date_util::shift_days(master.start.date_naive(), day_delta);
+    let start = crate::date_util::resolve_forward(&Local, start_date.and_time(master.start.time()))
+        + clock_delta;
+    let duration = edited.end - edited.start;
+    EventDraft {
+        start,
+        end: start + duration,
+        all_day: false,
+        ..master.draft()
+    }
+}
+
+/// The series after an "All events" edit of one occurrence.
+///
+/// Times move with [`shift_series`]. The title, place, notes, repeat rule and
+/// reminders come from the form. A stored exception keeps the title it already
+/// has; this only describes the master.
+#[cfg(any(test, feature = "gui"))]
+pub(crate) fn series_edit(master: &Event, occurrence: &Event, form: &EventDraft) -> EventDraft {
+    let mut shifted = shift_series(master, occurrence, form);
+    shifted.title = form.title.clone();
+    shifted.location = form.location.clone();
+    shifted.notes = form.notes.clone();
+    shifted.recurrence = form.recurrence;
+    shifted.reminder_minutes = form.reminder_minutes;
+    shifted.additional_reminders = form.additional_reminders.clone();
+    shifted
+}
+
+/// Moves `instant` by a number of calendar days and a clock change. The day
+/// is applied first so a DST boundary cannot turn a one-day move into 23 or
+/// 25 hours.
+fn shift_wall(instant: DateTime<Local>, day_delta: i32, clock_delta: Duration) -> DateTime<Local> {
+    let seconds = i64::from(instant.time().num_seconds_from_midnight()) + clock_delta.num_seconds();
+    let extra_days = i32::try_from(seconds.div_euclid(86_400)).unwrap_or(0);
+    let wrapped = u32::try_from(seconds.rem_euclid(86_400)).unwrap_or(0);
+    let date =
+        crate::date_util::shift_days(instant.date_naive(), day_delta.saturating_add(extra_days));
+    let time = NaiveTime::from_num_seconds_from_midnight_opt(wrapped, 0).unwrap_or(NaiveTime::MIN);
+    crate::date_util::resolve_forward(&Local, date.and_time(time))
 }
 
 /// `None` for a row whose stored timestamps can't be read — see
@@ -1422,6 +1692,12 @@ fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Option<Event>> {
         reminder_minutes: row.get(18)?,
         additional_reminders: serde_json::from_str(&row.get::<_, String>(20)?).unwrap_or_default(),
         attendees: attendees_from_json(row.get(19)?),
+        instance_of: row.get(21)?,
+        original_start: row
+            .get::<_, Option<String>>(22)?
+            .as_deref()
+            .and_then(parse_rfc3339),
+        cancelled: row.get::<_, i64>(23)? != 0,
     }))
 }
 
@@ -1583,6 +1859,9 @@ mod tests {
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 
@@ -2426,6 +2705,247 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
         );
         assert_eq!(events[0].recurrence, Some(Frequency::Weekly));
+    }
+
+    fn weekly_standup(store: &Store) -> (i64, DateTime<Local>) {
+        // 2026-07-02 is a Thursday.
+        let base = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", base, base + Duration::hours(1));
+        weekly.recurrence = Some(Frequency::Weekly);
+        let id = store
+            .create_event(store.default_calendar_id(), &weekly)
+            .unwrap();
+        (id, base)
+    }
+
+    fn titles_between(store: &Store, from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, String)> {
+        let events = store
+            .events_between(day_start(from), day_start(to))
+            .unwrap();
+        events
+            .into_iter()
+            .map(|event| (event.start.date_naive(), event.title))
+            .collect()
+    }
+
+    #[test]
+    fn editing_one_occurrence_of_a_local_series_leaves_the_other_weeks() {
+        let store = Store::open_in_memory().unwrap();
+        let (id, base) = weekly_standup(&store);
+        let third = base + Duration::weeks(2);
+        let mut moved = draft(
+            "Special",
+            third + Duration::hours(2),
+            third + Duration::hours(3),
+        );
+        moved.notes = Some("just this one".to_string());
+        store.save_occurrence(id, third, &moved).unwrap();
+
+        assert_eq!(
+            titles_between(
+                &store,
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            ),
+            vec![
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 9).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+                    "Special".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+                    "Standup".into()
+                ),
+            ]
+        );
+        let special = store
+            .events_between(
+                day_start(third.date_naive()),
+                day_start(third.date_naive() + Duration::days(1)),
+            )
+            .unwrap();
+        assert_eq!(special.len(), 1);
+        assert_eq!(special[0].start, third + Duration::hours(2));
+        assert_eq!(special[0].instance_of, Some(id));
+        assert_eq!(special[0].original_start, Some(third));
+        assert_eq!(special[0].notes.as_deref(), Some("just this one"));
+        assert_eq!(special[0].recurrence, None);
+    }
+
+    #[test]
+    fn skipping_one_occurrence_of_a_local_series_hides_only_that_date() {
+        let store = Store::open_in_memory().unwrap();
+        let (id, base) = weekly_standup(&store);
+        let second = base + Duration::weeks(1);
+        let mut skipped = draft("Standup", second, second + Duration::hours(1));
+        skipped.cancelled = true;
+        store.save_occurrence(id, second, &skipped).unwrap();
+
+        assert_eq!(
+            titles_between(
+                &store,
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+            ),
+            vec![
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 2).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+                    "Standup".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_a_local_series_keeps_an_override_on_the_shifted_date() {
+        let store = Store::open_in_memory().unwrap();
+        let (id, base) = weekly_standup(&store);
+        let third = base + Duration::weeks(2);
+        let special = draft("Special", third, third + Duration::hours(1));
+        store.save_occurrence(id, third, &special).unwrap();
+
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let mut shifted = master.draft();
+        shifted.start = base + Duration::days(1);
+        shifted.end = shifted.start + Duration::hours(1);
+        store.update_event(id, &shifted).unwrap();
+
+        assert_eq!(
+            titles_between(
+                &store,
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            ),
+            vec![
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+                    "Special".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+                    "Standup".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+                    "Standup".into()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_all_events_edit_renames_the_series_and_keeps_an_override_title() {
+        let store = Store::open_in_memory().unwrap();
+        let (id, base) = weekly_standup(&store);
+        let second = base + Duration::weeks(1);
+        store
+            .save_occurrence(
+                id,
+                second,
+                &draft("Special", second, second + Duration::hours(1)),
+            )
+            .unwrap();
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let third = base + Duration::weeks(2);
+        let occurrence = store
+            .events_between(
+                day_start(third.date_naive()),
+                day_start(third.date_naive() + Duration::days(1)),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut form = occurrence.draft();
+        form.title = "Moved".to_string();
+        form.location = Some("Room 2".to_string());
+        form.start = third + Duration::days(1);
+        form.end = form.start + Duration::hours(1);
+        form.recurrence = master.recurrence;
+
+        store
+            .update_event(id, &series_edit(&master, &occurrence, &form))
+            .unwrap();
+
+        assert_eq!(
+            titles_between(
+                &store,
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+            ),
+            vec![
+                (NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(), "Moved".into()),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+                    "Special".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+                    "Moved".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+                    "Moved".into()
+                ),
+                (
+                    NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+                    "Moved".into()
+                ),
+            ]
+        );
+        let master = store.event_by_id(id).unwrap().unwrap();
+        assert_eq!(master.location.as_deref(), Some("Room 2"));
+        assert_eq!(master.recurrence, Some(Frequency::Weekly));
+    }
+
+    #[test]
+    fn deleting_a_local_series_removes_its_occurrence_overrides() {
+        let store = Store::open_in_memory().unwrap();
+        let (id, base) = weekly_standup(&store);
+        let third = base + Duration::weeks(2);
+        let special = draft("Special", third, third + Duration::hours(1));
+        store.save_occurrence(id, third, &special).unwrap();
+
+        store.delete_event(id).unwrap();
+
+        assert!(
+            titles_between(
+                &store,
+                NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]

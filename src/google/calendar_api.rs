@@ -870,6 +870,10 @@ mod tests {
                 reminder_minutes: None,
                 additional_reminders: Vec::new(),
                 attendees: Vec::new(),
+
+                instance_of: None,
+                original_start: None,
+                cancelled: false,
             },
         )
     }
@@ -1028,6 +1032,10 @@ mod tests {
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();
@@ -1050,6 +1058,10 @@ mod tests {
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         };
 
         let json = serde_json::to_value(GoogleEventPatch::from_draft(&draft, false)).unwrap();

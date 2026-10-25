@@ -539,6 +539,10 @@ fn event(id: i64, start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -
         recurrence: None,
         reminder_minutes: None,
         additional_reminders: Vec::new(),
+
+        instance_of: None,
+        original_start: None,
+        cancelled: false,
     }
 }
 
@@ -733,6 +737,25 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         ("edit event dialog", {
             let (event, store) = (timed.clone(), store.clone());
             Box::new(move || {
+                let start = event.start;
+                event_dialog::build(
+                    store,
+                    Vec::new(),
+                    Some(event),
+                    start,
+                    None,
+                    |_| {},
+                    |_| {},
+                    None,
+                )
+                .upcast()
+            })
+        }),
+        ("edit one local occurrence", {
+            let (mut event, store) = (timed.clone(), store.clone());
+            Box::new(move || {
+                event.instance_of = Some(1);
+                event.original_start = Some(event.start);
                 let start = event.start;
                 event_dialog::build(
                     store,

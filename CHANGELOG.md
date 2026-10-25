@@ -10,6 +10,7 @@
 - Google recurring events offer This event and All events for edits and deletes.
 - Undo can recreate deleted events on synced calendars and retain their new provider identities.
 - Undo covers an all-events edit or delete, and creating a repeating event on a synced calendar. Taking one back puts the provider's series back, including per-occurrence overrides.
+- One occurrence of a local repeating event can be edited, moved, or deleted on its own. The rest of the series stays as it is, and undo puts that one date back.
 
 ### Changed
 
