@@ -37,6 +37,9 @@ pub struct Change {
     pub before: Option<EventDraft>,
     /// What it held afterwards; `None` when the change deleted it.
     pub after: Option<EventDraft>,
+    /// Exception rows that belonged to a deleted local series. Empty for every
+    /// other change. Putting the series back writes these onto the new master.
+    pub overrides: Vec<EventDraft>,
 }
 
 impl Change {
@@ -47,6 +50,7 @@ impl Change {
             id: Some(id),
             before: None,
             after: Some(draft),
+            overrides: Vec::new(),
         }
     }
 
@@ -57,6 +61,7 @@ impl Change {
             id: Some(id),
             before: Some(before),
             after: Some(after),
+            overrides: Vec::new(),
         }
     }
 
@@ -67,7 +72,14 @@ impl Change {
             id: None,
             before: Some(draft),
             after: None,
+            overrides: Vec::new(),
         }
+    }
+
+    /// The exception rows to put back with a deleted local series.
+    pub fn with_overrides(mut self, overrides: Vec<EventDraft>) -> Self {
+        self.overrides = overrides;
+        self
     }
 
     /// The write that takes the row back to how it was before this change,
@@ -106,6 +118,7 @@ impl Change {
             (Some(draft), None) => Ok(Write::Insert {
                 calendar_id: self.calendar_id,
                 draft: draft.clone(),
+                overrides: self.overrides.clone(),
             }),
             (None, Some(id)) => Ok(Write::Delete { id }),
             // Nothing to remove and nothing to write: the row is already where
@@ -133,15 +146,20 @@ fn same_edit(a: &EventDraft, b: &EventDraft) -> bool {
         && a.recurrence == b.recurrence
         && a.reminder_minutes == b.reminder_minutes
         && a.additional_reminders == b.additional_reminders
+        && a.instance_of == b.instance_of
+        && a.original_start == b.original_start
+        && a.cancelled == b.cancelled
 }
 
 /// The database write that carries out one undo or redo step.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Write {
-    /// Put a deleted event back. It returns with a new id.
+    /// Put a deleted event back. It returns with a new id. `overrides` are the
+    /// exception rows of a deleted local series, rewritten onto that new id.
     Insert {
         calendar_id: i64,
         draft: EventDraft,
+        overrides: Vec<EventDraft>,
     },
     Update {
         id: i64,
@@ -170,9 +188,82 @@ pub enum Stale {
 /// display attached.
 pub fn apply(store: &Store, write: &Write) -> rusqlite::Result<Option<i64>> {
     match write {
-        Write::Insert { calendar_id, draft } => store.create_event(*calendar_id, draft).map(Some),
+        Write::Insert {
+            calendar_id,
+            draft,
+            overrides,
+        } => {
+            let id = store.create_event(*calendar_id, draft)?;
+            for exception in overrides {
+                let mut exception = exception.clone();
+                // The snapshot still names the master that was deleted.
+                exception.instance_of = Some(id);
+                store.create_event(*calendar_id, &exception)?;
+            }
+            Ok(Some(id))
+        }
         Write::Update { id, draft } => store.update_event(*id, draft).map(|()| Some(*id)),
         Write::Delete { id } => store.delete_event(*id).map(|()| None),
+    }
+}
+
+/// The undo entry for one [`crate::store::Store::save_occurrence`].
+///
+/// The first write of a date creates the exception row, so taking it back
+/// removes that row and the series fills the date again. A later write edits
+/// the row, so taking it back restores the previous version of that one date.
+pub fn recorded_occurrence(calendar_id: i64, saved: &crate::store::OccurrenceSaved) -> Change {
+    match &saved.previous {
+        Some(before) => {
+            Change::edited(calendar_id, saved.id, before.clone(), saved.written.clone())
+        }
+        None => Change::created(calendar_id, saved.id, saved.written.clone()),
+    }
+}
+
+/// How a save in the event dialog applies to a local event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalSave {
+    /// Write an exception for this one date.
+    OneOccurrence,
+    /// Move the series and take the form's title, place, notes, rule and reminders.
+    AllEvents,
+    /// Rewrite the open row. That is the series itself when search opened the master.
+    ThisRow,
+}
+
+/// `is_occurrence` is a stored or expanded date of a local series. `all_events`
+/// is the dialog's "All events" choice.
+pub fn local_save(is_occurrence: bool, all_events: bool) -> LocalSave {
+    if is_occurrence && all_events {
+        LocalSave::AllEvents
+    } else if is_occurrence {
+        LocalSave::OneOccurrence
+    } else {
+        LocalSave::ThisRow
+    }
+}
+
+/// How a delete in the event dialog applies to a local event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalRemoval {
+    /// Store a skip for this one date.
+    OneOccurrence,
+    /// Delete the series and every exception that belonged to it.
+    WholeSeries,
+    /// Delete the one row.
+    ThisRow,
+}
+
+/// `is_occurrence` is one date of a local series. `repeats` is a row that still
+/// carries the series rule, including the master opened on its own.
+pub fn local_removal(apply_to_all: bool, is_occurrence: bool, repeats: bool) -> LocalRemoval {
+    if is_occurrence && !apply_to_all {
+        LocalRemoval::OneOccurrence
+    } else if deletes_whole_series(apply_to_all, is_occurrence, repeats) {
+        LocalRemoval::WholeSeries
+    } else {
+        LocalRemoval::ThisRow
     }
 }
 
@@ -394,6 +485,10 @@ pub enum SeriesWrite {
 }
 
 /// One entry in the undo stack: a single row, or a whole series.
+///
+/// Both variants own the row they would put back. Boxing them would allocate
+/// on every ordinary edit to shrink an entry that is already the whole change.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Record {
     Event(Change),
@@ -642,6 +737,10 @@ mod tests {
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 
@@ -829,7 +928,8 @@ mod tests {
             change.undo(None),
             Ok(Write::Insert {
                 calendar_id: 4,
-                draft: draft("Dentist", 15)
+                draft: draft("Dentist", 15),
+                overrides: Vec::new(),
             })
         );
     }
@@ -859,6 +959,213 @@ mod tests {
             change.undo(Some(&draft("Dentist", 15))),
             Err(Stale::ChangedSince)
         );
+    }
+
+    #[test]
+    fn a_moved_or_skipped_occurrence_is_a_different_edit() {
+        let change = Change::edited(1, 7, draft("Standup", 9), draft("Standup", 11));
+        let mut moved = draft("Standup", 11);
+        moved.original_start = Some(at(9));
+        moved.instance_of = Some(3);
+
+        assert_eq!(change.undo(Some(&moved)), Err(Stale::ChangedSince));
+
+        let mut skipped = draft("Standup", 11);
+        skipped.cancelled = true;
+        assert_eq!(change.undo(Some(&skipped)), Err(Stale::ChangedSince));
+    }
+
+    #[test]
+    fn saving_one_local_occurrence_is_not_an_edit_of_the_whole_series() {
+        assert_eq!(local_save(true, false), LocalSave::OneOccurrence);
+        assert_eq!(local_save(true, true), LocalSave::AllEvents);
+        assert_eq!(
+            local_save(false, false),
+            LocalSave::ThisRow,
+            "the series master, opened on its own, is the row being saved"
+        );
+    }
+
+    #[test]
+    fn deleting_one_local_occurrence_skips_that_date() {
+        assert_eq!(
+            local_removal(false, true, true),
+            LocalRemoval::OneOccurrence
+        );
+        assert_eq!(
+            local_removal(false, true, false),
+            LocalRemoval::OneOccurrence,
+            "a stored exception no longer carries the rule, and it is still one date"
+        );
+    }
+
+    #[test]
+    fn deleting_every_local_occurrence_removes_the_series() {
+        assert_eq!(local_removal(true, true, true), LocalRemoval::WholeSeries);
+        assert_eq!(local_removal(true, true, false), LocalRemoval::WholeSeries);
+        assert_eq!(
+            local_removal(false, false, true),
+            LocalRemoval::WholeSeries,
+            "the master row is the series"
+        );
+        assert_eq!(local_removal(false, false, false), LocalRemoval::ThisRow);
+    }
+
+    #[test]
+    fn undoing_a_deleted_local_series_puts_its_occurrence_back() {
+        let store = Store::open_in_memory().expect("an in-memory database");
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", 9);
+        weekly.start = start;
+        weekly.end = start + Duration::hours(1);
+        weekly.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let id = store.create_event(1, &weekly).expect("the series to store");
+        let third = start + Duration::weeks(2);
+        let mut special = draft("Special", 11);
+        special.start = third + Duration::hours(2);
+        special.end = third + Duration::hours(3);
+        special.notes = Some("just this one".to_string());
+        store
+            .save_occurrence(id, third, &special)
+            .expect("the exception to store");
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let overrides = store.series_overrides(id).unwrap();
+        store.delete_event(id).unwrap();
+
+        let mut history = History::default();
+        history
+            .record(Change::deleted(master.calendar_id, master.draft()).with_overrides(overrides));
+        undo_once(&store, &mut history).expect("the series to come back");
+
+        let restored_id = history
+            .peek_redo()
+            .and_then(Record::as_event)
+            .and_then(|change| change.id)
+            .expect("the restored master id");
+        let from = Local
+            .with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let until = Local
+            .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+            .single()
+            .unwrap();
+        let titles: Vec<_> = store
+            .events_between(from, until)
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.start.date_naive(), event.title, event.instance_of))
+            .collect();
+        let jul = |day| chrono::NaiveDate::from_ymd_opt(2026, 7, day).unwrap();
+        assert_eq!(
+            titles,
+            vec![
+                (jul(2), "Standup".to_string(), Some(restored_id)),
+                (jul(9), "Standup".to_string(), Some(restored_id)),
+                (jul(16), "Special".to_string(), Some(restored_id)),
+                (jul(23), "Standup".to_string(), Some(restored_id)),
+                (jul(30), "Standup".to_string(), Some(restored_id)),
+            ]
+        );
+        let special = store
+            .events_between(
+                Local
+                    .with_ymd_and_hms(2026, 7, 16, 0, 0, 0)
+                    .single()
+                    .unwrap(),
+                Local
+                    .with_ymd_and_hms(2026, 7, 17, 0, 0, 0)
+                    .single()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(special[0].notes.as_deref(), Some("just this one"));
+        assert_eq!(special[0].original_start, Some(third));
+
+        redo_once(&store, &mut history).expect("the delete to happen again");
+        assert!(store.events_between(from, until).unwrap().is_empty());
+        assert!(store.series_overrides(restored_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn undoing_the_first_edit_of_one_occurrence_brings_that_date_back() {
+        let store = Store::open_in_memory().expect("an in-memory database");
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", 9);
+        weekly.start = start;
+        weekly.end = start + Duration::hours(1);
+        weekly.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let id = store.create_event(1, &weekly).unwrap();
+        let second = start + Duration::weeks(1);
+        let mut skipped = draft("Standup", 9);
+        skipped.start = second;
+        skipped.end = second + Duration::hours(1);
+        skipped.cancelled = true;
+        let saved = store.save_occurrence(id, second, &skipped).unwrap();
+        let mut history = History::default();
+        history.record(recorded_occurrence(1, &saved));
+
+        undo_once(&store, &mut history).expect("the skip to come back");
+        let from = Local
+            .with_ymd_and_hms(2026, 7, 9, 0, 0, 0)
+            .single()
+            .unwrap();
+        let until = Local
+            .with_ymd_and_hms(2026, 7, 10, 0, 0, 0)
+            .single()
+            .unwrap();
+        let events = store.events_between(from, until).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Standup");
+        assert_eq!(events[0].id, id, "the date is the series again");
+    }
+
+    #[test]
+    fn undoing_a_second_edit_of_one_occurrence_restores_the_first_version() {
+        let store = Store::open_in_memory().expect("an in-memory database");
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let mut weekly = draft("Standup", 9);
+        weekly.start = start;
+        weekly.end = start + Duration::hours(1);
+        weekly.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let id = store.create_event(1, &weekly).unwrap();
+        let third = start + Duration::weeks(2);
+        let mut first = draft("Special", 11);
+        first.start = third + Duration::hours(2);
+        first.end = third + Duration::hours(3);
+        store.save_occurrence(id, third, &first).unwrap();
+        let mut second = first.clone();
+        second.title = "Moved again".to_string();
+        second.start = third + Duration::hours(4);
+        second.end = third + Duration::hours(5);
+        let saved = store.save_occurrence(id, third, &second).unwrap();
+        let mut history = History::default();
+        history.record(recorded_occurrence(1, &saved));
+
+        undo_once(&store, &mut history).expect("the second edit to come back");
+        let from = Local
+            .with_ymd_and_hms(2026, 7, 16, 0, 0, 0)
+            .single()
+            .unwrap();
+        let until = Local
+            .with_ymd_and_hms(2026, 7, 17, 0, 0, 0)
+            .single()
+            .unwrap();
+        let events = store.events_between(from, until).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Special");
+        assert_eq!(events[0].start, third + Duration::hours(2));
+        assert_eq!(events[0].instance_of, Some(id));
+        assert_eq!(events[0].original_start, Some(third));
     }
 
     #[test]
@@ -900,6 +1207,7 @@ mod tests {
         let write = Write::Insert {
             calendar_id: 4,
             draft: draft("Dentist", 15),
+            overrides: Vec::new(),
         };
 
         assert!(needs_a_remote_create(&write, false));

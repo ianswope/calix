@@ -305,6 +305,10 @@ mod tests {
             reminder_minutes: None,
             additional_reminders: Vec::new(),
             attendees: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 

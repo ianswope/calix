@@ -141,6 +141,10 @@ mod tests {
             recurrence: None,
             reminder_minutes,
             additional_reminders: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 

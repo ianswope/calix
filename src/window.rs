@@ -698,7 +698,10 @@ impl Ui {
             return;
         };
         if undo::needs_a_remote_create(&write, self.calendar_is_local(change.calendar_id)) {
-            if let undo::Write::Insert { calendar_id, draft } = write {
+            if let undo::Write::Insert {
+                calendar_id, draft, ..
+            } = write
+            {
                 self.restore_remote_event(step, calendar_id, draft);
             }
             return;
@@ -1507,19 +1510,9 @@ impl Ui {
                 let Some(ui) = ui.upgrade() else {
                     return;
                 };
-                // Local recurring events render as many occurrences that share
-                // the master's id; editing any of them edits the series, so open
-                // the stored master (its real start) rather than the clicked
-                // occurrence, which would otherwise re-anchor the whole series.
-                let event = if event.recurrence.is_some() {
-                    ui.store
-                        .event_by_id(event.id)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(event)
-                } else {
-                    event
-                };
+                // The clicked block is the occurrence: it carries that date and
+                // which series it belongs to. Replacing it with the stored
+                // master would edit every week.
                 let start = event.start;
                 let ui_for_saved = ui.clone();
                 let ui_for_change = ui.clone();
@@ -3019,6 +3012,7 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
             // A local series is one row. The draft describes the grabbed
             // occurrence; the stored master has to move by the same delta, or
             // the series would be replanted on the day that was dragged.
+            // An exception already has its own row, so it moves by itself.
             if occurrence.recurrence.is_some() {
                 let master = match ui.store.event_by_id(occurrence.id) {
                     Ok(Some(master)) => master,
@@ -3028,8 +3022,8 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
                         return;
                     }
                 };
-                let shifted = shift_series(&master, &occurrence, &draft);
-                confirm_series_drag(&ui, master, shifted);
+                let shifted = store::shift_series(&master, &occurrence, &draft);
+                confirm_series_drag(&ui, occurrence, master, draft, shifted);
                 return;
             }
             apply_drag(&ui, occurrence, draft);
@@ -3037,30 +3031,54 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
     )
 }
 
-/// Asks before a drag rewrites every occurrence. "Only this event" needs
-/// exceptions the sync layer cannot round-trip, so the choice is the whole
-/// series or nothing.
-fn confirm_series_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
+/// Asks whether a drag of one date changes that date or the whole series.
+fn confirm_series_drag(
+    ui: &Rc<Ui>,
+    occurrence: Event,
+    master: Event,
+    this_event: EventDraft,
+    all_events: EventDraft,
+) {
     let alert = adw::AlertDialog::builder()
-        .heading("Change all events in this series?")
-        .body(
-            "This event repeats. The change applies to every event in the series. \
-             Changing only this one isn't available yet.",
-        )
+        .heading("Change repeating event?")
+        .body("This event repeats. You can change only this one, or every event in the series.")
         .build();
     alert.add_response("cancel", "Cancel");
-    alert.add_response("all", "Change All");
-    alert.set_response_appearance("all", adw::ResponseAppearance::Suggested);
+    alert.add_response("one", "Only This Event");
+    alert.add_response("all", "All Events");
     alert.set_default_response(Some("cancel"));
     alert.set_close_response("cancel");
     let ui_for_dialog = ui.clone();
-    alert.connect_response(None, move |_, response| {
-        if response != "all" {
-            return;
-        }
-        apply_drag(&ui_for_dialog, event.clone(), draft.clone());
+    alert.connect_response(None, move |_, response| match response {
+        "one" => apply_occurrence_drag(&ui_for_dialog, occurrence.clone(), this_event.clone()),
+        "all" => apply_drag(&ui_for_dialog, master.clone(), all_events.clone()),
+        _ => {}
     });
     alert.present(Some(&ui.carousel));
+}
+
+/// Stores the dragged occurrence as an exception and records the undo entry
+/// that puts this date back.
+fn apply_occurrence_drag(ui: &Rc<Ui>, occurrence: Event, draft: EventDraft) {
+    let (Some(master_id), Some(original)) = (occurrence.instance_of, occurrence.original_start)
+    else {
+        ui.toast_overlay
+            .add_toast(adw::Toast::new("Couldn't tell which occurrence this is"));
+        return;
+    };
+    match ui.store.save_occurrence(master_id, original, &draft) {
+        Ok(saved) => {
+            ui.record(undo::Record::Event(undo::recorded_occurrence(
+                occurrence.calendar_id,
+                &saved,
+            )));
+            ui.reset_keeping_scroll();
+        }
+        Err(error) => {
+            ui.toast_overlay
+                .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+        }
+    }
 }
 
 fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
@@ -3210,47 +3228,6 @@ fn occurrence_for_drag(
     events.iter().find(|event| event.id == event_id).cloned()
 }
 
-/// The master row after one occurrence was edited.
-///
-/// The stored row is the first occurrence, not the block that was dragged.
-/// The series keeps its shape: the same calendar-day distance and the same
-/// clock change, measured from the grabbed occurrence to where it landed.
-/// The day is applied first and the clock second, so a 23:00 dragged to 01:00
-/// the next morning is one day forward and 22 hours back — 01:00, not a
-/// second day earlier from also counting the midnight wrap.
-fn shift_series(master: &Event, occurrence: &Event, edited: &EventDraft) -> EventDraft {
-    let day_delta =
-        days_as_i32((edited.start.date_naive() - occurrence.start.date_naive()).num_days());
-    if edited.all_day {
-        let span_days = days_as_i32(
-            (edited.end.date_naive() - edited.start.date_naive())
-                .num_days()
-                .max(1),
-        );
-        let start_date = shift_days(master.start.date_naive(), day_delta);
-        return EventDraft {
-            start: local_day_start(start_date),
-            end: local_day_start(shift_days(start_date, span_days)),
-            all_day: true,
-            ..master.draft()
-        };
-    }
-
-    let clock_delta = ChronoDuration::seconds(
-        i64::from(edited.start.time().num_seconds_from_midnight())
-            - i64::from(occurrence.start.time().num_seconds_from_midnight()),
-    );
-    let start_date = shift_days(master.start.date_naive(), day_delta);
-    let start = resolve_forward(&Local, start_date.and_time(master.start.time())) + clock_delta;
-    let duration = edited.end - edited.start;
-    EventDraft {
-        start,
-        end: start + duration,
-        all_day: false,
-        ..master.draft()
-    }
-}
-
 fn days_as_i32(days: i64) -> i32 {
     i32::try_from(days).unwrap_or(if days.is_negative() {
         i32::MIN
@@ -3327,6 +3304,9 @@ fn moved_draft(
         reminder_minutes: event.reminder_minutes,
         additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
+        instance_of: event.instance_of,
+        original_start: event.original_start,
+        cancelled: event.cancelled,
     }
 }
 
@@ -3369,6 +3349,9 @@ fn pasted_draft(
     EventDraft {
         recurrence: None,
         attendees: Vec::new(),
+        instance_of: None,
+        original_start: None,
+        cancelled: false,
         ..moved_draft(event, target_date, target_time)
     }
 }
@@ -3401,6 +3384,9 @@ fn resized_start_draft(
         reminder_minutes: event.reminder_minutes,
         additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
+        instance_of: event.instance_of,
+        original_start: event.original_start,
+        cancelled: event.cancelled,
     })
 }
 
@@ -3430,6 +3416,9 @@ fn resized_end_draft(
         reminder_minutes: event.reminder_minutes,
         additional_reminders: event.additional_reminders.clone(),
         attendees: event.attendees.clone(),
+        instance_of: event.instance_of,
+        original_start: event.original_start,
+        cancelled: event.cancelled,
     })
 }
 
@@ -5491,6 +5480,10 @@ mod tests {
             recurrence: None,
             reminder_minutes: None,
             additional_reminders: Vec::new(),
+
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
         }
     }
 
@@ -5638,6 +5631,38 @@ mod tests {
     }
 
     #[test]
+    fn moving_or_resizing_a_stored_exception_keeps_which_date_it_replaces() {
+        let mut event = test_event(local_at(2026, 7, 16, 9), local_at(2026, 7, 16, 10), false);
+        event.instance_of = Some(4);
+        event.original_start = Some(local_at(2026, 7, 16, 9));
+        let target = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let time = NaiveTime::from_hms_opt(11, 0, 0);
+
+        let moved = moved_draft(&event, target, time);
+        let resized = resized_end_draft(&event, target, time).expect("a timed resize");
+
+        assert_eq!(moved.instance_of, Some(4));
+        assert_eq!(moved.original_start, event.original_start);
+        assert!(!moved.cancelled);
+        assert_eq!(resized.instance_of, Some(4));
+        assert_eq!(resized.original_start, event.original_start);
+    }
+
+    #[test]
+    fn pasting_an_occurrence_starts_an_ordinary_event() {
+        let mut event = test_event(local_at(2026, 7, 16, 9), local_at(2026, 7, 16, 10), false);
+        event.instance_of = Some(4);
+        event.original_start = Some(event.start);
+        event.cancelled = true;
+
+        let draft = pasted_draft(&event, NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(), None);
+
+        assert_eq!(draft.instance_of, None);
+        assert_eq!(draft.original_start, None);
+        assert!(!draft.cancelled);
+    }
+
+    #[test]
     fn dropping_an_all_day_event_on_a_time_makes_it_a_one_hour_event() {
         let event = test_event(
             local_midnight(2026, 10, 21),
@@ -5723,7 +5748,7 @@ mod tests {
             NaiveTime::from_hms_opt(11, 0, 0),
         );
 
-        let shifted = shift_series(&master, &occurrence, &edited);
+        let shifted = store::shift_series(&master, &occurrence, &edited);
 
         assert_eq!(shifted.start, local_at(2026, 10, 6, 11));
         assert_eq!(shifted.end, local_at(2026, 10, 6, 12));
@@ -5748,7 +5773,7 @@ mod tests {
         )
         .expect("a timed resize");
 
-        let shifted = shift_series(&master, &occurrence, &edited);
+        let shifted = store::shift_series(&master, &occurrence, &edited);
 
         assert_eq!(shifted.start, master.start);
         assert_eq!(shifted.end, local_at(2026, 10, 5, 11));
@@ -5789,7 +5814,7 @@ mod tests {
             NaiveTime::from_hms_opt(1, 0, 0),
         );
 
-        let shifted = shift_series(&master, &occurrence, &edited);
+        let shifted = store::shift_series(&master, &occurrence, &edited);
 
         assert_eq!(shifted.start, local_at(2026, 10, 6, 1));
         assert_eq!(shifted.end - shifted.start, ChronoDuration::hours(1));
@@ -5812,7 +5837,7 @@ mod tests {
             NaiveTime::from_hms_opt(15, 30, 0),
         );
 
-        let shifted = shift_series(&master, &occurrence, &edited);
+        let shifted = store::shift_series(&master, &occurrence, &edited);
 
         assert!(!shifted.all_day);
         assert_eq!(
@@ -5838,7 +5863,7 @@ mod tests {
         )
         .expect("an all-day conversion");
 
-        let shifted = shift_series(&master, &occurrence, &edited);
+        let shifted = store::shift_series(&master, &occurrence, &edited);
 
         assert!(shifted.all_day);
         assert_eq!(shifted.start, local_midnight(2026, 10, 6));

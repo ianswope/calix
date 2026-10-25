@@ -60,6 +60,18 @@ pub enum Saved {
 /// [`Saved`] for one completed save: `remote` is whether the event lives on a
 /// provider, `whole_series` whether the operation covered a whole series rather
 /// than a single event or occurrence.
+/// The repeat rule the dialog shows. A stored exception carries none of its
+/// own; "All events" has to edit the series rule, not clear it.
+fn repeat_rule(store: &Store, event: &Event) -> Option<Frequency> {
+    if event.recurrence.is_some() || event.instance_of.is_none() {
+        return event.recurrence;
+    }
+    event
+        .instance_of
+        .and_then(|id| store.event_by_id(id).ok().flatten())
+        .and_then(|master| master.recurrence)
+}
+
 fn saved_state(remote: bool, whole_series: bool) -> Saved {
     if remote && whole_series {
         Saved::StaleUntilSync
@@ -614,7 +626,31 @@ pub(crate) fn build(
         .build();
     let editing_series_instance = remote_event
         .as_ref()
-        .is_some_and(RemoteEvent::is_series_instance);
+        .is_some_and(RemoteEvent::is_series_instance)
+        || editing
+            .as_ref()
+            .is_some_and(|event| event.instance_of.is_some());
+    let local_occurrence = remote_event.is_none()
+        && editing
+            .as_ref()
+            .is_some_and(|event| event.instance_of.is_some());
+    if local_occurrence {
+        // "This event" is the default. The rule belongs to the series, so it
+        // stays visible and locked until the user chooses "All events".
+        repeat_row.set_sensitive(false);
+        custom_row.set_sensitive(false);
+        scope_row.connect_selected_notify(clone!(
+            #[weak]
+            repeat_row,
+            #[weak]
+            custom_row,
+            move |scope| {
+                let editable = scope.selected() == 1;
+                repeat_row.set_sensitive(editable);
+                custom_row.set_sensitive(editable);
+            }
+        ));
+    }
     let error_label = gtk::Label::new(None);
     error_label.add_css_class("error");
     error_label.set_xalign(0.0);
@@ -691,9 +727,11 @@ pub(crate) fn build(
             location_row.set_text(event.location.as_deref().unwrap_or(""));
             notes.set_text(event.notes.as_deref().unwrap_or(""));
             // Selecting the stored rule keeps Save from clearing it. A custom
-            // rule also fills the controls the row reveals.
-            repeat_row.set_selected(Frequency::picker_index(event.recurrence));
-            if let Some(Frequency::Custom(rule)) = event.recurrence {
+            // rule also fills the controls the row reveals. A stored exception
+            // has no rule of its own; the series rule is what "All events" edits.
+            let recurrence = repeat_rule(&store, event);
+            repeat_row.set_selected(Frequency::picker_index(recurrence));
+            if let Some(Frequency::Custom(rule)) = recurrence {
                 custom_repeat.set_rule(rule);
             }
             for (minutes, button) in &alert_buttons {
@@ -772,8 +810,11 @@ pub(crate) fn build(
 
     if let Some(event) = &editing {
         let event_id = event.id;
-        // What deleting takes away, kept so an undo can put it back.
+        // What deleting one ordinary row takes away. A local series builds its
+        // own entry at click time: this draft is one occurrence, and its id is
+        // the master's, so recording it would undo the wrong row.
         let deleted = undo::Change::deleted(event.calendar_id, event.draft());
+        let event_for_delete = event.clone();
         let delete_button = gtk::Button::builder()
             .label("Delete Event")
             .css_classes(["destructive-action"])
@@ -794,6 +835,8 @@ pub(crate) fn build(
             #[strong]
             deleted,
             #[strong]
+            event_for_delete,
+            #[strong]
             remote_event,
             #[weak]
             delete_button,
@@ -803,6 +846,69 @@ pub(crate) fn build(
             error_label,
             move |_| {
                 delete_button.set_sensitive(false);
+                if remote_event.is_none() {
+                    match undo::local_removal(
+                        scope_row.selected() == 1,
+                        event_for_delete.instance_of.is_some(),
+                        event_for_delete.recurrence.is_some(),
+                    ) {
+                        undo::LocalRemoval::OneOccurrence => {
+                            let (Some(master_id), Some(original)) = (
+                                event_for_delete.instance_of,
+                                event_for_delete.original_start,
+                            ) else {
+                                error_label.set_label("Couldn't tell which occurrence this is");
+                                delete_button.set_sensitive(true);
+                                return;
+                            };
+                            let mut draft = event_for_delete.draft();
+                            draft.cancelled = true;
+                            match store.save_occurrence(master_id, original, &draft) {
+                                Ok(saved) => {
+                                    on_change(undo::Record::Event(undo::recorded_occurrence(
+                                        event_for_delete.calendar_id,
+                                        &saved,
+                                    )));
+                                    on_saved(Saved::Cached);
+                                    dialog.close();
+                                }
+                                Err(error) => {
+                                    error_label
+                                        .set_label(&format!("Couldn't delete event: {error}"));
+                                    delete_button.set_sensitive(true);
+                                }
+                            }
+                            return;
+                        }
+                        undo::LocalRemoval::WholeSeries => {
+                            let master_id = event_for_delete.instance_of.unwrap_or(event_id);
+                            let master = store.event_by_id(master_id).ok().flatten();
+                            let overrides = store.series_overrides(master_id).ok();
+                            let (Some(master), Some(overrides)) = (master, overrides) else {
+                                error_label.set_label("Couldn't load the repeating event");
+                                delete_button.set_sensitive(true);
+                                return;
+                            };
+                            match store.delete_event(master_id) {
+                                Ok(()) => {
+                                    on_change(undo::Record::Event(
+                                        undo::Change::deleted(master.calendar_id, master.draft())
+                                            .with_overrides(overrides),
+                                    ));
+                                    on_saved(Saved::Cached);
+                                    dialog.close();
+                                }
+                                Err(error) => {
+                                    error_label
+                                        .set_label(&format!("Couldn't delete event: {error}"));
+                                    delete_button.set_sensitive(true);
+                                }
+                            }
+                            return;
+                        }
+                        undo::LocalRemoval::ThisRow => {}
+                    }
+                }
                 let repeats = deleted
                     .before
                     .as_ref()
@@ -949,7 +1055,9 @@ pub(crate) fn build(
                         }
                     },
                 },
-            };
+            instance_of: None,
+            original_start: None,
+            cancelled: false,};
 
             let Some(event) = editing.as_ref() else {
                 let selected = calendar_selector.selected() as usize;
@@ -1084,18 +1192,69 @@ pub(crate) fn build(
                     ),
                 );
             } else {
-                match store.update_event(event.id, &draft) {
-                    Ok(()) => {
-                        on_change(undo::Record::Event(undo::Change::edited(
-                            event.calendar_id,
-                            event.id,
-                            event.draft(),
-                            draft.clone(),
-                        )));
-                        on_saved(Saved::Cached);
-                        dialog.close();
+                match undo::local_save(event.instance_of.is_some(), scope_row.selected() == 1) {
+                    undo::LocalSave::OneOccurrence => {
+                        let (Some(master_id), Some(original)) =
+                            (event.instance_of, event.original_start)
+                        else {
+                            error_label.set_label("Couldn't tell which occurrence this is");
+                            return;
+                        };
+                        match store.save_occurrence(master_id, original, &draft) {
+                            Ok(saved) => {
+                                on_change(undo::Record::Event(undo::recorded_occurrence(
+                                    event.calendar_id,
+                                    &saved,
+                                )));
+                                on_saved(Saved::Cached);
+                                dialog.close();
+                            }
+                            Err(error) => {
+                                error_label.set_label(&format!("Couldn't save event: {error}"))
+                            }
+                        }
                     }
-                    Err(error) => error_label.set_label(&format!("Couldn't save event: {error}")),
+                    undo::LocalSave::AllEvents => {
+                        let Some(master_id) = event.instance_of else {
+                            error_label.set_label("Couldn't load the repeating event");
+                            return;
+                        };
+                        let Some(master) = store.event_by_id(master_id).ok().flatten() else {
+                            error_label.set_label("Couldn't load the repeating event");
+                            return;
+                        };
+                        let shifted = crate::store::series_edit(&master, event, &draft);
+                        match store.update_event(master_id, &shifted) {
+                            Ok(()) => {
+                                on_change(undo::Record::Event(undo::Change::edited(
+                                    master.calendar_id,
+                                    master_id,
+                                    master.draft(),
+                                    shifted,
+                                )));
+                                on_saved(Saved::Cached);
+                                dialog.close();
+                            }
+                            Err(error) => {
+                                error_label.set_label(&format!("Couldn't save event: {error}"))
+                            }
+                        }
+                    }
+                    undo::LocalSave::ThisRow => match store.update_event(event.id, &draft) {
+                        Ok(()) => {
+                            on_change(undo::Record::Event(undo::Change::edited(
+                                event.calendar_id,
+                                event.id,
+                                event.draft(),
+                                draft.clone(),
+                            )));
+                            on_saved(Saved::Cached);
+                            dialog.close();
+                        }
+                        Err(error) => {
+                            error_label.set_label(&format!("Couldn't save event: {error}"))
+                        }
+                    },
                 }
             }
         }
@@ -1650,6 +1809,44 @@ fn meeting_link_label(link: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_exception_shows_the_series_rule() {
+        let store = Store::open_in_memory().unwrap();
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 2, 9, 0, 0)
+            .single()
+            .unwrap();
+        let weekly = EventDraft {
+            title: "Standup".to_string(),
+            start,
+            end: start + chrono::Duration::hours(1),
+            all_day: false,
+            location: None,
+            notes: None,
+            recurrence: Some(Frequency::Weekly),
+            reminder_minutes: None,
+            additional_reminders: Vec::new(),
+            attendees: Vec::new(),
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
+        };
+        let id = store
+            .create_event(store.default_calendar_id(), &weekly)
+            .unwrap();
+        let mut exception = store.event_by_id(id).unwrap().unwrap();
+        exception.recurrence = None;
+        exception.instance_of = Some(id);
+        exception.original_start = Some(start + chrono::Duration::weeks(1));
+
+        assert_eq!(repeat_rule(&store, &exception), Some(Frequency::Weekly));
+        assert_eq!(
+            repeat_rule(&store, &store.event_by_id(id).unwrap().unwrap()),
+            Some(Frequency::Weekly),
+            "the series itself shows its own rule"
+        );
+    }
 
     #[test]
     fn a_local_save_failure_can_be_retried() {
