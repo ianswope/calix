@@ -4,7 +4,7 @@
 //! `gio::Notification`) lives in `window.rs`.
 
 use crate::store::Event;
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Duration, Local, NaiveDate};
 
 /// Setting key for the last wall-clock instant an alert sweep completed.
 /// Persisted so a login launch can catch alerts that came due while Calix
@@ -91,11 +91,15 @@ pub fn next_checkpoint(
 /// Body text for an event alert, e.g. "Today at 9:05 AM — Suite 210" or
 /// "Tomorrow, all day". Starts further out (a 1-day alert can precede a
 /// Monday event by a weekend) show the weekday and date instead.
-pub fn notification_body(event: &Event, now: DateTime<Local>) -> String {
+pub fn notification_body(
+    event: &Event,
+    now: DateTime<Local>,
+    format_date: impl Fn(NaiveDate) -> String,
+) -> String {
     let day = match (event.start.date_naive() - now.date_naive()).num_days() {
         0 => "Today".to_string(),
         1 => "Tomorrow".to_string(),
-        _ => event.start.format("%A, %B %-d").to_string(),
+        _ => format_date(event.start.date_naive()),
     };
     let when = if event.all_day {
         format!("{day}, all day")
@@ -251,7 +255,7 @@ mod tests {
     #[test]
     fn notification_body_says_today_with_the_start_time() {
         let event = event_at(at(2026, 7, 20, 14, 30), Some(10));
-        let body = notification_body(&event, at(2026, 7, 20, 14, 20));
+        let body = notification_body(&event, at(2026, 7, 20, 14, 20), english_date);
         assert_eq!(body, "Today at 2:30 PM");
     }
 
@@ -259,7 +263,7 @@ mod tests {
     fn notification_body_appends_the_location_when_set() {
         let mut event = event_at(at(2026, 7, 20, 9, 5), Some(5));
         event.location = Some("Suite 210".into());
-        let body = notification_body(&event, at(2026, 7, 20, 9, 0));
+        let body = notification_body(&event, at(2026, 7, 20, 9, 0), english_date);
         assert_eq!(body, "Today at 9:05 AM — Suite 210");
     }
 
@@ -267,7 +271,7 @@ mod tests {
     fn notification_body_for_an_all_day_event_tomorrow_skips_the_time() {
         let mut event = event_at(at(2026, 7, 21, 0, 0), Some(1440));
         event.all_day = true;
-        let body = notification_body(&event, at(2026, 7, 20, 0, 0));
+        let body = notification_body(&event, at(2026, 7, 20, 0, 0), english_date);
         assert_eq!(body, "Tomorrow, all day");
     }
 
@@ -312,7 +316,20 @@ mod tests {
         // "Tomorrow" would be right, but a hand-moved clock or suspend can
         // stretch the gap past a day, so the fallback must stay readable.
         let event = event_at(at(2026, 7, 23, 9, 0), Some(1440));
-        let body = notification_body(&event, at(2026, 7, 20, 9, 0));
+        let body = notification_body(&event, at(2026, 7, 20, 9, 0), english_date);
         assert_eq!(body, "Thursday, July 23 at 9:00 AM");
+    }
+
+    #[test]
+    fn notification_body_uses_the_date_text_it_is_given() {
+        let event = event_at(at(2026, 7, 23, 9, 0), Some(1440));
+        let body = notification_body(&event, at(2026, 7, 20, 9, 0), |_| {
+            "czwartek, 23 lipca".to_string()
+        });
+        assert_eq!(body, "czwartek, 23 lipca at 9:00 AM");
+    }
+
+    fn english_date(date: NaiveDate) -> String {
+        date.format("%A, %B %-d").to_string()
     }
 }

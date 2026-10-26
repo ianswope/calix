@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- Day titles, week ranges, notification dates, year-view tooltips, and event dates follow the locale's names and day-month order.
 - Connecting a Nextcloud account no longer fails calendar discovery when the server's trashbin collection answers 501. Calendars listed beside an unreadable collection stay available.
 - Primary and destructive buttons keep readable fills on light accents.
 - Accent text uses the higher-contrast choice of black or white.

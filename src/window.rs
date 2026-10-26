@@ -546,14 +546,9 @@ impl State {
             ViewMode::Month => locale::month_title(self.period_anchor()),
             ViewMode::Week => {
                 let days = week_dates(self.current_date);
-                let (start, end) = (days[0], days[6]);
-                if start.format("%b").to_string() == end.format("%b").to_string() {
-                    format!("{} – {}", start.format("%b %-d"), end.format("%-d, %Y"))
-                } else {
-                    format!("{} – {}", start.format("%b %-d"), end.format("%b %-d, %Y"))
-                }
+                locale::week_title(days[0], days[6])
             }
-            ViewMode::Day => self.current_date.format("%A, %B %-d, %Y").to_string(),
+            ViewMode::Day => locale::day_title(self.current_date),
         }
     }
 }
@@ -1040,7 +1035,7 @@ impl Ui {
             return;
         }
         let draft = pasted_draft(&source, target.day, target.time);
-        let landed = draft.start;
+        let landed = draft.start.date_naive();
         let ui = self.clone();
         let ui_for_change = self.clone();
         event_dialog::create_event_async(
@@ -1051,7 +1046,7 @@ impl Ui {
             move |outcome| match outcome {
                 Ok(saved) => {
                     ui.apply_saved(saved);
-                    ui.toast(&format!("Pasted to {}", landed.format("%a, %b %-d")));
+                    ui.toast(&format!("Pasted to {}", locale::short_date(landed, false)));
                 }
                 Err((message, _)) => ui.toast(&message),
             },
@@ -2399,7 +2394,11 @@ fn sweep_due_alerts(ui: &Ui, app: &impl IsA<gio::Application>) {
     };
     for event in crate::notify::due_alerts(&events, since, now) {
         let notification = gio::Notification::new(&event.title);
-        notification.set_body(Some(&crate::notify::notification_body(&event, now)));
+        notification.set_body(Some(&crate::notify::notification_body(
+            &event,
+            now,
+            crate::locale::notification_date,
+        )));
         // Id'd by occurrence so a repeated send replaces instead
         // of stacking, and each occurrence of a series alerts
         // separately.
