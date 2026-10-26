@@ -171,11 +171,13 @@ currently published as stable end-user channels. The maintainer checklist for
 each is in [docs/packaging.md](docs/packaging.md):
 
 - **Flatpak:** `flatpak/com.ianswope.Calix.json` is a local development
-  manifest, not a Flathub listing. Generate its locked Cargo sources and build
-  it with:
+  manifest, not a Flathub listing. It builds this checkout, offline, from the
+  locked crates in `flatpak/cargo-sources.json`. When `Cargo.lock` changes,
+  regenerate that file with `scripts/generate-flatpak-sources.sh`. GNOME 50
+  needs `org.freedesktop.Sdk.Extension.rust-stable//25.08` installed; the
+  manifest names that extension without a branch. Then build:
 
   ```sh
-  scripts/generate-flatpak-sources.sh
   flatpak-builder --user --install --force-clean build-dir flatpak/com.ianswope.Calix.json
   ```
 
