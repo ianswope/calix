@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The Homebrew formula installs the tagged release. `--HEAD` still builds master.
+
 ## 0.9.0 — 2026-10-26
 
 A public calendar link can be subscribed read-only, and an event can repeat
