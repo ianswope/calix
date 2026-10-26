@@ -81,7 +81,7 @@ These screenshots were captured from the 0.7.0 development source on Omarchy, us
   </picture>
 </details>
 
-See [what changed in Calix 0.8.0](CHANGELOG.md).
+See [what changed in Calix 0.9.0](CHANGELOG.md).
 
 ## Install (recommended)
 

@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.9.0 — 2026-10-26
+
+A public calendar link can be subscribed read-only, and an event can repeat
+on a custom schedule or carry more than one reminder. Dates follow the system
+locale, including when an account was last updated. One occurrence of a
+repeating event can be changed on its own, and undo can put a synced series
+back, including the provider's per-occurrence overrides.
 
 ### Added
 

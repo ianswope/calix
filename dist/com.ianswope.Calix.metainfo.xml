@@ -38,11 +38,15 @@
   <screenshots>
     <screenshot type="default">
       <caption>Month view</caption>
-      <image>https://raw.githubusercontent.com/ianswope/calix/v0.8.0/docs/screenshots/month.png</image>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/month.png</image>
     </screenshot>
     <screenshot>
       <caption>Week view</caption>
-      <image>https://raw.githubusercontent.com/ianswope/calix/v0.8.0/docs/screenshots/week.png</image>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/week.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Year view</caption>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/year.png</image>
     </screenshot>
   </screenshots>
 
@@ -54,6 +58,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.9.0" date="2026-10-26">
+      <description>
+        <p>
+          A public calendar link can be subscribed read-only, and an event
+          can repeat on a custom schedule or carry more than one reminder.
+        </p>
+        <p>
+          Dates follow the system locale, including when an account was last
+          updated. One occurrence of a repeating event can be changed on its
+          own, and undo can put a synced series back.
+        </p>
+        <p>
+          Starting Calix at login works from a Flatpak install, and connecting
+          a Nextcloud account no longer fails when the server's trashbin
+          answers 501.
+        </p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-10-21">
       <description>
         <p>
