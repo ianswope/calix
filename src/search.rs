@@ -221,7 +221,7 @@ mod tests {
     fn a_result_shows_when_it_is_and_where() {
         assert_eq!(
             result_subtitle(&event(Some("Main St"))),
-            "Mon, Aug 10, 2026 · 9:00 AM – 10:00 AM · Main St"
+            "Mon, Aug 10, 2026 · 9:00 – 10:00 · Main St"
         );
     }
 
@@ -229,7 +229,7 @@ mod tests {
     fn a_result_without_a_location_does_not_trail_a_separator() {
         assert_eq!(
             result_subtitle(&event(None)),
-            "Mon, Aug 10, 2026 · 9:00 AM – 10:00 AM"
+            "Mon, Aug 10, 2026 · 9:00 – 10:00"
         );
     }
 

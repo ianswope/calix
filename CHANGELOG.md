@@ -5,6 +5,11 @@
 ### Changed
 
 - The Homebrew formula installs the tagged release. `--HEAD` still builds master.
+- Times follow the locale's clock. The week grid, event times, the drag preview, notifications, and an account's last update use 12-hour or 24-hour time with the system.
+
+### Fixed
+
+- A subscribed repeat with an excluded or moved day is kept as a series, so that day stays right past the old sync window. A repeat Calix cannot read, such as a holiday file that names months, stays its first date and the sync is marked incomplete.
 
 ## 0.9.0 — 2026-10-26
 

@@ -2406,6 +2406,7 @@ fn sweep_due_alerts(ui: &Ui, app: &impl IsA<gio::Application>) {
         notification.set_body(Some(&crate::notify::notification_body(
             &event,
             now,
+            crate::locale::clock(),
             crate::locale::notification_date,
         )));
         // Id'd by occurrence so a repeated send replaces instead
@@ -4213,7 +4214,7 @@ fn account_sync_status(account: &store::Account) -> String {
     let local = timestamp.with_timezone(&Local);
     format!(
         "Last updated {}",
-        locale::updated_stamp(local.date_naive(), &local.format("%-I:%M %p").to_string())
+        locale::updated_stamp(local.date_naive(), &locale::format_time(local.time()))
     )
 }
 
@@ -5238,8 +5239,7 @@ fn add_subscription(
     std::thread::spawn(move || {
         let result = (|| -> Result<SubscriptionAddResult, String> {
             let body = subscription::fetch_document(&url)?;
-            let (start, end) = subscription::expansion_window(Local::now());
-            let document = subscription::parse_document(&url, &body, start, end)?;
+            let document = subscription::parse_document(&url, &body)?;
             let display_name =
                 subscription::display_name(&typed_name, document.name.as_deref(), &url);
             let store = Store::open().map_err(|e| e.to_string())?;

@@ -709,12 +709,7 @@ fn add_now_indicator(overlay: &gtk::Overlay, hour_row_height: i32) {
 }
 
 fn hour_label(hour: u32) -> String {
-    match hour {
-        0 => "12 AM".to_string(),
-        1..=11 => format!("{hour} AM"),
-        12 => "12 PM".to_string(),
-        _ => format!("{} PM", hour - 12),
-    }
+    crate::date_util::hour_label(hour, locale::clock())
 }
 
 struct TimedEventLayout<'a> {
@@ -827,6 +822,14 @@ mod tests {
             y += slot.height;
         }
         offsets
+    }
+
+    #[test]
+    fn hour_labels_follow_the_process_clock() {
+        // No setlocale in this binary, so the C locale's 24-hour clock.
+        assert_eq!(hour_label(0), "0:00");
+        assert_eq!(hour_label(9), "9:00");
+        assert_eq!(hour_label(13), "13:00");
     }
 
     #[test]

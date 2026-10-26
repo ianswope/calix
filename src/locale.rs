@@ -2,7 +2,7 @@
 //! and GTK have no API for the latter, so it reads glibc, as GtkCalendar does.
 
 use crate::date_util;
-use chrono::{Datelike, Days, NaiveDate, Weekday};
+use chrono::{Datelike, Days, NaiveDate, NaiveTime, Weekday};
 use gtk::glib;
 
 /// "October 2026". `%OB` is the standalone month name in languages that
@@ -37,11 +37,22 @@ pub fn short_date(date: NaiveDate, include_year: bool) -> String {
     date_util::short_date(&named_date(date), current_order(), include_year)
 }
 
-/// "Oct 26, 4:07 PM". The clock text is already formatted. The month name
-/// comes from the locale, and the day and month trade places with it.
+/// "Oct 26, 4:07 PM", or "Oct 26, 16:07" on a 24-hour clock. The clock text
+/// is already formatted. The month name comes from the locale, and the day
+/// and month trade places with it.
 pub fn updated_stamp(date: NaiveDate, time: &str) -> String {
     let named = named_date(date);
     date_util::updated_stamp(&named.month_abbrev, named.day, current_order(), time)
+}
+
+/// The locale's clock, from its POSIX `t_fmt`.
+pub fn clock() -> date_util::Clock {
+    date_util::clock_from_format(&system_time_format())
+}
+
+/// "4:07 PM" or "16:07", with no leading zero and no seconds.
+pub fn format_time(time: NaiveTime) -> String {
+    date_util::format_time(time, clock())
 }
 
 fn named_date(date: NaiveDate) -> date_util::NamedDate {
@@ -134,18 +145,27 @@ pub fn first_weekday() -> Option<Weekday> {
 /// The locale's `d_fmt`, such as `%m/%d/%Y` or `%d.%m.%Y`. Empty where the
 /// platform has no langinfo, which keeps month-first order.
 fn system_date_format() -> String {
+    // `D_FMT` is `_NL_ITEM(LC_TIME, 41)`, and `LC_TIME` is 2.
+    system_langinfo((2 << 16) | 41)
+}
+
+/// The locale's `t_fmt`, such as `%H:%M:%S` or `%r`. Empty where the platform
+/// has no langinfo, which keeps the 12-hour clock.
+fn system_time_format() -> String {
+    // `T_FMT` is the item after `D_FMT`.
+    system_langinfo((2 << 16) | 42)
+}
+
+fn system_langinfo(item: i32) -> String {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use std::ffi::{CStr, c_char, c_int};
-
-        // `D_FMT` is `_NL_ITEM(LC_TIME, 41)`, and `LC_TIME` is 2.
-        const D_FMT: c_int = (2 << 16) | 41;
 
         unsafe extern "C" {
             fn nl_langinfo(item: c_int) -> *const c_char;
         }
 
-        let pointer = unsafe { nl_langinfo(D_FMT) };
+        let pointer = unsafe { nl_langinfo(item) };
         if pointer.is_null() {
             return String::new();
         }
@@ -155,6 +175,7 @@ fn system_date_format() -> String {
     }
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
     {
+        let _ = item;
         String::new()
     }
 }
@@ -202,5 +223,16 @@ mod tests {
     fn an_account_update_uses_the_locale_month_abbreviation() {
         let date = NaiveDate::from_ymd_opt(2026, 10, 26).unwrap();
         assert_eq!(updated_stamp(date, "4:07 PM"), "Oct 26, 4:07 PM");
+    }
+
+    #[test]
+    fn the_c_locale_uses_a_24_hour_clock() {
+        // Nothing calls setlocale in this binary, so this is the C locale.
+        // Its `t_fmt` is `%H:%M:%S`.
+        assert_eq!(clock(), date_util::Clock::TwentyFourHour);
+        assert_eq!(
+            format_time(NaiveTime::from_hms_opt(16, 7, 0).unwrap()),
+            "16:07"
+        );
     }
 }

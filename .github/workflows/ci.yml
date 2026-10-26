@@ -20,6 +20,15 @@ jobs:
       - run: cargo check --no-default-features
       - name: Install GTK build dependencies
         run: |
+          # Ubuntu runners sometimes hold this step open: the mirror accepts
+          # the connection and then sends nothing. Bound that wait, and prefer
+          # IPv4, which is the mirror path that answers.
+          sudo tee /etc/apt/apt.conf.d/99-calix-ci-timeout >/dev/null <<'EOF'
+          Acquire::ForceIPv4 "true";
+          Acquire::Retries "5";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
           sudo apt-get update
           sudo apt-get install -y appstream desktop-file-utils libgtk-4-dev libadwaita-1-dev pkg-config
       - run: cargo fmt --check
