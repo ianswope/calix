@@ -21,10 +21,6 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration as StdDuration;
 
-/// `Mon, Aug 10, 2026`
-const DATE_FORMAT: &str = "%a, %b %-d, %Y";
-/// `Mon, Aug 10`
-const DATE_NO_YEAR_FORMAT: &str = "%a, %b %-d";
 /// `9:05 AM`
 const TIME_FORMAT: &str = "%-I:%M %p";
 
@@ -52,23 +48,23 @@ pub(crate) fn when_text(event: &Event) -> String {
     let start_date = event.start.date_naive();
     let end_date = inclusive_end_date(event);
     match (event.all_day, start_date == end_date) {
-        (true, true) => format!("{} · All day", event.start.format(DATE_FORMAT)),
+        (true, true) => format!("{} · All day", crate::locale::short_date(start_date, true)),
         (true, false) => format!(
             "{} – {} · All day",
-            start_date.format(DATE_NO_YEAR_FORMAT),
-            end_date.format(DATE_FORMAT)
+            crate::locale::short_date(start_date, false),
+            crate::locale::short_date(end_date, true)
         ),
         (false, true) => format!(
             "{} · {} – {}",
-            event.start.format(DATE_FORMAT),
+            crate::locale::short_date(start_date, true),
             event.start.format(TIME_FORMAT),
             event.end.format(TIME_FORMAT)
         ),
         (false, false) => format!(
             "{}, {} – {}, {}, {}",
-            event.start.format(DATE_NO_YEAR_FORMAT),
+            crate::locale::short_date(start_date, false),
             event.start.format(TIME_FORMAT),
-            event.end.format(DATE_NO_YEAR_FORMAT),
+            crate::locale::short_date(end_date, false),
             event.end.format(TIME_FORMAT),
             event.end.format("%Y")
         ),

@@ -117,7 +117,7 @@ pub(crate) fn month_thumbnail(
 
         let button = gtk::Button::builder().css_classes(["flat"]).build();
         button.set_child(Some(&label));
-        button.set_tooltip_text(Some(&cell.date.format("%A, %B %-d").to_string()));
+        button.set_tooltip_text(Some(&crate::locale::notification_date(cell.date)));
         let date = cell.date;
         let on_pick = on_pick.clone();
         button.connect_clicked(move |_| on_pick(date));

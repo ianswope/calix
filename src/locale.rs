@@ -1,6 +1,7 @@
 //! Locale-dependent date names, and the locale's first day of the week. GLib
 //! and GTK have no API for the latter, so it reads glibc, as GtkCalendar does.
 
+use crate::date_util;
 use chrono::{Datelike, Days, NaiveDate, Weekday};
 use gtk::glib;
 
@@ -13,6 +14,43 @@ pub fn month_title(date: NaiveDate) -> String {
 /// "October", standalone form.
 pub fn month_name(date: NaiveDate) -> String {
     format(date, "%OB")
+}
+
+/// "Sunday, October 11, 2026". The day and month trade places when the
+/// locale's date format writes the day first.
+pub fn day_title(date: NaiveDate) -> String {
+    date_util::long_date(&named_date(date), current_order())
+}
+
+/// "Oct 5 – 11, 2026", naming both months when the week crosses one.
+pub fn week_title(start: NaiveDate, end: NaiveDate) -> String {
+    date_util::week_range(&named_date(start), &named_date(end), current_order())
+}
+
+/// "Thursday, July 23". Notification text and the year-view tooltip.
+pub fn notification_date(date: NaiveDate) -> String {
+    date_util::weekday_and_date(&named_date(date), current_order())
+}
+
+/// "Mon, Aug 10, 2026", or without the year when a range prints it once.
+pub fn short_date(date: NaiveDate, include_year: bool) -> String {
+    date_util::short_date(&named_date(date), current_order(), include_year)
+}
+
+fn named_date(date: NaiveDate) -> date_util::NamedDate {
+    date_util::NamedDate {
+        weekday: format(date, "%A"),
+        weekday_abbrev: format(date, "%a"),
+        month: format(date, "%B"),
+        month_abbrev: format(date, "%b"),
+        month_number: date.month(),
+        day: date.day(),
+        year: date.year(),
+    }
+}
+
+fn current_order() -> date_util::DateOrder {
+    date_util::date_order(&system_date_format())
 }
 
 /// "Mon".
@@ -86,6 +124,34 @@ pub fn first_weekday() -> Option<Weekday> {
     None
 }
 
+/// The locale's `d_fmt`, such as `%m/%d/%Y` or `%d.%m.%Y`. Empty where the
+/// platform has no langinfo, which keeps month-first order.
+fn system_date_format() -> String {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::ffi::{CStr, c_char, c_int};
+
+        // `D_FMT` is `_NL_ITEM(LC_TIME, 41)`, and `LC_TIME` is 2.
+        const D_FMT: c_int = (2 << 16) | 41;
+
+        unsafe extern "C" {
+            fn nl_langinfo(item: c_int) -> *const c_char;
+        }
+
+        let pointer = unsafe { nl_langinfo(D_FMT) };
+        if pointer.is_null() {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +170,24 @@ mod tests {
         assert_eq!(weekday_abbreviation(Weekday::Sun), "Sun");
         assert_eq!(weekday_abbreviation(Weekday::Thu), "Thu");
         assert_eq!(weekday_initial(Weekday::Thu), "T");
+    }
+
+    #[test]
+    fn a_day_title_uses_the_locale_names() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        assert_eq!(day_title(date), "Sunday, October 11, 2026");
+    }
+
+    #[test]
+    fn a_week_title_uses_the_locale_month_names() {
+        let start = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 10, 11).unwrap();
+        assert_eq!(week_title(start, end), "Oct 5 – 11, 2026");
+    }
+
+    #[test]
+    fn a_notification_date_uses_the_locale_weekday_and_month() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
+        assert_eq!(notification_date(date), "Thursday, July 23");
     }
 }

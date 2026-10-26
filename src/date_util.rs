@@ -64,6 +64,144 @@ pub fn first_weekday_from_langinfo(week_1stday: u32, first_weekday: u8) -> Optio
     weekdays_from(origin).get(offset).copied()
 }
 
+/// Whether a locale writes "October 11" or "11 October".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateOrder {
+    MonthFirst,
+    DayFirst,
+}
+
+/// One calendar day with its names already taken from the locale.
+#[derive(Clone)]
+pub struct NamedDate {
+    pub weekday: String,
+    pub weekday_abbrev: String,
+    pub month: String,
+    pub month_abbrev: String,
+    pub month_number: u32,
+    pub day: u32,
+    pub year: i32,
+}
+
+/// Reads a POSIX `d_fmt` string. Day before month means the day is written
+/// first; anything else keeps the month-first order.
+pub fn date_order(format: &str) -> DateOrder {
+    let bytes = format.as_bytes();
+    let mut index = 0;
+    let mut day_at = None;
+    let mut month_at = None;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index] == b'%' {
+            index += 1;
+            continue;
+        }
+        while index < bytes.len() && matches!(bytes[index], b'-' | b'_' | b'0' | b'^' | b'#' | b' ')
+        {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index < bytes.len() && matches!(bytes[index], b'E' | b'O') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        match bytes[index] {
+            b'd' | b'e' => {
+                day_at.get_or_insert(index);
+            }
+            b'm' | b'b' | b'B' | b'h' => {
+                month_at.get_or_insert(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    match (day_at, month_at) {
+        (Some(day), Some(month)) if day < month => DateOrder::DayFirst,
+        _ => DateOrder::MonthFirst,
+    }
+}
+
+/// "Sunday, October 11, 2026", or the day-first form of the same date.
+pub fn long_date(date: &NamedDate, order: DateOrder) -> String {
+    match order {
+        DateOrder::MonthFirst => format!(
+            "{}, {} {}, {}",
+            date.weekday, date.month, date.day, date.year
+        ),
+        DateOrder::DayFirst => format!(
+            "{}, {} {} {}",
+            date.weekday, date.day, date.month, date.year
+        ),
+    }
+}
+
+/// "Thursday, July 23", without the year. Used where the year is obvious.
+pub fn weekday_and_date(date: &NamedDate, order: DateOrder) -> String {
+    match order {
+        DateOrder::MonthFirst => format!("{}, {} {}", date.weekday, date.month, date.day),
+        DateOrder::DayFirst => format!("{}, {} {}", date.weekday, date.day, date.month),
+    }
+}
+
+/// "Mon, Aug 10, 2026" or "Mon, Aug 10".
+pub fn short_date(date: &NamedDate, order: DateOrder, include_year: bool) -> String {
+    match (order, include_year) {
+        (DateOrder::MonthFirst, true) => format!(
+            "{}, {} {}, {}",
+            date.weekday_abbrev, date.month_abbrev, date.day, date.year
+        ),
+        (DateOrder::MonthFirst, false) => format!(
+            "{}, {} {}",
+            date.weekday_abbrev, date.month_abbrev, date.day
+        ),
+        (DateOrder::DayFirst, true) => format!(
+            "{}, {} {} {}",
+            date.weekday_abbrev, date.day, date.month_abbrev, date.year
+        ),
+        (DateOrder::DayFirst, false) => {
+            format!(
+                "{}, {} {}",
+                date.weekday_abbrev, date.day, date.month_abbrev
+            )
+        }
+    }
+}
+
+/// The header for a week, compact when both days share a month.
+pub fn week_range(start: &NamedDate, end: &NamedDate, order: DateOrder) -> String {
+    let same_month = start.month_number == end.month_number && start.year == end.year;
+    match (order, same_month) {
+        (DateOrder::MonthFirst, true) => format!(
+            "{} {} – {}, {}",
+            start.month_abbrev, start.day, end.day, end.year
+        ),
+        (DateOrder::MonthFirst, false) => format!(
+            "{} {} – {} {}, {}",
+            start.month_abbrev, start.day, end.month_abbrev, end.day, end.year
+        ),
+        (DateOrder::DayFirst, true) => format!(
+            "{} – {} {} {}",
+            start.day, end.day, start.month_abbrev, end.year
+        ),
+        (DateOrder::DayFirst, false) => format!(
+            "{} {} – {} {} {}",
+            start.day, start.month_abbrev, end.day, end.month_abbrev, end.year
+        ),
+    }
+}
+
 /// The 7 dates of the week containing `date`.
 pub fn week_dates(date: NaiveDate) -> [NaiveDate; 7] {
     let start = week_start(date);
@@ -423,5 +561,143 @@ mod tests {
         let tz = chrono_tz::Pacific::Apia;
         let start = day_start_in(&tz, d(2011, 12, 30));
         assert!(start.naive_local() >= d(2011, 12, 30).and_hms_opt(0, 0, 0).unwrap());
+    }
+
+    fn october_eleventh() -> NamedDate {
+        NamedDate {
+            weekday: "Sunday".into(),
+            weekday_abbrev: "Sun".into(),
+            month: "October".into(),
+            month_abbrev: "Oct".into(),
+            month_number: 10,
+            day: 11,
+            year: 2026,
+        }
+    }
+
+    #[test]
+    fn an_american_date_format_writes_the_month_first() {
+        assert_eq!(date_order("%m/%d/%Y"), DateOrder::MonthFirst);
+        assert_eq!(date_order("%m/%d/%y"), DateOrder::MonthFirst);
+    }
+
+    #[test]
+    fn a_day_before_month_format_writes_the_day_first() {
+        assert_eq!(date_order("%d.%m.%Y"), DateOrder::DayFirst);
+        assert_eq!(date_order("%-d. %b %Y"), DateOrder::DayFirst);
+        assert_eq!(date_order("%Od/%Om/%Y"), DateOrder::DayFirst);
+    }
+
+    #[test]
+    fn a_doubled_percent_is_not_a_day_or_month_field() {
+        assert_eq!(date_order("%%d %m"), DateOrder::MonthFirst);
+        assert_eq!(date_order(""), DateOrder::MonthFirst);
+    }
+
+    #[test]
+    fn a_long_date_keeps_month_first_order_for_an_american_locale() {
+        assert_eq!(
+            long_date(&october_eleventh(), DateOrder::MonthFirst),
+            "Sunday, October 11, 2026"
+        );
+    }
+
+    #[test]
+    fn a_long_date_writes_the_day_before_the_month_when_the_locale_does() {
+        assert_eq!(
+            long_date(&october_eleventh(), DateOrder::DayFirst),
+            "Sunday, 11 October 2026"
+        );
+    }
+
+    #[test]
+    fn a_notification_date_drops_the_year_and_follows_the_locale_order() {
+        let date = NamedDate {
+            weekday: "Thursday".into(),
+            month: "July".into(),
+            day: 23,
+            ..october_eleventh()
+        };
+        assert_eq!(
+            weekday_and_date(&date, DateOrder::MonthFirst),
+            "Thursday, July 23"
+        );
+        assert_eq!(
+            weekday_and_date(&date, DateOrder::DayFirst),
+            "Thursday, 23 July"
+        );
+    }
+
+    #[test]
+    fn a_short_date_follows_the_locale_order() {
+        let date = NamedDate {
+            weekday_abbrev: "Mon".into(),
+            month_abbrev: "Aug".into(),
+            day: 10,
+            year: 2026,
+            ..october_eleventh()
+        };
+        assert_eq!(
+            short_date(&date, DateOrder::MonthFirst, true),
+            "Mon, Aug 10, 2026"
+        );
+        assert_eq!(
+            short_date(&date, DateOrder::MonthFirst, false),
+            "Mon, Aug 10"
+        );
+        assert_eq!(
+            short_date(&date, DateOrder::DayFirst, true),
+            "Mon, 10 Aug 2026"
+        );
+        assert_eq!(short_date(&date, DateOrder::DayFirst, false), "Mon, 10 Aug");
+    }
+
+    #[test]
+    fn a_week_inside_one_month_is_written_once() {
+        let start = NamedDate {
+            month_abbrev: "Oct".into(),
+            month_number: 10,
+            day: 5,
+            year: 2026,
+            ..october_eleventh()
+        };
+        let end = NamedDate {
+            day: 11,
+            ..start.clone()
+        };
+        assert_eq!(
+            week_range(&start, &end, DateOrder::MonthFirst),
+            "Oct 5 – 11, 2026"
+        );
+        assert_eq!(
+            week_range(&start, &end, DateOrder::DayFirst),
+            "5 – 11 Oct 2026"
+        );
+    }
+
+    #[test]
+    fn a_week_across_two_months_names_both() {
+        let start = NamedDate {
+            month_abbrev: "Sep".into(),
+            month_number: 9,
+            day: 28,
+            year: 2026,
+            ..october_eleventh()
+        };
+        let end = NamedDate {
+            month_abbrev: "Oct".into(),
+            month_number: 10,
+            day: 4,
+            year: 2026,
+            ..october_eleventh()
+        };
+        assert_eq!(
+            week_range(&start, &end, DateOrder::MonthFirst),
+            "Sep 28 – Oct 4, 2026"
+        );
+        assert_eq!(
+            week_range(&start, &end, DateOrder::DayFirst),
+            "28 Sep – 4 Oct 2026"
+        );
     }
 }
