@@ -284,6 +284,7 @@ dependencies = [
  "serde_json",
  "toml",
  "url",
+ "zbus",
 ]
 
 [[package]]
