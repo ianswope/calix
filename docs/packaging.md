@@ -11,8 +11,8 @@ only be finished once the tag exists and is immutable.
 3. Add a matching `<release>` block at the top of
    `dist/com.ianswope.Calix.metainfo.xml`, and repoint the `<screenshot>` URLs
    at the new tag.
-4. Bump `pkgver` in `packaging/aur/PKGBUILD` and the `tag` in
-   `flatpak/com.ianswope.Calix.json`.
+4. Bump `pkgver` in `packaging/aur/PKGBUILD`. If `Cargo.lock` changed,
+   regenerate `flatpak/cargo-sources.json` (see Flathub below).
 5. Run all four CI gates plus `scripts/check-package.sh`.
 6. Commit, tag `vX.Y.Z`, push the tag. `.github/workflows/release.yml` builds
    the archive and publishes the GitHub release.
@@ -37,28 +37,40 @@ machine without the project's own toolchain already present.
 
 ## 3. Flathub
 
-**Not ready to submit.** One thing still blocks it:
+`flatpak/com.ianswope.Calix.json` builds the checkout it sits in. Flatpak
+builders have no network, so every crate in `Cargo.lock` is vendored in
+`flatpak/cargo-sources.json`. `scripts/check-flatpak-sources.py` fails when
+the two disagree, and `scripts/check-package.sh` runs that check.
 
-- `flatpak/cargo-sources.json` is generated, not committed. Flathub builders
-  have no network, so the locked Cargo sources have to be vendored into the
-  manifest by `scripts/generate-flatpak-sources.sh`, which needs
-  `flatpak-cargo-generator` installed.
+Regenerate the vendored list whenever `Cargo.lock` changes.
+`flatpak-cargo-generator` has to be on `PATH`:
+
+```sh
+scripts/generate-flatpak-sources.sh
+```
 
 "Start Calix when you sign in" uses the Background portal's `RequestBackground`
 when `/.flatpak-info` is present. The portal writes the login entry on the
 host, and the switch follows the autostart bit in the portal's answer. Outside
 a sandbox, Calix still writes `$XDG_CONFIG_HOME/autostart/com.ianswope.Calix.desktop`.
 
-Flathub also requires the source pinned to a `commit` sha, not just a `tag`.
-Add it at submission time:
+A Flathub submission replaces the `dir` source with the release commit. Use
+the `cargo-sources.json` from that same revision:
 
-```sh
-git rev-parse vX.Y.Z^{commit}
+```json
+{
+  "type": "git",
+  "url": "https://github.com/ianswope/calix.git",
+  "commit": "<output of git rev-parse vX.Y.Z^{commit}>"
+}
 ```
 
 The manifest targets `org.gnome.Platform` 50; GNOME 48 reached end of life on
-2026-03-24, so it cannot be used. Check the runtime is still current at
-submission time.
+2026-03-24, so it cannot be used. Its Rust SDK extension is
+`org.freedesktop.Sdk.Extension.rust-stable//25.08`: the SDK extension point is
+version 25.08, and branch 50 is not published. Leave `sdk-extensions` as the
+bare id, and install the 25.08 branch before a local build. Check the runtime
+is still current at submission time.
 
 ## 4. Homebrew
 

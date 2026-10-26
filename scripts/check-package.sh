@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python3 "$ROOT_DIR/scripts/check-flatpak-sources.py"
 APP_ID="com.ianswope.Calix"
 VERSION="$(grep -m1 '^version =' "$ROOT_DIR/Cargo.toml" | cut -d '"' -f2)"
 PACKAGE="calix-$VERSION-linux-$(uname -m)"

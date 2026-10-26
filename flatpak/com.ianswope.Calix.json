@@ -16,7 +16,8 @@
   "build-options": {
     "append-path": "/usr/lib/sdk/rust-stable/bin",
     "env": {
-      "CARGO_HOME": "/run/build/calix/cargo"
+      "CARGO_HOME": "/run/build/calix/cargo",
+      "CARGO_NET_OFFLINE": "true"
     }
   },
   "modules": [
@@ -32,9 +33,9 @@
       ],
       "sources": [
         {
-          "type": "git",
-          "url": "https://github.com/ianswope/calix.git",
-          "tag": "v0.8.0"
+          "type": "dir",
+          "path": "..",
+          "skip": ["target", ".flatpak-builder", "build-dir"]
         },
         "cargo-sources.json"
       ]
