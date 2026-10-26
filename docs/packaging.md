@@ -74,7 +74,8 @@ is still current at submission time.
 
 ## 4. Homebrew
 
-`Formula/calix.rb` is `--HEAD` only. A checksum-pinned stable formula needs a
-`url`/`sha256` pair for the tagged archive; it is the lowest-value channel
-here, since Calix needs a GTK4 session and Homebrew's Linux users mostly do not
-have one.
+`Formula/calix.rb` installs the tagged release. `brew install --HEAD` still
+builds master. After the tag is pushed, set `url` to
+`https://github.com/ianswope/calix/archive/refs/tags/vX.Y.Z.tar.gz` and
+`sha256` to the same digest as the AUR source archive. Calix needs a GTK4
+session, and Homebrew's Linux users mostly do not have one.

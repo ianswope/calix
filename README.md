@@ -87,8 +87,9 @@ See [what changed in Calix 0.9.0](CHANGELOG.md).
 
 The recommended installation is the prebuilt Linux archive from the
 [latest GitHub release](https://github.com/ianswope/calix/releases/latest). It is
-the only end-user package currently published by the project; Flatpak, AUR, and
-Homebrew support below are development previews rather than stable channels.
+the only prebuilt end-user package currently published by the project. Flatpak
+and AUR below are development previews. Homebrew installs the tagged release
+from source.
 
 1. Download the archive for your CPU and extract it.
 2. Open a terminal in the extracted `calix-<version>-linux-<arch>` folder.
@@ -184,12 +185,12 @@ each is in [docs/packaging.md](docs/packaging.md):
 - **AUR:** `packaging/aur/PKGBUILD` is a release template. Its `SKIP` checksum
   must be replaced with the SHA-256 of the immutable tagged source archive
   before publication. Do not publish it with `SKIP`.
-- **Homebrew on Linux:** the tap currently builds the development branch from
-  source. There is no checksum-pinned stable formula yet:
+- **Homebrew on Linux:** the formula installs the tagged release from source.
+  `--HEAD` still builds master:
 
   ```sh
   brew tap ianswope/calix https://github.com/ianswope/calix
-  brew install --HEAD ianswope/calix/calix
+  brew install ianswope/calix/calix
   ```
 
 Package-manager installs should be updated and uninstalled with that same

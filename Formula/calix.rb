@@ -1,6 +1,9 @@
 class Calix < Formula
   desc "Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
   homepage "https://github.com/ianswope/calix"
+  url "https://github.com/ianswope/calix/archive/refs/tags/v0.9.0.tar.gz"
+  sha256 "19ce397725052feb0b36e9b33739e9d0ac893f343c86dcb198a813696716612a"
+  license "MIT"
   head "https://github.com/ianswope/calix.git", branch: "master"
 
   depends_on "pkgconf" => :build
