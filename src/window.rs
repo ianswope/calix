@@ -15,6 +15,7 @@ use crate::locale;
 use crate::provider::{self, Provider};
 use crate::search;
 use crate::store::{self, Event, EventDraft, Store};
+use crate::subscription;
 use crate::sync::{self, SyncOutcome};
 use crate::undo;
 use crate::views::{
@@ -1023,6 +1024,10 @@ impl Ui {
             self.toast("Nothing to paste yet — copy an event first");
             return;
         };
+        if subscription::is_read_only(source.account_provider.as_deref()) {
+            self.toast(subscription::READ_ONLY);
+            return;
+        }
         let Some(choice) = create_targets(self)
             .into_iter()
             .find(|choice| choice.target.calendar_id() == source.calendar_id)
@@ -1505,6 +1510,10 @@ impl Ui {
                 let Some(ui) = ui.upgrade() else {
                     return;
                 };
+                if subscription::is_read_only(event.account_provider.as_deref()) {
+                    ui.toast(subscription::READ_ONLY);
+                    return;
+                }
                 // The clicked block is the occurrence: it carries that date and
                 // which series it belongs to. Replacing it with the stored
                 // master would edit every week.
@@ -2896,6 +2905,9 @@ fn remote_event_handler(ui: &Rc<Ui>, event: &Event) -> Option<event_dialog::Remo
                 },
             })
         }
+        Some("webcal") => Some(event_dialog::RemoteEvent::Unavailable(
+            subscription::READ_ONLY.to_string(),
+        )),
         Some(provider @ ("icloud" | "caldav")) => {
             let (Some(username), Some(token_key), Some(event_href)) = (
                 event.account_provider_id.clone(),
@@ -2937,6 +2949,7 @@ fn create_targets(ui: &Rc<Ui>) -> Vec<event_dialog::TargetChoice> {
         .calendar_connections()
         .unwrap_or_default()
         .into_iter()
+        .filter(|calendar| !subscription::is_read_only(calendar.provider.as_deref()))
         .map(|calendar| {
             let visible = calendar.visible;
             let target = match calendar.provider.as_deref() {
@@ -3002,6 +3015,11 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
             let Some(occurrence) = occurrence_for_drag(&events, event_id, source_day) else {
                 return;
             };
+            if subscription::is_read_only(occurrence.account_provider.as_deref()) {
+                ui.toast_overlay
+                    .add_toast(adw::Toast::new(subscription::READ_ONLY));
+                return;
+            }
             let Some(draft) = drag_draft(&occurrence, kind, target_date, target_time) else {
                 ui.toast_overlay.add_toast(adw::Toast::new(
                     "Resize needs a timed slot in week or day view",
@@ -3735,6 +3753,20 @@ fn open_account_chooser(ui: &Rc<Ui>, welcome: bool) {
             }
         ),
     ));
+    group.add(&chooser_row(
+        "Subscribe to a calendar",
+        "Paste a public .ics or webcal link. Events stay read-only.",
+        clone!(
+            #[strong]
+            ui,
+            #[weak]
+            dialog,
+            move || {
+                dialog.close();
+                open_subscription_dialog(&ui);
+            }
+        ),
+    ));
     content.append(&group);
     let privacy = gtk::Label::new(Some(
         "Passwords and sign-in tokens are stored in your system keyring. Calendar events are cached on this computer.",
@@ -3948,18 +3980,22 @@ fn show_startup_error(app: &adw::Application, error: &str, date: Option<NaiveDat
     window.present();
 }
 
-/// Forgets `account`: its keyring credential, then its events, calendars, and
-/// row. Local only — nothing is deleted or revoked with the provider, so
-/// re-adding the same account later re-syncs it.
+/// Forgets `account`: its keyring credential when it has one, then its events,
+/// calendars, and row. Local only — nothing is deleted at the provider or at a
+/// subscribed link, so adding the same account later brings it back.
 fn disconnect_account(store: &Store, account: &store::Account) -> Result<(), String> {
     // Clear the credential first. If this fails the account stays listed, which
     // is the recoverable order: a leftover row can be removed again, whereas a
-    // secret orphaned by a deleted row has no UI left to reach it.
-    match account.provider.as_str() {
-        "google" => google::oauth::delete_refresh_token(&account.token_key)
-            .map_err(|e| format!("couldn't remove the saved sign-in: {e}"))?,
-        _ => icloud::credentials::delete_password(&account.token_key)
-            .map_err(|e| format!("couldn't remove the saved password: {e}"))?,
+    // secret orphaned by a deleted row has no UI left to reach it. A
+    // subscription has no secret; asking the keyring for one would fail and
+    // leave the calendar stuck in the list.
+    if Provider::from_key(&account.provider).is_none_or(Provider::stores_a_secret) {
+        match account.provider.as_str() {
+            "google" => google::oauth::delete_refresh_token(&account.token_key)
+                .map_err(|e| format!("couldn't remove the saved sign-in: {e}"))?,
+            _ => icloud::credentials::delete_password(&account.token_key)
+                .map_err(|e| format!("couldn't remove the saved password: {e}"))?,
+        }
     }
     store
         .delete_account(account.id)
@@ -4060,26 +4096,32 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
                 account,
                 move |_| retry_account_provider(&ui, &account)
             ));
-            let update_button = gtk::Button::builder()
-                .label(if account.provider == "google" {
-                    "Update sign-in"
-                } else {
-                    "Update password"
-                })
-                .valign(gtk::Align::Center)
-                .build();
-            update_button.connect_clicked(clone!(
-                #[strong]
-                ui,
-                #[strong]
-                account,
-                #[weak]
-                dialog,
-                move |_| {
-                    dialog.close();
-                    update_account_credentials(&ui, &account);
-                }
-            ));
+            actions.append(&retry_button);
+            // A subscription has no password to replace. Offering the button
+            // would open a dialog that cannot update it.
+            if account.provider != provider::WEBCAL.key {
+                let update_button = gtk::Button::builder()
+                    .label(if account.provider == "google" {
+                        "Update sign-in"
+                    } else {
+                        "Update password"
+                    })
+                    .valign(gtk::Align::Center)
+                    .build();
+                update_button.connect_clicked(clone!(
+                    #[strong]
+                    ui,
+                    #[strong]
+                    account,
+                    #[weak]
+                    dialog,
+                    move |_| {
+                        dialog.close();
+                        update_account_credentials(&ui, &account);
+                    }
+                ));
+                actions.append(&update_button);
+            }
             let remove_button = gtk::Button::builder()
                 .icon_name("edit-delete-symbolic")
                 .tooltip_text("Disconnect account")
@@ -4095,8 +4137,6 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
                     confirm_disconnect_account(&ui, &dialog, &account);
                 }
             ));
-            actions.append(&retry_button);
-            actions.append(&update_button);
             actions.append(&remove_button);
             row.add_suffix(&actions);
             group.add(&row);
@@ -4105,9 +4145,9 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
     }
 
     let note = gtk::Label::new(Some(
-        "Removing an account deletes its saved credential and cached events from \
-         this computer only. Nothing is changed or revoked on the provider, so you \
-         can add it back at any time.",
+        "Removing an account deletes its cached events from this computer only. A saved \
+         sign-in or password is forgotten when the account had one. Nothing is changed on \
+         the service or at a subscribed link, so you can add it back at any time.",
     ));
     note.set_wrap(true);
     note.set_xalign(0.0);
@@ -4134,6 +4174,7 @@ fn friendly_account_provider(account: &store::Account) -> String {
     match account.provider.as_str() {
         "google" => "Google Calendar".to_string(),
         "icloud" => "Apple iCloud".to_string(),
+        "webcal" => "Subscribed calendar".to_string(),
         "caldav" => {
             let host = account
                 .server_url
@@ -4224,6 +4265,7 @@ fn retry_account_provider(ui: &Rc<Ui>, account: &store::Account) {
         "google" => sync_google_accounts(ui, false),
         "icloud" => sync_icloud_accounts(ui, false),
         "caldav" => sync_caldav_accounts(ui, false),
+        "webcal" => sync_webcal_accounts(ui, false),
         _ => ui.toast_overlay.add_toast(adw::Toast::new(
             "This account type cannot be refreshed by this version of Calix",
         )),
@@ -4252,13 +4294,7 @@ fn update_account_credentials(ui: &Rc<Ui>, account: &store::Account) {
 fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store::Account) {
     let alert = adw::AlertDialog::builder()
         .heading(format!("Remove {}?", account.display_name))
-        .body(format!(
-            "Calix will forget this {} account's saved credential and delete its \
-             cached calendars and events from this computer.\n\nYour calendars and \
-             events are not touched on the provider, and no password or token is \
-             revoked there.",
-            Provider::label_for_key(&account.provider)
-        ))
+        .body(Provider::removal_body_for(&account.provider))
         .build();
     alert.add_response("cancel", "Cancel");
     alert.add_response("remove", "Remove");
@@ -4585,10 +4621,11 @@ fn sync_connected_accounts_mode(ui: &Rc<Ui>, quiet: bool) {
     // `run_account_sync` refuses a second one anyway, but skipping here keeps an
     // automatic pass from toasting about it.
     type SyncFn = fn(&Rc<Ui>, bool);
-    let providers: [(Provider, SyncFn); 3] = [
+    let providers: [(Provider, SyncFn); 4] = [
         (provider::GOOGLE, sync_google_accounts),
         (provider::ICLOUD, sync_icloud_accounts),
         (provider::CALDAV, sync_caldav_accounts),
+        (provider::WEBCAL, sync_webcal_accounts),
     ];
     for (provider, sync) in providers {
         if !ui.activity.is_syncing(provider) && has_accounts(ui, provider) {
@@ -5062,6 +5099,215 @@ fn sync_caldav_accounts(ui: &Rc<Ui>, quiet: bool) {
     });
 }
 
+fn sync_webcal_accounts(ui: &Rc<Ui>, quiet: bool) {
+    run_account_sync(ui, quiet, provider::WEBCAL, || {
+        let store = Store::open().map_err(|e| e.to_string())?;
+        let accounts = store
+            .accounts_for_provider(provider::WEBCAL.key)
+            .map_err(|e| e.to_string())?;
+        if accounts.is_empty() {
+            return Err(provider::WEBCAL.none_connected());
+        }
+
+        let account_count = accounts.len();
+        let outcome = sync::sync_accounts(
+            &accounts,
+            |account| account.label(),
+            |account| {
+                sync_account_with_health(&store, account, || {
+                    subscription::sync_account(&store, account)
+                })
+            },
+        );
+        Ok((account_count, outcome))
+    });
+}
+
+fn open_subscription_dialog(ui: &Rc<Ui>) {
+    let dialog = adw::Dialog::builder()
+        .title("Subscribe to a calendar")
+        .content_width(440)
+        .build();
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let subscribe_button = gtk::Button::builder()
+        .label("Subscribe")
+        .css_classes(["suggested-action"])
+        .build();
+
+    let header = adw::HeaderBar::new();
+    header.pack_start(&cancel_button);
+    header.pack_end(&subscribe_button);
+
+    let link_row = adw::EntryRow::builder().title("Calendar link").build();
+    let name_row = adw::EntryRow::builder().title("Name").build();
+    let group = adw::PreferencesGroup::builder()
+        .title("Public calendar")
+        .description(
+            "Paste an https, http, or webcal address. Leave the name blank to use the \
+             one in the file. Events stay read-only.",
+        )
+        .build();
+    group.add(&link_row);
+    group.add(&name_row);
+
+    const PROSE_WIDTH_CHARS: i32 = 44;
+    let error_label = gtk::Label::new(None);
+    error_label.add_css_class("error");
+    error_label.set_xalign(0.0);
+    error_label.set_wrap(true);
+    error_label.set_max_width_chars(PROSE_WIDTH_CHARS);
+    error_label.set_visible(false);
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.append(&group);
+    content.append(&error_label);
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar_view));
+
+    cancel_button.connect_clicked(clone!(
+        #[weak]
+        dialog,
+        move |_| {
+            dialog.close();
+        }
+    ));
+
+    subscribe_button.connect_clicked(clone!(
+        #[strong]
+        ui,
+        #[weak]
+        dialog,
+        #[weak]
+        error_label,
+        // Weak, as in the CalDAV dialog: the button must not pin its dialog.
+        #[weak]
+        subscribe_button,
+        move |_| {
+            let url = match subscription::feed_url(&link_row.text()) {
+                Ok(url) => url,
+                Err(message) => {
+                    error_label.set_label(&message);
+                    error_label.set_visible(true);
+                    return;
+                }
+            };
+            error_label.set_visible(false);
+            add_subscription(
+                &ui,
+                &dialog,
+                &error_label,
+                &subscribe_button,
+                url,
+                name_row.text().to_string(),
+            );
+        }
+    ));
+
+    dialog.present(Some(&ui.carousel));
+}
+
+/// Downloads one public calendar and stores it. The account row is written
+/// only after the body parses as a calendar, so a dead link or an HTML page
+/// leaves nothing behind. The same link again updates the name in place.
+fn add_subscription(
+    ui: &Rc<Ui>,
+    dialog: &adw::Dialog,
+    error_label: &gtk::Label,
+    subscribe_button: &gtk::Button,
+    url: String,
+    typed_name: String,
+) {
+    subscribe_button.set_sensitive(false);
+    subscribe_button.set_label("Subscribing…");
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<SubscriptionAddResult, String> {
+            let body = subscription::fetch_document(&url)?;
+            let (start, end) = subscription::expansion_window(Local::now());
+            let document = subscription::parse_document(&url, &body, start, end)?;
+            let display_name =
+                subscription::display_name(&typed_name, document.name.as_deref(), &url);
+            let store = Store::open().map_err(|e| e.to_string())?;
+            let account_id = store
+                .upsert_webcal_account(&url, &display_name)
+                .map_err(|e| e.to_string())?;
+            let outcome =
+                subscription::apply_document(&store, account_id, &url, &display_name, &document);
+            record_sync_result(&store, account_id, &display_name, &outcome);
+            Ok(SubscriptionAddResult {
+                display_name,
+                outcome,
+            })
+        })();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(
+        Duration::from_millis(200),
+        clone!(
+            #[strong]
+            ui,
+            #[strong]
+            dialog,
+            #[strong]
+            error_label,
+            #[strong]
+            subscribe_button,
+            move || {
+                let restore = || {
+                    subscribe_button.set_label("Subscribe");
+                    subscribe_button.set_sensitive(true);
+                };
+                match rx.try_recv() {
+                    Ok(Ok(result)) => {
+                        ui.toast_overlay
+                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
+                                &result.outcome,
+                                &result.display_name,
+                                "calendar",
+                            ))));
+                        restore();
+                        dialog.close();
+                        ui.reset_calendar_sidebar();
+                        ui.reset_keeping_scroll();
+                        glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        error_label.set_label(first_line(&error));
+                        error_label.set_visible(true);
+                        restore();
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        error_label
+                            .set_label("The subscription attempt stopped unexpectedly. Try again.");
+                        error_label.set_visible(true);
+                        restore();
+                        glib::ControlFlow::Break
+                    }
+                }
+            }
+        ),
+    );
+}
+
+/// A completed subscribe. The account row exists even when applying the
+/// document fails, so the toast reports that separately.
+struct SubscriptionAddResult {
+    display_name: String,
+    outcome: Result<SyncOutcome, String>,
+}
+
 /// Host portion of a server URL, for a compact account label; falls back to
 /// the raw string if it doesn't parse.
 fn host_label(server_url: &str) -> String {
@@ -5092,6 +5338,21 @@ mod tests {
     #[test]
     fn unchanged_syncs_do_not_queue_a_refresh() {
         assert!(!AccountActivity::default().queue_sync_refresh(false));
+    }
+
+    #[test]
+    fn a_subscribed_account_is_named_as_a_subscribed_calendar() {
+        let account = store::Account {
+            id: 1,
+            provider: "webcal".into(),
+            provider_account_id: "https://example.com/a.ics".into(),
+            display_name: "Holidays".into(),
+            token_key: "webcal:https://example.com/a.ics".into(),
+            server_url: Some("https://example.com/a.ics".into()),
+            last_sync_at: None,
+            last_sync_error: None,
+        };
+        assert_eq!(friendly_account_provider(&account), "Subscribed calendar");
     }
 
     #[test]

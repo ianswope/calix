@@ -26,6 +26,7 @@ pub mod places;
 pub mod provider;
 pub mod recurrence;
 pub mod store;
+pub mod subscription;
 pub mod sync;
 pub mod undo;
 pub mod xdg;

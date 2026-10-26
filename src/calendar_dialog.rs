@@ -35,6 +35,13 @@ pub fn build_list(store: Rc<Store>, on_changed: impl Fn() + 'static) -> gtk::Wid
         "Other calendar accounts",
         "caldav",
     );
+    add_account_sections(
+        &content,
+        store.clone(),
+        on_changed.clone(),
+        "Subscribed calendars",
+        "webcal",
+    );
 
     if let Ok(local_calendars) = store.local_calendars()
         && !local_calendars.is_empty()
@@ -69,6 +76,7 @@ fn add_account_sections(
         "google" => store.google_accounts(),
         "icloud" => store.icloud_accounts(),
         "caldav" => store.caldav_accounts(),
+        "webcal" => store.accounts_for_provider("webcal"),
         _ => return,
     };
 
@@ -101,6 +109,7 @@ fn add_account_sections(
                     match provider {
                         "google" => "Google Calendar",
                         "icloud" => "Apple iCloud calendar",
+                        "webcal" => "Subscribed calendar",
                         _ => "Online calendar",
                     },
                     calendars,

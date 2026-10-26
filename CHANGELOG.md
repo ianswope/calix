@@ -4,6 +4,7 @@
 
 ### Added
 
+- A public .ics or webcal link can be subscribed as a read-only calendar. Events refresh with the other accounts, and Calix will not edit them.
 - Events can repeat on a custom interval, on chosen weekdays, for a set number of times, or until a date.
 - Events can have several reminders, selected individually in the event dialog.
 - Weekday and month names follow the system locale.

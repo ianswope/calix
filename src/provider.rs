@@ -1,9 +1,10 @@
-//! The three sync providers, and how each is named to the user.
+//! The sync providers, and how each is named to the user.
 //!
 //! Google, iCloud and CalDAV each had their own copy of the add/sync UI, which
 //! meant three copies of every label, tooltip and error string — and they had
 //! already drifted. Naming lives here instead, so the shared account plumbing
-//! can talk about a provider without a `match` per sentence.
+//! can talk about a provider without a `match` per sentence. A subscribed
+//! calendar is the fourth: a public link, refreshed on the same timer.
 //!
 //! Deliberately GTK-free: `key` is the value stored in the `accounts.provider`
 //! column, so this is as much storage vocabulary as it is presentation.
@@ -38,8 +39,16 @@ pub const CALDAV: Provider = Provider {
     calendar_noun: "CalDAV calendar",
 };
 
+/// A public `.ics` / `webcal` link. One account is one calendar, and it is
+/// never written back to.
+pub const WEBCAL: Provider = Provider {
+    key: "webcal",
+    label: "Subscription",
+    calendar_noun: "subscribed calendar",
+};
+
 /// Every provider, in the order their controls appear in the sidebar.
-pub const ALL: [Provider; 3] = [GOOGLE, ICLOUD, CALDAV];
+pub const ALL: [Provider; 4] = [GOOGLE, ICLOUD, CALDAV, WEBCAL];
 
 impl Provider {
     /// The provider for a stored `accounts.provider` value.
@@ -68,6 +77,33 @@ impl Provider {
     pub fn sync_failed(&self, error: &str) -> String {
         format!("{} sync failed: {}", self.label, error)
     }
+
+    /// A subscription is only a link. The other providers keep a keyring secret.
+    pub fn stores_a_secret(self) -> bool {
+        self.key != WEBCAL.key
+    }
+
+    /// The confirmation shown before an account is removed. An unknown key is
+    /// named as itself, the same way [`Self::label_for_key`] does.
+    pub fn removal_body_for(key: &str) -> String {
+        if key == WEBCAL.key {
+            return "Calix will delete this subscribed calendar's cached events from this \
+                    computer.\n\nThe calendar at the link is not changed."
+                .to_string();
+        }
+        format!(
+            "Calix will forget this {} account's saved credential and delete its \
+             cached calendars and events from this computer.\n\nYour calendars and \
+             events are not touched on the provider, and no password or token is \
+             revoked there.",
+            Self::label_for_key(key)
+        )
+    }
+
+    /// The confirmation shown before this provider's account is removed.
+    pub fn removal_body(self) -> String {
+        Self::removal_body_for(self.key)
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +115,7 @@ mod tests {
         assert_eq!(Provider::from_key("google"), Some(GOOGLE));
         assert_eq!(Provider::from_key("icloud"), Some(ICLOUD));
         assert_eq!(Provider::from_key("caldav"), Some(CALDAV));
+        assert_eq!(Provider::from_key("webcal"), Some(WEBCAL));
         assert_eq!(Provider::from_key("fastmail"), None);
     }
 
@@ -100,6 +137,40 @@ mod tests {
         assert_eq!(
             CALDAV.none_connected(),
             "No CalDAV accounts connected. Use Connect an account first."
+        );
+    }
+
+    #[test]
+    fn a_subscribed_account_keeps_no_keyring_secret() {
+        assert!(!WEBCAL.stores_a_secret());
+        assert!(GOOGLE.stores_a_secret());
+        assert!(ICLOUD.stores_a_secret());
+        assert!(CALDAV.stores_a_secret());
+    }
+
+    #[test]
+    fn a_subscribed_account_removal_does_not_mention_a_saved_credential() {
+        let body = WEBCAL.removal_body();
+        assert!(
+            body.contains("The calendar at the link is not changed."),
+            "{body}"
+        );
+        assert!(
+            !body.to_ascii_lowercase().contains("credential")
+                && !body.to_ascii_lowercase().contains("password")
+                && !body.to_ascii_lowercase().contains("token"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_signed_in_account_still_names_its_saved_credential() {
+        assert_eq!(
+            GOOGLE.removal_body(),
+            "Calix will forget this Google account's saved credential and delete its \
+             cached calendars and events from this computer.\n\nYour calendars and \
+             events are not touched on the provider, and no password or token is \
+             revoked there."
         );
     }
 
