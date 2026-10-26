@@ -866,6 +866,45 @@ fn dropping_a_widget_tree_frees_every_widget_in_it() {
         natural_height < 600,
         "long notes must scroll, not stretch the inspector to {natural_height}px"
     );
+    assert!(
+        widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Button>()
+                .is_some_and(|button| button.label().as_deref() == Some("Edit"))
+        }),
+        "an ordinary event keeps its Edit button"
+    );
+
+    let mut subscribed = timed.clone();
+    subscribed.account_provider = Some("webcal".to_string());
+    let subscribed_inspector = event_popover::build(
+        &subscribed,
+        Rc::new(|_| {}),
+        store.clone(),
+        None,
+        Rc::new(|| {}),
+        Rc::new(|| {}),
+    );
+    let subscribed_widgets: Vec<_> = watch(subscribed_inspector.upcast_ref())
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect();
+    assert!(
+        subscribed_widgets.iter().any(|widget| {
+            widget
+                .downcast_ref::<gtk::Button>()
+                .is_some_and(|button| button.label().as_deref() == Some("Copy"))
+        }),
+        "a subscribed event can still be copied"
+    );
+    assert!(
+        subscribed_widgets.iter().all(|widget| {
+            widget
+                .downcast_ref::<gtk::Button>()
+                .is_none_or(|button| button.label().as_deref() != Some("Edit"))
+        }),
+        "a subscribed event has no Edit button"
+    );
 
     // The edit dialog's notes are edited where they can be read: an invite's
     // lines on lines, not run together in a one-line entry.

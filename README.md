@@ -5,8 +5,9 @@
 
 A fast, native calendar for Linux with a clean GTK4 interface and direct sync
 for Google Calendar, Apple iCloud, Fastmail, Nextcloud, and other CalDAV
-services. It was written for [Omarchy](https://omarchy.org/), where it adopts
-the active theme's colors on its own, and runs on any GTK4 desktop.
+services, plus read-only calendars from a public .ics or webcal link. It was
+written for [Omarchy](https://omarchy.org/), where it adopts the active theme's
+colors on its own, and runs on any GTK4 desktop.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/month-dark.png">
@@ -226,6 +227,18 @@ Any CalDAV server works — Fastmail, Nextcloud, Radicale, mailbox.org, Posteo, 
 
 Editing and deleting synced CalDAV events works the same as iCloud, including the **This event / All events** choice on recurring series.
 
+## Subscribing to a calendar
+
+A public `.ics` or `webcal` link — holidays, a sports schedule, a team calendar someone published as an address — can be added without a sign-in.
+
+1. In Calix, choose **Connect an account → Subscribe to a calendar**.
+2. Paste the link. `webcal://` addresses are fetched over HTTPS. A name is optional; Calix uses the name in the file, or the site, when you leave it blank.
+3. Events refresh with the other calendars. They stay read-only: Calix will not edit, move, or delete them, and nothing is written back to the link.
+
+A repeat rule Calix understands is kept and shown as far ahead as you scroll. A rule with excluded dates, or one Calix cannot read (a holiday file that names specific months), is stored as the individual dates inside the usual sync window.
+
+Removing the account deletes only the cached copy on this computer.
+
 ## Connecting Google Calendar
 
 Google is the one provider that needs real setup: you have to bring your own
@@ -278,7 +291,7 @@ If you previously connected Google before Calix had multi-account storage, the n
 
 ## Using Calendars
 
-The left sidebar lists local calendars and synced Google/iCloud/CalDAV calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
+The left sidebar lists local calendars, synced Google/iCloud/CalDAV calendars, and subscribed calendars. Use the switch next to each calendar to show or hide it in the month/week/day grid. Remote calendar visibility is local and is preserved across later syncs.
 
 **Year view** shows the twelve months as thumbnails with busy days weighted; clicking a day opens it in Day view. Swiping or the arrows move a whole year at a time.
 
@@ -365,7 +378,8 @@ than guessing from an empty list.
 - `src/google/oauth.rs` — the OAuth2 + PKCE sign-in flow (loopback redirect, no embedded browser) and per-account refresh-token storage via the system keyring.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
-- `src/caldav.rs` — the provider-neutral CalDAV engine: principal/calendar discovery (with a `/.well-known/caldav` fallback), event fetch with server-side recurrence expansion, create/update/delete, and the shared sync loop. Used by both iCloud and generic CalDAV accounts; only the credentials differ.
+- `src/caldav.rs` — the provider-neutral CalDAV engine: principal/calendar discovery (with a `/.well-known/caldav` fallback), event fetch with server-side recurrence expansion, create/update/delete, and the shared sync loop. Used by both iCloud and generic CalDAV accounts; only the credentials differ. Its iCalendar reader is also what a subscribed `.ics` link is parsed with.
+- `src/subscription.rs` — read-only calendars fetched from one public `.ics` or `webcal` link. A plain repeat rule is stored and expanded locally; a rule with exclusions is written out as individual dates. Nothing is written back to the link.
 - `src/icloud/` — the iCloud adapter over `src/caldav.rs`: the fixed `caldav.icloud.com` root plus app-specific-password keyring helpers (also reused for generic CalDAV account passwords).
 
 ## Roadmap
@@ -399,6 +413,7 @@ than guessing from an empty list.
 - [x] Copy, cut and paste an event onto a selected day or hour
 - [x] Location type-ahead from past events and an OpenStreetMap geocoder
 - [x] Invitation responses for Google and compatible CalDAV events
+- [x] Subscribe to a public .ics or webcal calendar, kept read-only
 - [x] Google invitee authoring when creating events
 - [x] Background alerts with optional XDG autostart
 - [ ] Packaging (AUR, Flatpak)

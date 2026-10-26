@@ -35,9 +35,12 @@ pub struct RemoteEvent {
 
 /// One `VEVENT`. Attendees are kept apart from `props` because `ATTENDEE`
 /// repeats once per invitee, and a single-valued map would keep only the last.
-struct IcsEvent {
-    props: HashMap<String, IcsProperty>,
-    attendees: Vec<Attendee>,
+pub(crate) struct IcsEvent {
+    pub(crate) props: HashMap<String, IcsProperty>,
+    pub(crate) attendees: Vec<Attendee>,
+    /// Every `EXDATE` on the component. A map would keep only the last line,
+    /// and a subscription has to honor all of them.
+    pub(crate) exdates: Vec<IcsProperty>,
 }
 
 /// Parses one `ATTENDEE` line. The value is a CAL-ADDRESS, in practice always
@@ -973,7 +976,7 @@ fn parse_resource(href: &str, ics: &str) -> (Vec<RemoteEvent>, bool) {
     (events, complete)
 }
 
-fn ics_status_is_cancelled(component: &IcsEvent) -> bool {
+pub(crate) fn ics_status_is_cancelled(component: &IcsEvent) -> bool {
     component
         .props
         .get("STATUS")
@@ -981,7 +984,9 @@ fn ics_status_is_cancelled(component: &IcsEvent) -> bool {
 }
 
 fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Option<RemoteEvent> {
-    let IcsEvent { props, attendees } = component;
+    let IcsEvent {
+        props, attendees, ..
+    } = component;
     let summary = props
         .get("SUMMARY")
         .map(|property| property.value.clone())
@@ -1025,15 +1030,16 @@ fn parse_event(href: &str, component: IcsEvent, component_count: usize) -> Optio
     })
 }
 
-struct IcsProperty {
-    value: String,
-    tzid: Option<String>,
+pub(crate) struct IcsProperty {
+    pub(crate) value: String,
+    pub(crate) tzid: Option<String>,
 }
 
-fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
+pub(crate) fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
     let mut events = Vec::new();
     let mut props = HashMap::new();
     let mut attendees: Vec<Attendee> = Vec::new();
+    let mut exdates = Vec::new();
     let mut in_event = false;
     // Depth of nested components (e.g. VALARM) below the VEVENT. Only the
     // VEVENT's own properties — depth 0 — are the event's; an alarm's
@@ -1045,6 +1051,7 @@ fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
             nested_depth = 0;
             props = HashMap::new();
             attendees = Vec::new();
+            exdates = Vec::new();
             continue;
         }
         if is_component_boundary(&line, "END", "VEVENT") {
@@ -1052,6 +1059,7 @@ fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
                 events.push(IcsEvent {
                     props: std::mem::take(&mut props),
                     attendees: std::mem::take(&mut attendees),
+                    exdates: std::mem::take(&mut exdates),
                 });
             }
             in_event = false;
@@ -1076,6 +1084,18 @@ fn ics_event_properties(ics: &str) -> Vec<IcsEvent> {
         };
         let mut parts = split_parameters(name).into_iter();
         let key = parts.next().unwrap_or(name).to_ascii_uppercase();
+        if key == "EXDATE" {
+            exdates.push(IcsProperty {
+                value: unescape_ics_text(value),
+                tzid: parts.find_map(|parameter| {
+                    parameter
+                        .split_once('=')
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("TZID"))
+                        .map(|(_, value)| value.trim_matches('"').to_string())
+                }),
+            });
+            continue;
+        }
         if key == "ATTENDEE" {
             if let Some(attendee) = parse_ics_attendee(name, value) {
                 // Servers sometimes repeat an invitee across CUTYPE/ROLE
@@ -1120,7 +1140,7 @@ fn is_component_keyword(line: &str, keyword: &str) -> bool {
         .is_some_and(|(name, _)| name.eq_ignore_ascii_case(keyword))
 }
 
-fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)> {
+pub(crate) fn parse_ics_datetime(property: &IcsProperty) -> Option<(DateTime<Local>, bool)> {
     parse_ics_datetime_in(property, &Local)
 }
 
@@ -1251,7 +1271,7 @@ fn end_from_duration<Tz: TimeZone>(
 /// than a fallback. Inventing an end for a property the server did send — and
 /// that a later edit would write back — is worse than declining to read the
 /// event, which leaves the cached copy in place.
-fn event_end(
+pub(crate) fn event_end(
     props: &HashMap<String, IcsProperty>,
     start: DateTime<Local>,
     all_day: bool,
@@ -1735,7 +1755,7 @@ fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
     lines.join("\r\n") + "\r\n"
 }
 
-fn unfold_ics(ics: &str) -> Vec<String> {
+pub(crate) fn unfold_ics(ics: &str) -> Vec<String> {
     let mut unfolded: Vec<String> = Vec::new();
     for line in ics.replace("\r\n", "\n").lines() {
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -1758,7 +1778,7 @@ fn property_name(line: &str) -> Option<&str> {
 /// colon outside double quotes. RFC 5545 quotes a parameter value that holds a
 /// colon (`CN="Smith: Jo"`), and the value is free to hold more — a `mailto:`
 /// address always does — so neither the first nor the last colon will do.
-fn split_content_line(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_content_line(line: &str) -> Option<(&str, &str)> {
     let mut quoted = false;
     for (index, character) in line.char_indices() {
         match character {
@@ -1808,7 +1828,7 @@ fn escape_ics_text(value: &str) -> String {
         .replace(';', "\\;")
 }
 
-fn unescape_ics_text(value: &str) -> String {
+pub(crate) fn unescape_ics_text(value: &str) -> String {
     let mut decoded = String::with_capacity(value.len());
     let mut characters = value.chars();
     while let Some(character) = characters.next() {

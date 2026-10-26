@@ -155,14 +155,14 @@ impl Event {
 #[derive(Clone)]
 pub struct Account {
     pub id: i64,
-    /// `google`, `icloud`, or `caldav` — which sync path and keyring key
-    /// scheme this account uses.
+    /// `google`, `icloud`, `caldav`, or `webcal` — which sync path and keyring
+    /// key scheme this account uses. A subscription has no keyring entry.
     pub provider: String,
     pub provider_account_id: String,
     pub display_name: String,
     pub token_key: String,
-    /// CalDAV server base URL for generic `caldav` accounts; `None` for
-    /// google and icloud.
+    /// CalDAV server base URL, or the fetch URL of a `webcal` subscription.
+    /// `None` for google and icloud.
     pub server_url: Option<String>,
     pub last_sync_at: Option<String>,
     pub last_sync_error: Option<String>,
@@ -175,6 +175,15 @@ impl Account {
     /// its id, and CalDAV names one "<username> (<host>)" around the id, so in
     /// both cases the parenthetical would only repeat what's already there.
     pub fn label(&self) -> String {
+        // The subscription's id is the full link. Putting it next to the
+        // calendar name only repeats a URL the account row already stores.
+        if self.provider == "webcal" {
+            let name = self.display_name.trim();
+            if name.is_empty() {
+                return self.provider_account_id.trim().to_string();
+            }
+            return name.to_string();
+        }
         let name = self.display_name.trim();
         let id = self.provider_account_id.trim();
         if name.is_empty() {
@@ -708,6 +717,22 @@ impl Store {
         )
     }
 
+    /// Creates or updates a subscribed-calendar account. The link is both the
+    /// identity and the address that gets fetched; there is no keyring secret.
+    /// Subscribing to the same link again updates the display name in place.
+    pub fn upsert_webcal_account(&self, url: &str, display_name: &str) -> rusqlite::Result<i64> {
+        let token_key = format!("webcal:{url}");
+        self.conn.query_row(
+            "INSERT INTO accounts (provider, provider_account_id, display_name, token_key, server_url)
+             VALUES ('webcal', ?1, ?2, ?3, ?1)
+             ON CONFLICT(provider, provider_account_id, COALESCE(server_url, ''))
+             DO UPDATE SET display_name = ?2, token_key = ?3, server_url = ?1
+             RETURNING id",
+            params![url, display_name, token_key],
+            |row| row.get(0),
+        )
+    }
+
     /// Creates a Google-sourced calendar if `google_calendar_id` hasn't
     /// been seen before for `account_id`, or updates its name/color if it
     /// has. Returns the local calendar id either way.
@@ -1210,6 +1235,76 @@ impl Store {
         )
     }
 
+    /// A subscribed event, stored in the CalDAV id column because a feed is a
+    /// list of iCalendar objects. Unlike a CalDAV upsert, this writes
+    /// `recurrence`: a public feed is not expanded by a server, so a plain
+    /// rule has to repeat locally. Reminders are still left alone on update.
+    pub fn upsert_subscription_event(
+        &self,
+        calendar_id: i64,
+        event_id: &str,
+        draft: &EventDraft,
+    ) -> rusqlite::Result<i64> {
+        let recurrence = draft.recurrence.map(Frequency::to_rrule);
+        let additional = serde_json::to_string(&draft.additional_reminders).unwrap();
+        let attendees = attendees_to_json(&draft.attendees);
+        let sql = "
+            INSERT INTO events (
+                calendar_id, title, start_at, end_at, all_day, location, notes,
+                icloud_event_id, attendees, reminder_minutes, additional_reminders, recurrence
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                COALESCE(
+                    (SELECT reminder_minutes FROM events
+                     WHERE calendar_id = ?1 AND icloud_event_id = ?8
+                       AND reminder_minutes IS NOT NULL
+                     LIMIT 1),
+                    ?10
+                ),
+                COALESCE(
+                    (SELECT additional_reminders FROM events
+                     WHERE calendar_id = ?1 AND icloud_event_id = ?8
+                     LIMIT 1),
+                    ?11
+                ),
+                ?12)
+            ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
+            DO UPDATE SET
+                title = ?2, start_at = ?3, end_at = ?4, all_day = ?5,
+                location = ?6, notes = ?7, attendees = ?9, recurrence = ?12
+            WHERE local_edit = 0 AND (
+                title IS NOT ?2 OR start_at IS NOT ?3 OR end_at IS NOT ?4
+                OR all_day IS NOT ?5 OR location IS NOT ?6 OR notes IS NOT ?7
+                OR attendees IS NOT ?9 OR recurrence IS NOT ?12)
+            RETURNING id";
+        let written = self.conn.query_row(
+            sql,
+            params![
+                calendar_id,
+                draft.title,
+                stored_timestamp(&draft.start),
+                stored_timestamp(&draft.end),
+                draft.all_day as i64,
+                draft.location,
+                draft.notes,
+                event_id,
+                attendees,
+                draft.reminder_minutes,
+                additional,
+                recurrence,
+            ],
+            |row| row.get(0),
+        );
+        match written {
+            Err(rusqlite::Error::QueryReturnedNoRows) => self.conn.query_row(
+                "SELECT id FROM events WHERE calendar_id = ?1 AND icloud_event_id = ?2",
+                params![calendar_id, event_id],
+                |row| row.get(0),
+            ),
+            other => other,
+        }
+    }
+
     /// Reports the row `remote_id` maps to, whether or not this call wrote it.
     ///
     /// `RETURNING` rather than `last_insert_rowid`, which says nothing useful
@@ -1370,6 +1465,37 @@ impl Store {
             );
         }
 
+        self.conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Drops subscribed events this feed no longer contains.
+    ///
+    /// Unlike a CalDAV prune, this is not limited to the sync window. A plain
+    /// repeating event is one row whose start may be years outside that
+    /// window, and a feed that drops it has to drop the row too. Rows with no
+    /// remote id are leftovers (a local exception on a read-only calendar)
+    /// and go with them.
+    pub fn prune_subscription_events(
+        &self,
+        calendar_id: i64,
+        keep_ids: &[String],
+    ) -> rusqlite::Result<()> {
+        if keep_ids.is_empty() {
+            self.conn.execute(
+                "DELETE FROM events WHERE calendar_id = ?1 AND local_edit = 0",
+                params![calendar_id],
+            )?;
+            return Ok(());
+        }
+        let sql = format!(
+            "DELETE FROM events
+             WHERE calendar_id = ?1 AND local_edit = 0
+               AND (icloud_event_id IS NULL OR icloud_event_id NOT IN ({}))",
+            placeholders(keep_ids.len())
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&calendar_id];
+        params.extend(keep_ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
         Ok(())
     }
@@ -2438,6 +2564,13 @@ mod tests {
     fn an_accounts_label_falls_back_to_the_provider_id_when_unnamed() {
         let account = test_account("", "ian@example.com");
         assert_eq!(account.label(), "ian@example.com");
+    }
+
+    #[test]
+    fn a_subscription_label_does_not_append_its_link() {
+        let mut account = test_account("US Holidays", "https://example.com/holidays.ics");
+        account.provider = "webcal".to_string();
+        assert_eq!(account.label(), "US Holidays");
     }
 
     #[test]

@@ -12,6 +12,7 @@
 use crate::event_dialog::RemoteEvent;
 use crate::store::Store;
 use crate::store::{Attendee, Event};
+use crate::subscription;
 use chrono::{Duration, NaiveDate};
 use gtk::gdk;
 use gtk::glib;
@@ -411,9 +412,14 @@ pub(crate) fn build(
         "Copy this event, then right-click another day to paste it",
     ));
     buttons.append(&copy_button);
-    let edit_button = gtk::Button::with_label("Edit");
-    edit_button.add_css_class("suggested-action");
-    buttons.append(&edit_button);
+    // A subscribed event can be copied onto a calendar Calix can write. Edit
+    // would only open a dialog that then refuses the change.
+    let edit_button = (!subscription::is_read_only(event.account_provider.as_deref())).then(|| {
+        let edit_button = gtk::Button::with_label("Edit");
+        edit_button.add_css_class("suggested-action");
+        buttons.append(&edit_button);
+        edit_button
+    });
     content.append(&buttons);
 
     // Both buttons live inside the popover, so a closure on either that held
@@ -427,14 +433,16 @@ pub(crate) fn build(
         on_copy();
     });
 
-    let weak_popover = popover.downgrade();
-    let event_for_edit = event.clone();
-    edit_button.connect_clicked(move |_| {
-        if let Some(popover) = weak_popover.upgrade() {
-            popover.popdown();
-        }
-        on_edit(event_for_edit.clone());
-    });
+    if let Some(edit_button) = edit_button {
+        let weak_popover = popover.downgrade();
+        let event_for_edit = event.clone();
+        edit_button.connect_clicked(move |_| {
+            if let Some(popover) = weak_popover.upgrade() {
+                popover.popdown();
+            }
+            on_edit(event_for_edit.clone());
+        });
+    }
 
     popover.set_child(Some(&content));
     popover
