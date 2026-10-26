@@ -4040,7 +4040,10 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
             }
             if let Err(error) = crate::autostart::set_enabled(row.is_active()) {
                 reverting_background_alerts.set(true);
-                row.set_active(!row.is_active());
+                // The portal can answer with a different bit than the switch
+                // asked for. Show that answer, which is also the previous
+                // position when nothing was saved.
+                row.set_active(crate::autostart::enabled());
                 ui.toast_overlay.add_toast(adw::Toast::new(&format!(
                     "Could not update background startup: {error}"
                 )));

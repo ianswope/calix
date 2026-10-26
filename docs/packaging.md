@@ -37,20 +37,17 @@ machine without the project's own toolchain already present.
 
 ## 3. Flathub
 
-**Not ready to submit.** Two things block it:
+**Not ready to submit.** One thing still blocks it:
 
 - `flatpak/cargo-sources.json` is generated, not committed. Flathub builders
   have no network, so the locked Cargo sources have to be vendored into the
   manifest by `scripts/generate-flatpak-sources.sh`, which needs
   `flatpak-cargo-generator` installed.
-- **Autostart does not work under Flatpak.** `src/autostart.rs` writes
-  `$XDG_CONFIG_HOME/autostart/com.ianswope.Calix.desktop`, which inside the
-  sandbox is `~/.var/app/com.ianswope.Calix/config/autostart` — a directory the
-  host session never scans. The "Start Calix when you sign in" switch would
-  write its file, report itself as enabled, and never launch anything. Fixing
-  it means calling the Background portal's `RequestBackground` with
-  `autostart: true` instead of writing the file directly, and having the switch
-  reflect the portal's answer rather than the file's existence.
+
+"Start Calix when you sign in" uses the Background portal's `RequestBackground`
+when `/.flatpak-info` is present. The portal writes the login entry on the
+host, and the switch follows the autostart bit in the portal's answer. Outside
+a sandbox, Calix still writes `$XDG_CONFIG_HOME/autostart/com.ianswope.Calix.desktop`.
 
 Flathub also requires the source pinned to a `commit` sha, not just a `tag`.
 Add it at submission time:
