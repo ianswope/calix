@@ -1238,7 +1238,9 @@ impl Store {
     /// A subscribed event, stored in the CalDAV id column because a feed is a
     /// list of iCalendar objects. Unlike a CalDAV upsert, this writes
     /// `recurrence`: a public feed is not expanded by a server, so a plain
-    /// rule has to repeat locally. Reminders are still left alone on update.
+    /// rule has to repeat locally. An excluded or moved date is a row linked
+    /// to that series by `series_event_id` and `original_start`. Reminders
+    /// are still left alone on update.
     pub fn upsert_subscription_event(
         &self,
         calendar_id: i64,
@@ -1248,10 +1250,12 @@ impl Store {
         let recurrence = draft.recurrence.map(Frequency::to_rrule);
         let additional = serde_json::to_string(&draft.additional_reminders).unwrap();
         let attendees = attendees_to_json(&draft.attendees);
+        let original_start = draft.original_start.as_ref().map(stored_timestamp);
         let sql = "
             INSERT INTO events (
                 calendar_id, title, start_at, end_at, all_day, location, notes,
-                icloud_event_id, attendees, reminder_minutes, additional_reminders, recurrence
+                icloud_event_id, attendees, reminder_minutes, additional_reminders,
+                recurrence, series_event_id, original_start, cancelled
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                 COALESCE(
@@ -1267,15 +1271,18 @@ impl Store {
                      LIMIT 1),
                     ?11
                 ),
-                ?12)
+                ?12, ?13, ?14, ?15)
             ON CONFLICT(calendar_id, icloud_event_id) WHERE icloud_event_id IS NOT NULL
             DO UPDATE SET
                 title = ?2, start_at = ?3, end_at = ?4, all_day = ?5,
-                location = ?6, notes = ?7, attendees = ?9, recurrence = ?12
+                location = ?6, notes = ?7, attendees = ?9, recurrence = ?12,
+                series_event_id = ?13, original_start = ?14, cancelled = ?15
             WHERE local_edit = 0 AND (
                 title IS NOT ?2 OR start_at IS NOT ?3 OR end_at IS NOT ?4
                 OR all_day IS NOT ?5 OR location IS NOT ?6 OR notes IS NOT ?7
-                OR attendees IS NOT ?9 OR recurrence IS NOT ?12)
+                OR attendees IS NOT ?9 OR recurrence IS NOT ?12
+                OR series_event_id IS NOT ?13 OR original_start IS NOT ?14
+                OR cancelled IS NOT ?15)
             RETURNING id";
         let written = self.conn.query_row(
             sql,
@@ -1292,6 +1299,9 @@ impl Store {
                 draft.reminder_minutes,
                 additional,
                 recurrence,
+                draft.instance_of,
+                original_start,
+                draft.cancelled as i64,
             ],
             |row| row.get(0),
         );
@@ -1303,6 +1313,22 @@ impl Store {
             ),
             other => other,
         }
+    }
+
+    /// The local id of a subscribed or CalDAV row, when that remote id is
+    /// already stored on this calendar.
+    pub(crate) fn id_for_icloud_event(
+        &self,
+        calendar_id: i64,
+        remote_id: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT id FROM events WHERE calendar_id = ?1 AND icloud_event_id = ?2",
+                params![calendar_id, remote_id],
+                |row| row.get(0),
+            )
+            .optional()
     }
 
     /// Reports the row `remote_id` maps to, whether or not this call wrote it.

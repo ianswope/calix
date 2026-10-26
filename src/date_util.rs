@@ -1,6 +1,6 @@
 use chrono::{
     DateTime, Datelike, Local, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone,
-    Weekday,
+    Timelike, Weekday,
 };
 use std::sync::OnceLock;
 
@@ -71,6 +71,13 @@ pub enum DateOrder {
     DayFirst,
 }
 
+/// Whether a locale writes "2:30 PM" or "14:30".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clock {
+    TwelveHour,
+    TwentyFourHour,
+}
+
 /// One calendar day with its names already taken from the locale.
 #[derive(Clone)]
 pub struct NamedDate {
@@ -130,6 +137,85 @@ pub fn date_order(format: &str) -> DateOrder {
     match (day_at, month_at) {
         (Some(day), Some(month)) if day < month => DateOrder::DayFirst,
         _ => DateOrder::MonthFirst,
+    }
+}
+
+/// Reads a POSIX `t_fmt`. A 12-hour marker wins; a 24-hour marker otherwise
+/// selects that clock. An empty or unrecognized format stays 12-hour, which
+/// is what the grids showed before a locale was read.
+pub fn clock_from_format(format: &str) -> Clock {
+    let bytes = format.as_bytes();
+    let mut index = 0;
+    let mut saw_24 = false;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            break;
+        }
+        if bytes[index] == b'%' {
+            index += 1;
+            continue;
+        }
+        while index < bytes.len() && matches!(bytes[index], b'-' | b'_' | b'0' | b'^' | b'#' | b' ')
+        {
+            index += 1;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index < bytes.len() && matches!(bytes[index], b'E' | b'O') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        match bytes[index] {
+            b'I' | b'l' | b'p' | b'P' | b'r' => return Clock::TwelveHour,
+            b'H' | b'k' | b'R' | b'T' => saw_24 = true,
+            _ => {}
+        }
+        index += 1;
+    }
+    if saw_24 {
+        Clock::TwentyFourHour
+    } else {
+        Clock::TwelveHour
+    }
+}
+
+/// "9:05 AM" or "9:05". No leading zero on the hour, and no seconds.
+pub fn format_time(time: NaiveTime, clock: Clock) -> String {
+    let minute = time.minute();
+    match clock {
+        Clock::TwelveHour => {
+            let hour = time.hour();
+            let (display, suffix) = match hour {
+                0 => (12, "AM"),
+                1..=11 => (hour, "AM"),
+                12 => (12, "PM"),
+                _ => (hour - 12, "PM"),
+            };
+            format!("{display}:{minute:02} {suffix}")
+        }
+        Clock::TwentyFourHour => format!("{}:{minute:02}", time.hour()),
+    }
+}
+
+/// The week-grid label for one hour: "1 PM" or "13:00".
+pub fn hour_label(hour: u32, clock: Clock) -> String {
+    let hour = hour % 24;
+    match clock {
+        Clock::TwelveHour => match hour {
+            0 => "12 AM".to_string(),
+            1..=11 => format!("{hour} AM"),
+            12 => "12 PM".to_string(),
+            _ => format!("{} PM", hour - 12),
+        },
+        Clock::TwentyFourHour => format!("{hour}:00"),
     }
 }
 
@@ -601,6 +687,57 @@ mod tests {
     fn a_doubled_percent_is_not_a_day_or_month_field() {
         assert_eq!(date_order("%%d %m"), DateOrder::MonthFirst);
         assert_eq!(date_order(""), DateOrder::MonthFirst);
+    }
+
+    #[test]
+    fn a_posix_time_format_with_a_24_hour_spec_uses_that_clock() {
+        assert_eq!(clock_from_format("%H:%M:%S"), Clock::TwentyFourHour);
+        assert_eq!(clock_from_format("%k:%M"), Clock::TwentyFourHour);
+        assert_eq!(clock_from_format("%R"), Clock::TwentyFourHour);
+        assert_eq!(clock_from_format("%T"), Clock::TwentyFourHour);
+        assert_eq!(clock_from_format("%OH:%M"), Clock::TwentyFourHour);
+    }
+
+    #[test]
+    fn a_posix_time_format_with_a_meridian_uses_a_12_hour_clock() {
+        assert_eq!(clock_from_format("%I:%M:%S %p"), Clock::TwelveHour);
+        assert_eq!(clock_from_format("%l:%M %P"), Clock::TwelveHour);
+        assert_eq!(clock_from_format("%r"), Clock::TwelveHour);
+        assert_eq!(clock_from_format(""), Clock::TwelveHour);
+        assert_eq!(clock_from_format("no spec"), Clock::TwelveHour);
+    }
+
+    #[test]
+    fn a_12_hour_marker_wins_when_a_format_names_both_clocks() {
+        assert_eq!(clock_from_format("%H:%M %p"), Clock::TwelveHour);
+    }
+
+    #[test]
+    fn format_time_drops_the_leading_zero_and_follows_the_clock() {
+        let morning = NaiveTime::from_hms_opt(9, 5, 0).unwrap();
+        let afternoon = NaiveTime::from_hms_opt(14, 30, 0).unwrap();
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        let noon = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        assert_eq!(format_time(morning, Clock::TwelveHour), "9:05 AM");
+        assert_eq!(format_time(afternoon, Clock::TwelveHour), "2:30 PM");
+        assert_eq!(format_time(midnight, Clock::TwelveHour), "12:00 AM");
+        assert_eq!(format_time(noon, Clock::TwelveHour), "12:00 PM");
+        assert_eq!(format_time(morning, Clock::TwentyFourHour), "9:05");
+        assert_eq!(format_time(afternoon, Clock::TwentyFourHour), "14:30");
+        assert_eq!(format_time(midnight, Clock::TwentyFourHour), "0:00");
+        assert_eq!(format_time(noon, Clock::TwentyFourHour), "12:00");
+    }
+
+    #[test]
+    fn an_hour_label_follows_the_clock() {
+        assert_eq!(hour_label(0, Clock::TwelveHour), "12 AM");
+        assert_eq!(hour_label(9, Clock::TwelveHour), "9 AM");
+        assert_eq!(hour_label(12, Clock::TwelveHour), "12 PM");
+        assert_eq!(hour_label(13, Clock::TwelveHour), "1 PM");
+        assert_eq!(hour_label(0, Clock::TwentyFourHour), "0:00");
+        assert_eq!(hour_label(9, Clock::TwentyFourHour), "9:00");
+        assert_eq!(hour_label(13, Clock::TwentyFourHour), "13:00");
+        assert_eq!(hour_label(23, Clock::TwentyFourHour), "23:00");
     }
 
     #[test]

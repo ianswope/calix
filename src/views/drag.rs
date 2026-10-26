@@ -873,15 +873,9 @@ fn time_of(minutes: f64) -> Option<NaiveTime> {
 
 fn format_minutes(minutes: f64) -> String {
     let minutes = minutes.clamp(0.0, MINUTES_PER_DAY) as u32;
-    let hour = (minutes / 60) % 24;
-    let minute = minutes % 60;
-    let (display_hour, suffix) = match hour {
-        0 => (12, "AM"),
-        1..=11 => (hour, "AM"),
-        12 => (12, "PM"),
-        _ => (hour - 12, "PM"),
-    };
-    format!("{display_hour}:{minute:02} {suffix}")
+    let time =
+        NaiveTime::from_hms_opt((minutes / 60) % 24, minutes % 60, 0).unwrap_or(NaiveTime::MIN);
+    crate::date_util::format_time(time, crate::locale::clock())
 }
 
 #[cfg(test)]
@@ -1111,10 +1105,11 @@ mod tests {
     }
 
     #[test]
-    fn format_minutes_uses_twelve_hour_clock() {
-        assert_eq!(format_minutes(0.0), "12:00 AM"); // midnight
-        assert_eq!(format_minutes(9.0 * 60.0 + 5.0), "9:05 AM");
-        assert_eq!(format_minutes(12.0 * 60.0), "12:00 PM"); // noon
-        assert_eq!(format_minutes(13.0 * 60.0 + 30.0), "1:30 PM");
+    fn format_minutes_follows_the_process_clock() {
+        // No setlocale in this binary, so the C locale's 24-hour clock.
+        assert_eq!(format_minutes(0.0), "0:00");
+        assert_eq!(format_minutes(9.0 * 60.0 + 5.0), "9:05");
+        assert_eq!(format_minutes(12.0 * 60.0), "12:00");
+        assert_eq!(format_minutes(13.0 * 60.0 + 30.0), "13:30");
     }
 }

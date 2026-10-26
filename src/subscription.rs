@@ -1,23 +1,18 @@
 //! A read-only calendar fetched from one public `.ics` or `webcal` link.
 //!
-//! Parsing reuses the iCalendar reader in [`crate::caldav`]. What a server
-//! would expand for CalDAV, this module decides itself: a plain repeat rule is
-//! stored and expanded locally, so a yearly holiday keeps showing up. A rule
-//! with exclusions or moved instances is written out as individual dates
-//! inside the same window the other syncs use, because the local expander
-//! does not know `EXDATE`.
+//! Parsing reuses the iCalendar reader in [`crate::caldav`]. A repeat rule
+//! Calix understands is stored and expanded locally, including its excluded
+//! dates and moved instances, so it keeps showing up as far as the grid asks.
+//! A rule Calix cannot read is kept as its first date only, and the document
+//! is marked incomplete so a later sync will not delete events to match that
+//! partial copy.
 
 use crate::caldav::{self, IcsEvent, IcsProperty};
-use crate::recurrence::{self, Frequency};
+use crate::recurrence::Frequency;
 use crate::store::{self, EventDraft, Store};
 use crate::sync::SyncOutcome;
 use chrono::{DateTime, Duration, Local, Utc};
-use std::collections::HashMap;
-
-/// How far back and forward an excluded or overridden rule is written out.
-/// A plain rule is not cut off here; the grid expands it as far as it is asked.
-const PAST_DAYS: i64 = 90;
-const FUTURE_DAYS: i64 = 180;
+use std::collections::{HashMap, HashSet};
 
 /// Shown when a feed does not name a color. The same blue the rest of the
 /// calendar uses for an event that has none of its own.
@@ -47,6 +42,10 @@ pub struct SubscribedDocument {
 pub struct SubscribedEvent {
     pub id: String,
     pub draft: EventDraft,
+    /// Remote id of the series this row replaces one date of. Filled in as
+    /// `instance_of` once that series has a local id. `None` on the series
+    /// itself and on an ordinary event.
+    pub series_id: Option<String>,
 }
 
 struct Component {
@@ -122,14 +121,6 @@ pub fn fallback_name(url: &str) -> String {
         .unwrap_or_else(|| "Subscribed calendar".to_string())
 }
 
-/// The span an excluded rule is expanded across, around `now`.
-pub fn expansion_window(now: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
-    (
-        now - Duration::days(PAST_DAYS),
-        now + Duration::days(FUTURE_DAYS),
-    )
-}
-
 /// Downloads `url` and returns the body. The caller checks that it is a calendar.
 pub fn fetch_document(url: &str) -> Result<String, String> {
     let response = crate::http::client()?
@@ -151,20 +142,14 @@ pub fn fetch_document(url: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Reads one calendar document. `window` bounds only rules that have to be
-/// written out date by date; everything else is kept whole.
-pub fn parse_document(
-    url: &str,
-    ics: &str,
-    window_start: DateTime<Local>,
-    window_end: DateTime<Local>,
-) -> Result<SubscribedDocument, String> {
+/// Reads one calendar document.
+pub fn parse_document(url: &str, ics: &str) -> Result<SubscribedDocument, String> {
     if !is_calendar_document(ics) {
         return Err("That link did not return a calendar".to_string());
     }
     let (name, color) = calendar_metadata(ics);
     let (components, unreadable) = read_components(ics);
-    let (events, trust) = assemble(url, components, window_start, window_end);
+    let (events, trust) = assemble(url, components);
     Ok(SubscribedDocument {
         name,
         color,
@@ -307,12 +292,7 @@ fn read_exdates(event: &IcsEvent) -> Option<Vec<DateTime<Local>>> {
     Some(instants)
 }
 
-fn assemble(
-    url: &str,
-    components: Vec<(String, Component)>,
-    window_start: DateTime<Local>,
-    window_end: DateTime<Local>,
-) -> (Vec<SubscribedEvent>, bool) {
+fn assemble(url: &str, components: Vec<(String, Component)>) -> (Vec<SubscribedEvent>, bool) {
     let mut order = Vec::new();
     let mut groups: HashMap<String, Vec<Component>> = HashMap::new();
     for (uid, component) in components {
@@ -327,20 +307,14 @@ fn assemble(
         let Some(group) = groups.remove(&uid) else {
             continue;
         };
-        let (produced, group_trust) = events_for_group(url, &uid, &group, window_start, window_end);
+        let (produced, group_trust) = events_for_group(url, &uid, &group);
         trust &= group_trust;
         events.extend(produced);
     }
     (events, trust)
 }
 
-fn events_for_group(
-    url: &str,
-    uid: &str,
-    group: &[Component],
-    window_start: DateTime<Local>,
-    window_end: DateTime<Local>,
-) -> (Vec<SubscribedEvent>, bool) {
+fn events_for_group(url: &str, uid: &str, group: &[Component]) -> (Vec<SubscribedEvent>, bool) {
     let Some(master_index) = group
         .iter()
         .position(|component| component.recurrence_id.is_none())
@@ -369,17 +343,17 @@ fn events_for_group(
             true,
         );
     }
-    let Some(freq) = master.rrule.as_deref().and_then(Frequency::from_rrule) else {
+    let Some(rule) = master.rrule.as_deref() else {
         return (concrete_events(url, uid, master, &overrides), true);
+    };
+    let Some(freq) = Frequency::from_rrule(rule) else {
+        return (concrete_events(url, uid, master, &overrides), false);
     };
     if !master.exdates_readable {
         return (vec![one_off(url, uid, master)], false);
     }
-    if master.exdates.is_empty() && overrides.is_empty() {
-        return (vec![master_with_rule(url, uid, master, freq)], true);
-    }
     (
-        materialize(url, uid, master, freq, &overrides, window_start, window_end),
+        series_with_exceptions(url, uid, master, freq, &overrides),
         true,
     )
 }
@@ -409,6 +383,7 @@ fn master_with_rule(url: &str, uid: &str, master: &Component, freq: Frequency) -
     SubscribedEvent {
         id: event_id(url, uid, None),
         draft,
+        series_id: None,
     }
 }
 
@@ -421,78 +396,103 @@ fn one_off(url: &str, uid: &str, component: &Component) -> SubscribedEvent {
     SubscribedEvent {
         id: event_id(url, uid, stamp.as_deref()),
         draft,
+        series_id: None,
     }
 }
 
-fn materialize(
+/// The series, plus one row per excluded or replaced date. Those rows carry
+/// the date they stand in for; the grid's expander leaves that date out for
+/// as long as the series is stored, with no sync window around it.
+fn series_with_exceptions(
     url: &str,
     uid: &str,
     master: &Component,
     freq: Frequency,
     overrides: &[&Component],
-    window_start: DateTime<Local>,
-    window_end: DateTime<Local>,
 ) -> Vec<SubscribedEvent> {
-    let occurrences = recurrence::occurrences_in(
-        master.draft.start,
-        repeat_duration(&master.draft),
-        freq,
-        window_start,
-        window_end,
-    );
-    let mut events = Vec::new();
-    for start in occurrences {
-        if master
-            .exdates
-            .iter()
-            .any(|excluded| matches_instance(*excluded, start, master.draft.all_day))
-        {
-            continue;
-        }
-        let stamp = instance_stamp(&start, master.draft.all_day);
-        if let Some(replacement) = overrides.iter().find(|component| {
-            component
-                .recurrence_id
-                .is_some_and(|when| matches_instance(when, start, master.draft.all_day))
-        }) {
-            if replacement.cancelled {
-                continue;
-            }
-            let mut draft = replacement.draft.clone();
-            draft.recurrence = None;
-            events.push(SubscribedEvent {
-                id: event_id(url, uid, Some(&stamp)),
-                draft,
-            });
-            continue;
-        }
-        events.push(SubscribedEvent {
-            id: event_id(url, uid, Some(&stamp)),
-            draft: moved_draft(&master.draft, start),
-        });
-    }
+    let master_event = master_with_rule(url, uid, master, freq);
+    let master_id = master_event.id.clone();
+    let mut events = vec![master_event];
+    let mut replaced = HashSet::new();
     for replacement in overrides {
-        if replacement.cancelled {
-            continue;
-        }
         let Some(original) = replacement.recurrence_id else {
             continue;
         };
-        let id = event_id(
-            url,
-            uid,
-            Some(&instance_stamp(&original, master.draft.all_day)),
-        );
-        if events.iter().any(|event| event.id == id) {
+        let anchor = occurrence_anchor(original, master.draft.all_day);
+        if !replaced.insert(anchor) {
             continue;
         }
-        if replacement.draft.start < window_end && replacement.draft.end > window_start {
-            let mut draft = replacement.draft.clone();
-            draft.recurrence = None;
-            events.push(SubscribedEvent { id, draft });
+        events.push(exception_from_override(
+            url,
+            uid,
+            &master_id,
+            master,
+            replacement,
+            anchor,
+        ));
+    }
+    for excluded in &master.exdates {
+        let anchor = occurrence_anchor(*excluded, master.draft.all_day);
+        if !replaced.insert(anchor) {
+            continue;
         }
+        events.push(cancelled_exception(url, uid, &master_id, master, anchor));
     }
     events
+}
+
+fn exception_from_override(
+    url: &str,
+    uid: &str,
+    master_id: &str,
+    master: &Component,
+    replacement: &Component,
+    anchor: DateTime<Local>,
+) -> SubscribedEvent {
+    let mut draft = replacement.draft.clone();
+    draft.recurrence = None;
+    draft.original_start = Some(anchor);
+    draft.cancelled = replacement.cancelled;
+    SubscribedEvent {
+        id: event_id(
+            url,
+            uid,
+            Some(&instance_stamp(&anchor, master.draft.all_day)),
+        ),
+        draft,
+        series_id: Some(master_id.to_string()),
+    }
+}
+
+fn cancelled_exception(
+    url: &str,
+    uid: &str,
+    master_id: &str,
+    master: &Component,
+    anchor: DateTime<Local>,
+) -> SubscribedEvent {
+    let mut draft = moved_draft(&master.draft, anchor);
+    draft.original_start = Some(anchor);
+    draft.cancelled = true;
+    SubscribedEvent {
+        id: event_id(
+            url,
+            uid,
+            Some(&instance_stamp(&anchor, master.draft.all_day)),
+        ),
+        draft,
+        series_id: Some(master_id.to_string()),
+    }
+}
+
+/// The instant the expander will generate for this occurrence, which is the
+/// key a stored exception has to use.
+fn occurrence_anchor(when: DateTime<Local>, all_day: bool) -> DateTime<Local> {
+    if all_day {
+        store::day_start(when.date_naive())
+    } else {
+        when
+    }
 }
 
 fn moved_draft(master: &EventDraft, start: DateTime<Local>) -> EventDraft {
@@ -510,29 +510,6 @@ fn moved_draft(master: &EventDraft, start: DateTime<Local>) -> EventDraft {
         draft.end = start + duration;
     }
     draft
-}
-
-fn repeat_duration(draft: &EventDraft) -> Duration {
-    if draft.all_day {
-        let days = (draft.end.date_naive() - draft.start.date_naive())
-            .num_days()
-            .max(1);
-        Duration::days(days)
-    } else {
-        draft.end - draft.start
-    }
-}
-
-fn matches_instance(
-    candidate: DateTime<Local>,
-    occurrence: DateTime<Local>,
-    all_day: bool,
-) -> bool {
-    if all_day {
-        candidate.date_naive() == occurrence.date_naive()
-    } else {
-        candidate == occurrence
-    }
 }
 
 fn event_id(url: &str, uid: &str, stamp: Option<&str>) -> String {
@@ -560,8 +537,7 @@ pub fn sync_account(store: &Store, account: &store::Account) -> Result<SyncOutco
         .filter(|url| !url.is_empty())
         .ok_or("this subscription has no link")?;
     let ics = fetch_document(url)?;
-    let (start, end) = expansion_window(Local::now());
-    let document = parse_document(url, &ics, start, end)?;
+    let document = parse_document(url, &ics)?;
     apply_document(store, account.id, url, &account.display_name, &document)
 }
 
@@ -586,8 +562,28 @@ pub fn apply_document(
         .collect();
     store
         .sync_batch(|| {
-            for event in &document.events {
-                store.upsert_subscription_event(calendar_id, &event.id, &event.draft)?;
+            let mut series_rows = HashMap::new();
+            for event in document
+                .events
+                .iter()
+                .filter(|event| event.series_id.is_none())
+            {
+                let id = store.upsert_subscription_event(calendar_id, &event.id, &event.draft)?;
+                series_rows.insert(event.id.as_str(), id);
+            }
+            for event in document
+                .events
+                .iter()
+                .filter(|event| event.series_id.is_some())
+            {
+                let mut draft = event.draft.clone();
+                if let Some(series) = event.series_id.as_deref() {
+                    draft.instance_of = match series_rows.get(series).copied() {
+                        Some(id) => Some(id),
+                        None => store.id_for_icloud_event(calendar_id, series)?,
+                    };
+                }
+                store.upsert_subscription_event(calendar_id, &event.id, &draft)?;
             }
             if document.complete {
                 store.prune_subscription_events(calendar_id, &ids)?;
@@ -685,8 +681,7 @@ mod tests {
 
     #[test]
     fn a_page_that_is_not_a_calendar_is_refused() {
-        let (start, end) = window(date(2026, 7, 1), date(2026, 7, 4));
-        let error = parse_document("https://example.com/nope", "<html>nope</html>", start, end)
+        let error = parse_document("https://example.com/nope", "<html>nope</html>")
             .expect_err("html is not a calendar");
         assert_eq!(error, "That link did not return a calendar");
     }
@@ -700,8 +695,7 @@ X-APPLE-CALENDAR-COLOR:#ff00aa\r\n\
 BEGIN:VEVENT\r\nUID:new-year\r\nSUMMARY:New Year's Day\r\n\
 DTSTART;VALUE=DATE:20200101\r\nDTEND;VALUE=DATE:20200102\r\n\
 RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-        let (start, end) = window(date(2026, 1, 1), date(2026, 1, 2));
-        let document = parse_document("https://example.com/holidays.ics", ics, start, end).unwrap();
+        let document = parse_document("https://example.com/holidays.ics", ics).unwrap();
         assert_eq!(document.name.as_deref(), Some("US Holidays"));
         assert_eq!(document.color.as_deref(), Some("#ff00aa"));
         assert!(document.complete);
@@ -726,8 +720,7 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             ",
         );
         let url = "https://example.com/holidays.ics";
-        let (start, end) = window(date(2026, 1, 1), date(2026, 1, 2));
-        let document = parse_document(url, &ics, start, end).unwrap();
+        let document = parse_document(url, &ics).unwrap();
         let store = Store::open_in_memory().unwrap();
         let account_id = store.upsert_webcal_account(url, "US Holidays").unwrap();
         apply_document(&store, account_id, url, "US Holidays", &document).unwrap();
@@ -747,7 +740,7 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     }
 
     #[test]
-    fn an_excluded_day_of_a_repeating_feed_is_not_stored() {
+    fn an_excluded_day_of_a_repeating_feed_is_a_skipped_occurrence() {
         let ics = calendar(
             "
             BEGIN:VCALENDAR
@@ -762,20 +755,232 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             END:VCALENDAR
             ",
         );
-        let (start, end) = window(date(2026, 7, 1), date(2026, 7, 4));
-        let document = parse_document("https://example.com/team.ics", &ics, start, end).unwrap();
-        let days: Vec<NaiveDate> = document
+        let document = parse_document("https://example.com/team.ics", &ics).unwrap();
+        assert!(document.complete);
+        let master = document
             .events
             .iter()
-            .map(|event| event.draft.start.date_naive())
+            .find(|event| event.series_id.is_none())
+            .expect("the series");
+        assert_eq!(master.draft.recurrence, Some(Frequency::Daily));
+        assert_eq!(master.draft.start.date_naive(), date(2026, 7, 1));
+        let skipped: Vec<_> = document
+            .events
+            .iter()
+            .filter(|event| event.draft.cancelled)
             .collect();
-        assert_eq!(days, vec![date(2026, 7, 1), date(2026, 7, 3)]);
-        assert!(
-            document
-                .events
-                .iter()
-                .all(|event| event.draft.recurrence.is_none())
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0]
+                .draft
+                .original_start
+                .map(|when| when.date_naive()),
+            Some(date(2026, 7, 2))
         );
+        assert_eq!(skipped[0].series_id.as_deref(), Some(master.id.as_str()));
+    }
+
+    #[test]
+    fn an_excluded_day_stays_missing_outside_the_old_sync_window() {
+        let ics = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Standup
+            DTSTART;VALUE=DATE:20260701
+            DTEND;VALUE=DATE:20260702
+            RRULE:FREQ=DAILY
+            EXDATE;VALUE=DATE:20260702,20270702
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let url = "https://example.com/team.ics";
+        // 2027-07-02 is past the 180 days a sync used to write out, and the
+        // exclusion has to survive that anyway.
+        let document = parse_document(url, &ics).unwrap();
+        assert!(document.complete);
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store.upsert_webcal_account(url, "Team").unwrap();
+        apply_document(&store, account_id, url, "Team", &document).unwrap();
+
+        assert_eq!(
+            titles_on(&store, date(2026, 7, 1), date(2026, 7, 4)),
+            vec![
+                (date(2026, 7, 1), "Standup".to_string()),
+                (date(2026, 7, 3), "Standup".to_string()),
+            ]
+        );
+        assert_eq!(
+            titles_on(&store, date(2027, 7, 1), date(2027, 7, 4)),
+            vec![
+                (date(2027, 7, 1), "Standup".to_string()),
+                (date(2027, 7, 3), "Standup".to_string()),
+            ]
+        );
+    }
+
+    fn titles_on(store: &Store, from: NaiveDate, to: NaiveDate) -> Vec<(NaiveDate, String)> {
+        store
+            .events_between(store::day_start(from), store::day_start(to))
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.start.date_naive(), event.title))
+            .collect()
+    }
+
+    #[test]
+    fn a_moved_feed_occurrence_stays_moved_and_the_series_continues() {
+        let ics = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Standup
+            DTSTART:20260702T140000
+            DTEND:20260702T150000
+            RRULE:FREQ=WEEKLY
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Special
+            DTSTART:20260716T160000
+            DTEND:20260716T170000
+            RECURRENCE-ID:20260716T140000
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let url = "https://example.com/team.ics";
+        let document = parse_document(url, &ics).unwrap();
+        assert!(document.complete);
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store.upsert_webcal_account(url, "Team").unwrap();
+        apply_document(&store, account_id, url, "Team", &document).unwrap();
+
+        let day = store
+            .events_between(
+                store::day_start(date(2026, 7, 16)),
+                store::day_start(date(2026, 7, 17)),
+            )
+            .unwrap();
+        assert_eq!(day.len(), 1);
+        assert_eq!(day[0].title, "Special");
+        assert_eq!(day[0].start.format("%H:%M").to_string(), "16:00");
+        // 2026-07-02 was a Thursday. A year later the series still lands on
+        // Thursdays, which in 2027 is July 1.
+        assert_eq!(
+            titles_on(&store, date(2027, 7, 1), date(2027, 7, 2)),
+            vec![(date(2027, 7, 1), "Standup".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_excluded_time_stays_off_the_grid() {
+        let ics = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Standup
+            DTSTART:20260702T140000
+            DTEND:20260702T150000
+            RRULE:FREQ=DAILY
+            EXDATE:20260703T140000
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let url = "https://example.com/team.ics";
+        let document = parse_document(url, &ics).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store.upsert_webcal_account(url, "Team").unwrap();
+        apply_document(&store, account_id, url, "Team", &document).unwrap();
+        assert_eq!(
+            titles_on(&store, date(2026, 7, 2), date(2026, 7, 5)),
+            vec![
+                (date(2026, 7, 2), "Standup".to_string()),
+                (date(2026, 7, 4), "Standup".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_an_exclusion_brings_that_day_back() {
+        let url = "https://example.com/team.ics";
+        let excluded = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Standup
+            DTSTART;VALUE=DATE:20260701
+            DTEND;VALUE=DATE:20260702
+            RRULE:FREQ=DAILY
+            EXDATE;VALUE=DATE:20260702
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let restored = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:standup
+            SUMMARY:Standup
+            DTSTART;VALUE=DATE:20260701
+            DTEND;VALUE=DATE:20260702
+            RRULE:FREQ=DAILY
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store.upsert_webcal_account(url, "Team").unwrap();
+        let excluded = parse_document(url, &excluded).unwrap();
+        apply_document(&store, account_id, url, "Team", &excluded).unwrap();
+        assert!(titles_on(&store, date(2026, 7, 2), date(2026, 7, 3)).is_empty());
+        let restored = parse_document(url, &restored).unwrap();
+        apply_document(&store, account_id, url, "Team", &restored).unwrap();
+        assert_eq!(
+            titles_on(&store, date(2026, 7, 1), date(2026, 7, 4)),
+            vec![
+                (date(2026, 7, 1), "Standup".to_string()),
+                (date(2026, 7, 2), "Standup".to_string()),
+                (date(2026, 7, 3), "Standup".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_calix_cannot_read_keeps_only_its_first_date() {
+        let ics = calendar(
+            "
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:new-year
+            SUMMARY:New Year
+            DTSTART;VALUE=DATE:20200101
+            DTEND;VALUE=DATE:20200102
+            RRULE:FREQ=YEARLY;BYMONTH=1
+            END:VEVENT
+            END:VCALENDAR
+            ",
+        );
+        let url = "https://example.com/holidays.ics";
+        let document = parse_document(url, &ics).unwrap();
+        assert!(!document.complete);
+        assert_eq!(document.events.len(), 1);
+        assert!(document.events[0].draft.recurrence.is_none());
+        let store = Store::open_in_memory().unwrap();
+        let account_id = store.upsert_webcal_account(url, "Holidays").unwrap();
+        apply_document(&store, account_id, url, "Holidays", &document).unwrap();
+        assert_eq!(
+            titles_on(&store, date(2020, 1, 1), date(2020, 1, 2)),
+            vec![(date(2020, 1, 1), "New Year".to_string())]
+        );
+        assert!(titles_on(&store, date(2026, 1, 1), date(2026, 1, 2)).is_empty());
     }
 
     #[test]
@@ -817,9 +1022,9 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let again = store.upsert_webcal_account(url, "Team").unwrap();
         assert_eq!(account_id, again);
 
-        let first = parse_document(url, &first, start, end).unwrap();
+        let first = parse_document(url, &first).unwrap();
         apply_document(&store, account_id, url, "Team", &first).unwrap();
-        let second = parse_document(url, &second, start, end).unwrap();
+        let second = parse_document(url, &second).unwrap();
         apply_document(&store, account_id, url, "Team", &second).unwrap();
 
         let titles: Vec<String> = store
@@ -860,9 +1065,9 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let (start, end) = window(date(2026, 7, 1), date(2026, 8, 1));
         let store = Store::open_in_memory().unwrap();
         let account_id = store.upsert_webcal_account(url, "Team").unwrap();
-        let good = parse_document(url, &good, start, end).unwrap();
+        let good = parse_document(url, &good).unwrap();
         apply_document(&store, account_id, url, "Team", &good).unwrap();
-        let broken = parse_document(url, &broken, start, end).unwrap();
+        let broken = parse_document(url, &broken).unwrap();
         assert!(!broken.complete);
         apply_document(&store, account_id, url, "Team", &broken).unwrap();
 
@@ -890,8 +1095,7 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             ",
         );
         let url = "https://example.com/one.ics";
-        let (start, end) = window(date(2026, 7, 1), date(2026, 8, 1));
-        let document = parse_document(url, &ics, start, end).unwrap();
+        let document = parse_document(url, &ics).unwrap();
         assert!(document.color.is_none());
         let store = Store::open_in_memory().unwrap();
         let account_id = store.upsert_webcal_account(url, "One").unwrap();
@@ -917,7 +1121,7 @@ RRULE:FREQ=YEARLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         );
         let url = "https://example.com/one.ics";
         let (start, end) = window(date(2026, 7, 1), date(2026, 8, 1));
-        let document = parse_document(url, &ics, start, end).unwrap();
+        let document = parse_document(url, &ics).unwrap();
         let store = Store::open_in_memory().unwrap();
         let account_id = store.upsert_webcal_account(url, "One").unwrap();
         apply_document(&store, account_id, url, "One", &document).unwrap();

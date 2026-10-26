@@ -90,10 +90,12 @@ pub fn next_checkpoint(
 
 /// Body text for an event alert, e.g. "Today at 9:05 AM — Suite 210" or
 /// "Tomorrow, all day". Starts further out (a 1-day alert can precede a
-/// Monday event by a weekend) show the weekday and date instead.
+/// Monday event by a weekend) show the weekday and date instead. `clock`
+/// is the locale's, passed in so this module stays free of GTK.
 pub fn notification_body(
     event: &Event,
     now: DateTime<Local>,
+    clock: crate::date_util::Clock,
     format_date: impl Fn(NaiveDate) -> String,
 ) -> String {
     let day = match (event.start.date_naive() - now.date_naive()).num_days() {
@@ -104,8 +106,10 @@ pub fn notification_body(
     let when = if event.all_day {
         format!("{day}, all day")
     } else {
-        // Same 12-hour convention as the drag preview (drag::format_minutes).
-        format!("{day} at {}", event.start.format("%-I:%M %p"))
+        format!(
+            "{day} at {}",
+            crate::date_util::format_time(event.start.time(), clock)
+        )
     };
     match &event.location {
         Some(location) => format!("{when} — {location}"),
@@ -116,6 +120,7 @@ pub fn notification_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::date_util::Clock;
     use chrono::TimeZone;
 
     fn at(y: i32, m: u32, d: u32, hour: u32, min: u32) -> DateTime<Local> {
@@ -255,7 +260,12 @@ mod tests {
     #[test]
     fn notification_body_says_today_with_the_start_time() {
         let event = event_at(at(2026, 7, 20, 14, 30), Some(10));
-        let body = notification_body(&event, at(2026, 7, 20, 14, 20), english_date);
+        let body = notification_body(
+            &event,
+            at(2026, 7, 20, 14, 20),
+            Clock::TwelveHour,
+            english_date,
+        );
         assert_eq!(body, "Today at 2:30 PM");
     }
 
@@ -263,7 +273,12 @@ mod tests {
     fn notification_body_appends_the_location_when_set() {
         let mut event = event_at(at(2026, 7, 20, 9, 5), Some(5));
         event.location = Some("Suite 210".into());
-        let body = notification_body(&event, at(2026, 7, 20, 9, 0), english_date);
+        let body = notification_body(
+            &event,
+            at(2026, 7, 20, 9, 0),
+            Clock::TwelveHour,
+            english_date,
+        );
         assert_eq!(body, "Today at 9:05 AM — Suite 210");
     }
 
@@ -271,7 +286,12 @@ mod tests {
     fn notification_body_for_an_all_day_event_tomorrow_skips_the_time() {
         let mut event = event_at(at(2026, 7, 21, 0, 0), Some(1440));
         event.all_day = true;
-        let body = notification_body(&event, at(2026, 7, 20, 0, 0), english_date);
+        let body = notification_body(
+            &event,
+            at(2026, 7, 20, 0, 0),
+            Clock::TwelveHour,
+            english_date,
+        );
         assert_eq!(body, "Tomorrow, all day");
     }
 
@@ -316,17 +336,34 @@ mod tests {
         // "Tomorrow" would be right, but a hand-moved clock or suspend can
         // stretch the gap past a day, so the fallback must stay readable.
         let event = event_at(at(2026, 7, 23, 9, 0), Some(1440));
-        let body = notification_body(&event, at(2026, 7, 20, 9, 0), english_date);
+        let body = notification_body(
+            &event,
+            at(2026, 7, 20, 9, 0),
+            Clock::TwelveHour,
+            english_date,
+        );
         assert_eq!(body, "Thursday, July 23 at 9:00 AM");
     }
 
     #[test]
     fn notification_body_uses_the_date_text_it_is_given() {
         let event = event_at(at(2026, 7, 23, 9, 0), Some(1440));
-        let body = notification_body(&event, at(2026, 7, 20, 9, 0), |_| {
+        let body = notification_body(&event, at(2026, 7, 20, 9, 0), Clock::TwelveHour, |_| {
             "czwartek, 23 lipca".to_string()
         });
         assert_eq!(body, "czwartek, 23 lipca at 9:00 AM");
+    }
+
+    #[test]
+    fn notification_body_uses_a_24_hour_clock_when_asked() {
+        let event = event_at(at(2026, 7, 20, 14, 30), Some(10));
+        let body = notification_body(
+            &event,
+            at(2026, 7, 20, 14, 20),
+            Clock::TwentyFourHour,
+            english_date,
+        );
+        assert_eq!(body, "Today at 14:30");
     }
 
     fn english_date(date: NaiveDate) -> String {

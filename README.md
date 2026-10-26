@@ -70,8 +70,6 @@ silently failing.
   </picture>
 </details>
 
-These screenshots were captured from the 0.7.0 development source on Omarchy, using fictional local calendars. They do not demonstrate the later 0.8.0 drag-and-drop changes.
-
 <details>
   <summary><strong>See the year view</strong></summary>
 
@@ -238,7 +236,7 @@ A public `.ics` or `webcal` link — holidays, a sports schedule, a team calenda
 2. Paste the link. `webcal://` addresses are fetched over HTTPS. A name is optional; Calix uses the name in the file, or the site, when you leave it blank.
 3. Events refresh with the other calendars. They stay read-only: Calix will not edit, move, or delete them, and nothing is written back to the link.
 
-A repeat rule Calix understands is kept and shown as far ahead as you scroll. A rule with excluded dates, or one Calix cannot read (a holiday file that names specific months), is stored as the individual dates inside the usual sync window.
+A repeat rule Calix understands is kept and shown as far ahead as you scroll, including a day the feed skips or moves. A rule Calix cannot read, such as a holiday file that names specific months, is kept as its first date, and that sync is marked incomplete.
 
 Removing the account deletes only the cached copy on this computer.
 
@@ -382,7 +380,7 @@ than guessing from an empty list.
 - `src/google/calendar_api.rs` — thin REST client over the Calendar API v3.
 - `src/google/sync.rs` — fetches Google calendars and event windows, then upserts/prunes synced rows in SQLite. Google’s selected/hidden state is used only for a calendar’s initial Calix visibility; later sidebar choices are preserved.
 - `src/caldav.rs` — the provider-neutral CalDAV engine: principal/calendar discovery (with a `/.well-known/caldav` fallback), event fetch with server-side recurrence expansion, create/update/delete, and the shared sync loop. Used by both iCloud and generic CalDAV accounts; only the credentials differ. Its iCalendar reader is also what a subscribed `.ics` link is parsed with.
-- `src/subscription.rs` — read-only calendars fetched from one public `.ics` or `webcal` link. A plain repeat rule is stored and expanded locally; a rule with exclusions is written out as individual dates. Nothing is written back to the link.
+- `src/subscription.rs` — read-only calendars fetched from one public `.ics` or `webcal` link. A repeat rule Calix understands is stored and expanded locally, including excluded and moved days. A rule it cannot read is kept as its first date. Nothing is written back to the link.
 - `src/icloud/` — the iCloud adapter over `src/caldav.rs`: the fixed `caldav.icloud.com` root plus app-specific-password keyring helpers (also reused for generic CalDAV account passwords).
 
 ## Roadmap

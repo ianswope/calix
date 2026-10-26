@@ -10,6 +10,7 @@
 //! it is thin enough to verify by looking at it.
 
 use crate::event_dialog::RemoteEvent;
+use crate::locale;
 use crate::store::Store;
 use crate::store::{Attendee, Event};
 use crate::subscription;
@@ -21,9 +22,6 @@ use gtk::prelude::*;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Duration as StdDuration;
-
-/// `9:05 AM`
-const TIME_FORMAT: &str = "%-I:%M %p";
 
 /// The last calendar day an event covers, as a person would name it.
 ///
@@ -58,15 +56,15 @@ pub(crate) fn when_text(event: &Event) -> String {
         (false, true) => format!(
             "{} · {} – {}",
             crate::locale::short_date(start_date, true),
-            event.start.format(TIME_FORMAT),
-            event.end.format(TIME_FORMAT)
+            locale::format_time(event.start.time()),
+            locale::format_time(event.end.time())
         ),
         (false, false) => format!(
             "{}, {} – {}, {}, {}",
             crate::locale::short_date(start_date, false),
-            event.start.format(TIME_FORMAT),
+            locale::format_time(event.start.time()),
             crate::locale::short_date(end_date, false),
-            event.end.format(TIME_FORMAT),
+            locale::format_time(event.end.time()),
             event.end.format("%Y")
         ),
     }
@@ -541,7 +539,7 @@ mod tests {
     #[test]
     fn a_timed_event_inside_one_day_shows_the_date_once() {
         let e = event(at(2026, 8, 10, 9, 0), at(2026, 8, 10, 10, 30), false);
-        assert_eq!(when_text(&e), "Mon, Aug 10, 2026 · 9:00 AM – 10:30 AM");
+        assert_eq!(when_text(&e), "Mon, Aug 10, 2026 · 9:00 – 10:30");
     }
 
     #[test]
@@ -549,7 +547,7 @@ mod tests {
         let e = event(at(2026, 8, 10, 21, 0), at(2026, 8, 11, 1, 0), false);
         assert_eq!(
             when_text(&e),
-            "Mon, Aug 10, 9:00 PM – Tue, Aug 11, 1:00 AM, 2026"
+            "Mon, Aug 10, 21:00 – Tue, Aug 11, 1:00, 2026"
         );
     }
 
