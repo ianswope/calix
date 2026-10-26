@@ -179,6 +179,15 @@ pub fn short_date(date: &NamedDate, order: DateOrder, include_year: bool) -> Str
     }
 }
 
+/// "Oct 26, 4:07 PM". The clock text is already formatted. The day and the
+/// month abbreviation trade places when the locale writes the day first.
+pub fn updated_stamp(month_abbrev: &str, day: u32, order: DateOrder, time: &str) -> String {
+    match order {
+        DateOrder::MonthFirst => format!("{month_abbrev} {day}, {time}"),
+        DateOrder::DayFirst => format!("{day} {month_abbrev}, {time}"),
+    }
+}
+
 /// The header for a week, compact when both days share a month.
 pub fn week_range(start: &NamedDate, end: &NamedDate, order: DateOrder) -> String {
     let same_month = start.month_number == end.month_number && start.year == end.year;
@@ -625,6 +634,18 @@ mod tests {
         assert_eq!(
             weekday_and_date(&date, DateOrder::DayFirst),
             "Thursday, 23 July"
+        );
+    }
+
+    #[test]
+    fn an_account_update_follows_the_locale_date_order() {
+        assert_eq!(
+            updated_stamp("Oct", 26, DateOrder::MonthFirst, "4:07 PM"),
+            "Oct 26, 4:07 PM"
+        );
+        assert_eq!(
+            updated_stamp("Oct", 26, DateOrder::DayFirst, "4:07 PM"),
+            "26 Oct, 4:07 PM"
         );
     }
 

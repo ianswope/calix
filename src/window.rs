@@ -4211,7 +4211,10 @@ fn account_sync_status(account: &store::Account) -> String {
         return "Last sync time unreadable".to_string();
     };
     let local = timestamp.with_timezone(&Local);
-    format!("Last updated {}", local.format("%b %-d, %-I:%M %p"))
+    format!(
+        "Last updated {}",
+        locale::updated_stamp(local.date_naive(), &local.format("%-I:%M %p").to_string())
+    )
 }
 
 fn sync_account_with_health(
