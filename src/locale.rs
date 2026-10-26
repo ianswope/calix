@@ -37,6 +37,13 @@ pub fn short_date(date: NaiveDate, include_year: bool) -> String {
     date_util::short_date(&named_date(date), current_order(), include_year)
 }
 
+/// "Oct 26, 4:07 PM". The clock text is already formatted. The month name
+/// comes from the locale, and the day and month trade places with it.
+pub fn updated_stamp(date: NaiveDate, time: &str) -> String {
+    let named = named_date(date);
+    date_util::updated_stamp(&named.month_abbrev, named.day, current_order(), time)
+}
+
 fn named_date(date: NaiveDate) -> date_util::NamedDate {
     date_util::NamedDate {
         weekday: format(date, "%A"),
@@ -189,5 +196,11 @@ mod tests {
     fn a_notification_date_uses_the_locale_weekday_and_month() {
         let date = NaiveDate::from_ymd_opt(2026, 7, 23).unwrap();
         assert_eq!(notification_date(date), "Thursday, July 23");
+    }
+
+    #[test]
+    fn an_account_update_uses_the_locale_month_abbreviation() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 26).unwrap();
+        assert_eq!(updated_stamp(date, "4:07 PM"), "Oct 26, 4:07 PM");
     }
 }
