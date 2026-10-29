@@ -28,6 +28,9 @@ const FIRST_FRAME_US: f64 = 16_667.0;
 /// Attach eased wheel scrolling to a timed page's scroll container.
 pub(crate) fn install(scrolled: &gtk::ScrolledWindow) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    // The week-swipe guard looks controllers up by name so it can silence the
+    // grid's own scrolling without silencing this one.
+    controller.set_name(Some("calix-smooth-scroll"));
     // Capture, so a detent is seen here before the scrolled window's own
     // controller applies it as a jump.
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);

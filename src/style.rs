@@ -170,6 +170,10 @@ row:selected {
     background-color: alpha(@accent_bg_color, 0.06);
 }
 
+.week-page {
+    background-color: @window_bg_color;
+}
+
 .all-day-row {
     border-bottom: 1px solid @borders;
 }

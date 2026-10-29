@@ -215,7 +215,7 @@ impl AccountActivity {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
     Year,
     Month,
@@ -380,15 +380,20 @@ fn settle_action(frame: SettleFrame) -> SettleAction {
 /// Which end of the carousel a one-period step swaps out.
 ///
 /// A swipe leaves the page the user is now looking at attached at the near end.
-/// Only the far page — two periods stale, and offscreen — may be replaced;
-/// destroying and rebuilding the visible page mid-animation is what makes the
-/// whole view flicker.
+/// Only the far page — two periods stale, and offscreen — may be replaced.
+/// Destroying the visible page mid-animation makes the whole view flicker, and
+/// so does inserting a fresh page: the carousel draws a page at full size for
+/// the frame it is still "size 0", stacked on the week the swipe just reached.
+/// A timed view moves the far page instead (`reorder_to`). Month and year have
+/// no hour grid to refill in place, so they still drop and insert.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 struct RecyclePlan {
     /// Remove the carousel's first child rather than its last.
     drop_first: bool,
     /// Insert the replacement at the front rather than appending it.
     insert_first: bool,
+    /// Move the far page here. `-1` is the end of the carousel.
+    reorder_to: i32,
 }
 
 fn recycle_plan(delta: i32) -> RecyclePlan {
@@ -396,13 +401,46 @@ fn recycle_plan(delta: i32) -> RecyclePlan {
         RecyclePlan {
             drop_first: true,
             insert_first: false,
+            reorder_to: -1,
         }
     } else {
         RecyclePlan {
             drop_first: false,
             insert_first: true,
+            reorder_to: 0,
         }
     }
+}
+
+/// Where libadwaita 1.10 leaves `position` when `size_allocate` applies a
+/// reorder's `position_shift`.
+///
+/// The shift is clamped to `0..=shift + last_child.snap_point`, and those
+/// snap points still describe the order from before the children moved.
+/// Moving the first page to the end leaves that last snap at 0 and the shift
+/// at -1, so a carousel parked on the last page clamps to 0: the page just
+/// swiped away from.
+#[cfg(test)]
+fn position_after_shift_clamp(position: f64, shift: f64, last_stale_snap: f64) -> f64 {
+    let upper = (shift + last_stale_snap).max(0.0);
+    (position + shift).clamp(0.0, upper)
+}
+
+/// Puts `page` on screen after a reorder, before the next paint.
+///
+/// `reorder` only stores a `position_shift` and flags the carousel so
+/// `scroll_to` waits for idle. The shift is applied in `size_allocate`, which
+/// clamps it as `position_after_shift_clamp` describes, and that clamped
+/// position is what paints — the idle scroll corrects it one frame too late.
+/// Allocating here consumes the shift and clears the flag, so the scroll runs
+/// before paint instead of after it.
+fn park_after_reorder(carousel: &adw::Carousel, page: &gtk::Widget) {
+    let width = carousel.width();
+    let height = carousel.height();
+    if width > 0 && height > 0 {
+        carousel.allocate(width, height, -1, None);
+    }
+    carousel.scroll_to(page, false);
 }
 
 /// Which way a landed `page-changed` index moves the period, if at all.
@@ -500,6 +538,74 @@ fn page_drives_siblings(index: usize, position: f64) -> bool {
     (position - index as f64).abs() < 0.5
 }
 
+/// How much more horizontal than vertical a touchpad sample must be before
+/// it belongs to the week carousel. This is the factor libadwaita's swipe
+/// tracker uses, so a gesture the carousel will reject is left to the hour
+/// grid and one it will take is not.
+const SWIPE_AXIS_FACTOR: f64 = 1.2;
+
+/// Whether this touchpad sample is a horizontal page change.
+///
+/// `None` when the sample has no movement — a stop at the end of a gesture
+/// must not decide the axis. A real trackpad swipe is almost never a pure
+/// horizontal line; the vertical crumbs are what the hour grid latches onto.
+fn touchpad_swipe_is_horizontal(dx: f64, dy: f64) -> Option<bool> {
+    if dx == 0.0 && dy == 0.0 {
+        return None;
+    }
+    Some(dx.abs() >= dy.abs() * SWIPE_AXIS_FACTOR)
+}
+
+/// The axis a touchpad gesture has settled on.
+///
+/// The first sample that actually moves locks it. Later samples must not
+/// reopen the question: once the hour grid has accepted a vertical delta it
+/// eats every event after that, including the horizontal ones that were
+/// changing the week, and the hours jump for the rest of the swipe.
+fn lock_touchpad_axis(locked: Option<bool>, dx: f64, dy: f64) -> Option<bool> {
+    locked.or_else(|| touchpad_swipe_is_horizontal(dx, dy))
+}
+
+/// What a quiet redraw — a sync, a save, an undo — should do with the carousel.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum QuietRedraw {
+    /// The pages already show this period and the carousel is parked. Swap
+    /// the events in place; tearing the page down is the flash.
+    Refresh,
+    /// Same period, but a swipe is still landing. Refresh once it parks.
+    Defer,
+    /// The period changed, or this view has no hour grid to refresh.
+    Rebuild,
+}
+
+/// The period the carousel's pages were built for.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct ShownPeriod {
+    mode: ViewMode,
+    date: NaiveDate,
+}
+
+/// A redraw that does not change the week or the day can keep the pages it
+/// already has. Rebuilding them destroys the one on screen, and that is the
+/// flash that shows up on its own when a sync lands.
+fn quiet_redraw(
+    settled: bool,
+    n_pages: u32,
+    shown: Option<ShownPeriod>,
+    mode: ViewMode,
+    date: NaiveDate,
+) -> QuietRedraw {
+    let same_period = shown == Some(ShownPeriod { mode, date });
+    let timed = matches!(mode, ViewMode::Week | ViewMode::Day);
+    if same_period && timed && settled && n_pages == PAGES_PER_REBUILD {
+        QuietRedraw::Refresh
+    } else if same_period && timed && !settled {
+        QuietRedraw::Defer
+    } else {
+        QuietRedraw::Rebuild
+    }
+}
+
 /// Where a timed page should open to show `event`: an hour above its start,
 /// so the block sits just below the header rather than flush against it. An
 /// all-day event has no hour to show, so the page opens where it normally
@@ -576,6 +682,13 @@ struct Ui {
     // Which rebuild owns the carousel, and whether it has landed. Everything
     // that must not act on a half-rebuilt carousel consults this.
     sync: Rc<Cell<CarouselSync>>,
+    // The period the pages currently on the carousel were built for. A quiet
+    // redraw compares against it so a sync can refresh events without
+    // destroying the page on screen.
+    shown: Cell<Option<ShownPeriod>>,
+    // A quiet redraw that arrived while a swipe was still landing. Applied
+    // from `settled`, once the page on screen is safe to touch.
+    pending_refresh: Cell<bool>,
     // Run once by the next rebuild that verifiably lands. Startup uses it to
     // connect the interactive handlers on the same clock that centers the
     // first page, instead of guessing at a delay.
@@ -1081,16 +1194,38 @@ impl Ui {
     /// yanked the view away from the evening the user had scrolled to every
     /// time a sync finished. Without a timed page on screen there is no
     /// position to keep, and the page opens where it normally would.
+    ///
+    /// When the pages already show this week or day, the events are swapped
+    /// in place instead. A full rebuild destroys the page on screen, and that
+    /// flash is what a sync looks like when nobody touched the calendar.
     fn reset_keeping_scroll(self: &Rc<Self>) {
-        let scroll = self
-            .visible_scroll_hours()
-            .map(week_view::InitialScroll::AtHour)
-            .unwrap_or(week_view::InitialScroll::NowOrMorning);
-        self.reset_with(scroll);
+        let (mode, date) = {
+            let state = self.state.borrow();
+            (state.view_mode, state.current_date)
+        };
+        match quiet_redraw(
+            self.sync.get().is_settled(),
+            self.carousel.n_pages(),
+            self.shown.get(),
+            mode,
+            date,
+        ) {
+            QuietRedraw::Refresh => self.refresh_timed_pages(),
+            QuietRedraw::Defer => self.pending_refresh.set(true),
+            QuietRedraw::Rebuild => {
+                let scroll = self
+                    .visible_scroll_hours()
+                    .map(week_view::InitialScroll::AtHour)
+                    .unwrap_or(week_view::InitialScroll::NowOrMorning);
+                self.reset_with(scroll);
+            }
+        }
     }
 
     /// `reset`, but landing the timed grid at `scroll`.
     fn reset_with(self: &Rc<Self>, scroll: week_view::InitialScroll) {
+        // This rebuild is the redraw a deferred refresh was waiting to do.
+        self.pending_refresh.set(false);
         let generation = {
             let mut sync = self.sync.get();
             let generation = sync.begin_rebuild();
@@ -1141,7 +1276,51 @@ impl Ui {
         // the frame-clock loop below is for.
         self.carousel.scroll_to(&current_page, false);
 
+        self.remember_shown();
         self.confirm_centered(generation, current_page);
+    }
+
+    /// Records the period the pages now on the carousel were built for.
+    fn remember_shown(&self) {
+        let state = self.state.borrow();
+        self.shown.set(Some(ShownPeriod {
+            mode: state.view_mode,
+            date: state.current_date,
+        }));
+    }
+
+    /// Replaces the events on the three timed pages without touching the
+    /// carousel. The scroll containers stay, so the hours on screen stay and
+    /// nothing is destroyed under the user's eyes.
+    fn refresh_timed_pages(self: &Rc<Self>) {
+        let (mode, dates, height) = {
+            let state = self.state.borrow();
+            let dates: Vec<NaiveDate> = [-1, 0, 1]
+                .into_iter()
+                .map(|delta| state.shift_from(state.current_date, delta))
+                .collect();
+            (state.view_mode, dates, state.hour_row_height)
+        };
+        let mut pages = Vec::new();
+        let mut child = self.carousel.first_child();
+        while let Some(page) = child {
+            child = page.next_sibling();
+            pages.push(page);
+        }
+        if pages.len() != dates.len() {
+            return;
+        }
+        for (page, date) in pages.iter().zip(dates) {
+            let days = match mode {
+                ViewMode::Week => week_dates(date).to_vec(),
+                ViewMode::Day => vec![date],
+                ViewMode::Month | ViewMode::Year => return,
+            };
+            let events = page_events(&self.store, mode, date);
+            let actions = self.event_callbacks(events.clone());
+            week_view::replace_timed_contents(page, &days, &events, actions, height);
+        }
+        self.zoom_dirty.set(false);
     }
 
     /// Retries the scroll onto `current_page` each frame until the carousel is
@@ -1203,6 +1382,11 @@ impl Ui {
         // waiting out the 30s timer.
         self.tick_clock();
         self.apply_pending_steps();
+        // A sync that landed mid-swipe deferred its redraw. The pages it would
+        // have rebuilt are the ones now parked, so refresh them in place.
+        if self.pending_refresh.take() {
+            self.refresh_timed_pages();
+        }
     }
 
     /// Takes the arrow presses that queued up while the carousel was busy and
@@ -1304,22 +1488,45 @@ impl Ui {
         let view_mode = state.view_mode;
         let replacement_date = state.shift_from(state.current_date, delta);
         let title = state.title();
+        let hour_row_height = state.hour_row_height;
         drop(state);
 
-        let replacement = self.build_page(view_mode, replacement_date, scroll);
         let plan = recycle_plan(delta);
-        let stale = if plan.drop_first {
+        let far = if plan.drop_first {
             self.carousel.first_child()
         } else {
             self.carousel.last_child()
         };
-        if let Some(stale) = stale {
-            self.carousel.remove(&stale);
-        }
-        if plan.insert_first {
-            self.carousel.insert(&replacement, 0);
+        // Week and day keep the offscreen page and move it. Inserting a new
+        // one paints that page, still full size, over the week the swipe just
+        // reached, and the other week's grid shows through for a frame.
+        let days = match view_mode {
+            ViewMode::Week => Some(week_dates(replacement_date).to_vec()),
+            ViewMode::Day => Some(vec![replacement_date]),
+            ViewMode::Month | ViewMode::Year => None,
+        };
+        let recycled = if let (Some(far), Some(days)) = (far.clone(), days) {
+            let events = page_events(&self.store, view_mode, replacement_date);
+            let actions = self.event_callbacks(events.clone());
+            if week_view::replace_timed_contents(&far, &days, &events, actions, hour_row_height) {
+                self.carousel.reorder(&far, plan.reorder_to);
+                true
+            } else {
+                false
+            }
         } else {
-            self.carousel.append(&replacement);
+            false
+        };
+        if !recycled {
+            let replacement = self.build_page(view_mode, replacement_date, scroll);
+            if let Some(far) = far {
+                self.carousel.remove(&far);
+            }
+            if plan.insert_first {
+                self.carousel.insert(&replacement, 0);
+            } else {
+                self.carousel.append(&replacement);
+            }
         }
         self.title_label.set_label(&title);
 
@@ -1333,10 +1540,17 @@ impl Ui {
             // rebuild recover.
             return;
         };
-        // Inserting the new previous page briefly puts it at position zero.
-        // Recenter before GTK can paint it, or the swipe shows the wrong
-        // period for a frame.
-        self.carousel.scroll_to(&current_page, false);
+        // A month or year insert leaves the new previous page at position
+        // zero, and its scroll has to wait out the insert's reveal. A week
+        // reorder has already flagged the carousel the same way, but the
+        // allocate inside that wait clamps onto the week just left (see
+        // `park_after_reorder`), so that scroll has to happen first.
+        if recycled {
+            park_after_reorder(&self.carousel, &current_page);
+        } else {
+            self.carousel.scroll_to(&current_page, false);
+        }
+        self.remember_shown();
         self.confirm_centered(generation, current_page);
     }
 
@@ -1601,16 +1815,7 @@ impl Ui {
         date: NaiveDate,
         initial_scroll: week_view::InitialScroll,
     ) -> gtk::Widget {
-        let (range_start, range_end) = match view_mode {
-            ViewMode::Year => year_bounds(date),
-            ViewMode::Month => month_grid_bounds(date),
-            ViewMode::Week => week_bounds(date),
-            ViewMode::Day => day_bounds(date),
-        };
-        let events = self
-            .store
-            .events_between(store::day_start(range_start), store::day_start(range_end))
-            .unwrap_or_default();
+        let events = page_events(&self.store, view_mode, date);
         let actions = self.event_callbacks(events.clone());
 
         let page = match view_mode {
@@ -1833,6 +2038,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         // Starts unsettled, so nothing treats the carousel as authoritative
         // before the first rebuild has centered it.
         sync: Rc::new(Cell::new(CarouselSync::default())),
+        shown: Cell::new(None),
+        pending_refresh: Cell::new(false),
         on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
         pending_steps: Cell::new(0),
@@ -2647,6 +2854,7 @@ fn connect_handlers(
         }
     ));
     ui.carousel.add_controller(pinch);
+    install_hour_grid_swipe_guard(&ui.carousel);
 }
 
 /// A `Ui` wired the way [`build`] and [`connect_handlers`] wire one, then
@@ -2694,6 +2902,8 @@ fn wire_a_ui_and_drop_it() -> std::rc::Weak<Ui> {
         config: Rc::new(RefCell::new(Config::default())),
         today: Rc::new(Cell::new(Local::now().date_naive())),
         sync: Rc::new(Cell::new(CarouselSync::default())),
+        shown: Cell::new(None),
+        pending_refresh: Cell::new(false),
         on_settled: Rc::new(RefCell::new(None)),
         zoom_dirty: Rc::new(Cell::new(false)),
         pending_steps: Cell::new(0),
@@ -2772,6 +2982,19 @@ fn schedule_launch_sync(action: impl FnOnce() + 'static) -> Rc<Cell<Option<glib:
     pending
 }
 
+/// Events that belong on the page for `date` in `mode`.
+fn page_events(store: &Store, mode: ViewMode, date: NaiveDate) -> Vec<Event> {
+    let (start, end) = match mode {
+        ViewMode::Year => year_bounds(date),
+        ViewMode::Month => month_grid_bounds(date),
+        ViewMode::Week => week_bounds(date),
+        ViewMode::Day => day_bounds(date),
+    };
+    store
+        .events_between(store::day_start(start), store::day_start(end))
+        .unwrap_or_default()
+}
+
 /// Keeps the three timed pages at one scroll offset: whichever page is being
 /// looked at drives the other two, so a swipe or a step reveals the neighbour
 /// at the same hours rather than at wherever it happened to open.
@@ -2822,6 +3045,168 @@ fn follow_page_scroll(page: &gtk::Widget, value: f64) {
         if (adjustment.value() - value).abs() > 0.5 {
             adjustment.set_value(value);
         }
+    }
+}
+
+/// Name of the wheel-ease controller, so a horizontal swipe can leave it
+/// alone while it silences the hour grid's own scroll controllers.
+const SMOOTH_SCROLL_NAME: &str = "calix-smooth-scroll";
+const GRID_SCROLL_CAPTURE: &str = "calix-grid-scroll-capture";
+const GRID_SCROLL_BUBBLE: &str = "calix-grid-scroll-bubble";
+
+/// Stops a two-finger week swipe from also scrolling — and then being
+/// swallowed by — the hour grid.
+///
+/// The grid's scrolled window listens in the capture phase. The first
+/// vertical crumb of a sideways swipe latches it, and from then on it eats
+/// the gesture, so the week stutters and the hours jump. This runs on the
+/// carousel, which is visited first, and for a gesture the carousel is
+/// taking it turns those controllers off before they see the event.
+fn install_hour_grid_swipe_guard(carousel: &adw::Carousel) {
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let locked = Rc::new(Cell::new(None));
+    let blocked = Rc::new(Cell::new(false));
+    // Bumped when a new gesture starts, so a re-enable queued by the previous
+    // one cannot land in the middle of this one.
+    let generation = Rc::new(Cell::new(0u64));
+
+    controller.connect_scroll_begin(clone!(
+        #[strong]
+        locked,
+        #[strong]
+        blocked,
+        #[strong]
+        generation,
+        move |controller| {
+            generation.set(generation.get().wrapping_add(1));
+            locked.set(None);
+            set_hour_grids_blocked(controller, &blocked, false);
+        }
+    ));
+    controller.connect_scroll(clone!(
+        #[strong]
+        locked,
+        #[strong]
+        blocked,
+        move |controller, dx, dy| {
+            if !scroll_is_touchpad(controller) {
+                return glib::Propagation::Proceed;
+            }
+            let decision = lock_touchpad_axis(locked.get(), dx, dy);
+            locked.set(decision);
+            set_hour_grids_blocked(controller, &blocked, decision == Some(true));
+            glib::Propagation::Proceed
+        }
+    ));
+    controller.connect_scroll_end(clone!(
+        #[strong]
+        locked,
+        #[strong]
+        blocked,
+        #[strong]
+        generation,
+        move |controller| {
+            locked.set(None);
+            // This fires while the stop event is still walking down the
+            // widget tree. Turning the hour grid back on here lets it swallow
+            // that stop, and the carousel never hears that the swipe ended.
+            // Wait until the event has finished, and skip it if another
+            // gesture has already begun.
+            let started = generation.get();
+            let blocked = blocked.clone();
+            let generation = generation.clone();
+            let carousel = controller.widget();
+            glib::idle_add_local_once(move || {
+                if generation.get() != started {
+                    return;
+                }
+                let Some(carousel) = carousel.and_downcast::<adw::Carousel>() else {
+                    return;
+                };
+                if !blocked.replace(false) {
+                    return;
+                }
+                let mut child = carousel.first_child();
+                while let Some(page) = child {
+                    child = page.next_sibling();
+                    let Some(scrolled) = timed_grid_of(&page) else {
+                        continue;
+                    };
+                    retune_hour_grid_scroll(&scrolled, false);
+                }
+            });
+        }
+    ));
+    carousel.add_controller(controller);
+}
+
+/// A touchpad stream, as opposed to a mouse wheel. The wheel already has its
+/// own split: vertical detents ease the hour grid, and Shift pages the week.
+fn scroll_is_touchpad(controller: &gtk::EventControllerScroll) -> bool {
+    controller.unit() != gdk::ScrollUnit::Wheel
+        && controller
+            .current_event_device()
+            .is_some_and(|device| device.source() == gdk::InputSource::Touchpad)
+}
+
+/// Turns the hour grids' own scroll controllers off or back on. The flag
+/// skips the walk when nothing changed; a swipe delivers an event per frame.
+fn set_hour_grids_blocked(
+    controller: &impl IsA<gtk::EventController>,
+    blocked_flag: &Cell<bool>,
+    blocked: bool,
+) {
+    if blocked_flag.replace(blocked) == blocked {
+        return;
+    }
+    let Some(carousel) = controller.widget().and_downcast::<adw::Carousel>() else {
+        return;
+    };
+    let mut child = carousel.first_child();
+    while let Some(page) = child {
+        child = page.next_sibling();
+        let Some(scrolled) = timed_grid_of(&page) else {
+            continue;
+        };
+        retune_hour_grid_scroll(&scrolled, blocked);
+    }
+}
+
+/// Silences one hour grid's scroll controllers, or hands them back. The
+/// wheel-ease controller is left in place: it ignores touchpad input.
+fn retune_hour_grid_scroll(scrolled: &gtk::ScrolledWindow, blocked: bool) {
+    let controllers = scrolled.observe_controllers();
+    for index in 0..controllers.n_items() {
+        let Some(controller) = controllers
+            .item(index)
+            .and_then(|item| item.downcast::<gtk::EventControllerScroll>().ok())
+        else {
+            continue;
+        };
+        let role = match controller.name().as_deref() {
+            Some(SMOOTH_SCROLL_NAME) => continue,
+            Some(GRID_SCROLL_CAPTURE) => GRID_SCROLL_CAPTURE,
+            Some(GRID_SCROLL_BUBBLE) => GRID_SCROLL_BUBBLE,
+            _ => match controller.propagation_phase() {
+                gtk::PropagationPhase::Capture => {
+                    controller.set_name(Some(GRID_SCROLL_CAPTURE));
+                    GRID_SCROLL_CAPTURE
+                }
+                gtk::PropagationPhase::Bubble => {
+                    controller.set_name(Some(GRID_SCROLL_BUBBLE));
+                    GRID_SCROLL_BUBBLE
+                }
+                _ => continue,
+            },
+        };
+        controller.set_propagation_phase(if blocked {
+            gtk::PropagationPhase::None
+        } else if role == GRID_SCROLL_CAPTURE {
+            gtk::PropagationPhase::Capture
+        } else {
+            gtk::PropagationPhase::Bubble
+        });
     }
 }
 
@@ -6431,7 +6816,11 @@ mod tests {
             recycle_plan(1),
             RecyclePlan {
                 drop_first: true,
-                insert_first: false
+                insert_first: false,
+                // The stale previous page moves to the end, still full size.
+                // A newly inserted page would be drawn over the week the swipe
+                // just reached for the frame it is still size 0.
+                reorder_to: -1
             }
         );
     }
@@ -6442,8 +6831,211 @@ mod tests {
             recycle_plan(-1),
             RecyclePlan {
                 drop_first: false,
-                insert_first: true
+                insert_first: true,
+                reorder_to: 0
             }
+        );
+    }
+
+    #[test]
+    fn a_forward_reorder_clamps_onto_the_week_just_left() {
+        // Three full-size pages, position 2, the first page moved to the end.
+        // Its stale snap is 0, so the shift of -1 clamps onto page 0.
+        assert_eq!(position_after_shift_clamp(2.0, -1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn a_backward_reorder_lands_on_the_week_just_reached() {
+        // Position 0, the last page moved to the front. The new last child's
+        // stale snap is 1 and the shift is +1, which lands on the middle page.
+        assert_eq!(position_after_shift_clamp(0.0, 1.0, 1.0), 1.0);
+    }
+
+    /// Needs a display. GTK can be initialized once per process, so run it on
+    /// its own rather than beside `gui_leaks`:
+    ///
+    /// ```sh
+    /// cargo test reordering_forward -- --ignored --test-threads=1
+    /// ```
+    #[test]
+    #[ignore]
+    fn reordering_forward_parks_on_the_landed_page_before_the_next_paint() {
+        adw::init().expect("GTK initializes");
+        let window = gtk::Window::new();
+        let carousel = adw::Carousel::new();
+        carousel.set_hexpand(true);
+        carousel.set_vexpand(true);
+        for _ in 0..3 {
+            let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            page.set_hexpand(true);
+            page.set_vexpand(true);
+            carousel.append(&page);
+        }
+        window.set_child(Some(&carousel));
+        window.set_default_size(600, 400);
+        window.present();
+
+        let context = glib::MainContext::default();
+        for _ in 0..100 {
+            if carousel.width() > 0 {
+                break;
+            }
+            let _ = context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(carousel.width() > 0, "the carousel was never given a size");
+        let landed = carousel.nth_page(2);
+        carousel.scroll_to(&landed, false);
+        for _ in 0..100 {
+            if (carousel.position() - 2.0).abs() < 1e-4 {
+                break;
+            }
+            let _ = context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            (carousel.position() - 2.0).abs() < 1e-4,
+            "the swipe lands on the last page, position was {}",
+            carousel.position()
+        );
+
+        let far = carousel.first_child().expect("the offscreen page");
+        carousel.reorder(&far, -1);
+        let middle = carousel
+            .first_child()
+            .and_then(|page| page.next_sibling())
+            .expect("the landed page is the middle child after the reorder");
+        // No main-loop turn between the reorder and this read. An idle
+        // scroll would still be pending, and the clamped page would paint.
+        park_after_reorder(&carousel, &middle);
+        assert!(
+            (carousel.position() - 1.0).abs() < 1e-4,
+            "the landed page is showing before paint, position was {}",
+            carousel.position()
+        );
+        window.close();
+    }
+
+    #[test]
+    fn a_sideways_touchpad_swipe_belongs_to_the_week_not_the_hour_grid() {
+        assert_eq!(touchpad_swipe_is_horizontal(-40.0, 2.0), Some(true));
+        assert_eq!(touchpad_swipe_is_horizontal(40.0, -2.0), Some(true));
+        // Exactly the tracker's factor: horizontal still wins.
+        assert_eq!(touchpad_swipe_is_horizontal(1.2, 1.0), Some(true));
+    }
+
+    #[test]
+    fn a_vertical_touchpad_swipe_stays_with_the_hour_grid() {
+        assert_eq!(touchpad_swipe_is_horizontal(2.0, -40.0), Some(false));
+        assert_eq!(touchpad_swipe_is_horizontal(-2.0, 40.0), Some(false));
+        // Just short of the tracker's factor, so the carousel would reject it.
+        assert_eq!(touchpad_swipe_is_horizontal(1.19, 1.0), Some(false));
+    }
+
+    #[test]
+    fn a_touchpad_stop_does_not_decide_the_axis() {
+        assert_eq!(touchpad_swipe_is_horizontal(0.0, 0.0), None);
+    }
+
+    #[test]
+    fn the_first_real_sample_locks_the_swipe_axis() {
+        assert_eq!(lock_touchpad_axis(None, -30.0, 1.0), Some(true));
+        assert_eq!(lock_touchpad_axis(None, 1.0, -30.0), Some(false));
+        // A stop before anything has moved leaves the gesture undecided.
+        assert_eq!(lock_touchpad_axis(None, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn later_samples_cannot_steal_a_week_swipe_back_to_the_hour_grid() {
+        // The vertical crumb that arrives mid-swipe is what used to latch the
+        // grid and eat the rest of the gesture.
+        assert_eq!(lock_touchpad_axis(Some(true), 1.0, -40.0), Some(true));
+        assert_eq!(lock_touchpad_axis(Some(true), 0.0, 0.0), Some(true));
+    }
+
+    #[test]
+    fn later_samples_cannot_turn_an_hour_scroll_into_a_week_swipe() {
+        assert_eq!(lock_touchpad_axis(Some(false), -40.0, 1.0), Some(false));
+    }
+
+    #[test]
+    fn a_settled_week_refreshes_in_place_when_the_period_has_not_changed() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        let shown = Some(ShownPeriod {
+            mode: ViewMode::Week,
+            date,
+        });
+        assert_eq!(
+            quiet_redraw(true, PAGES_PER_REBUILD, shown, ViewMode::Week, date),
+            QuietRedraw::Refresh
+        );
+        assert_eq!(
+            quiet_redraw(
+                true,
+                PAGES_PER_REBUILD,
+                Some(ShownPeriod {
+                    mode: ViewMode::Day,
+                    date,
+                }),
+                ViewMode::Day,
+                date,
+            ),
+            QuietRedraw::Refresh
+        );
+    }
+
+    #[test]
+    fn a_quiet_redraw_waits_while_a_swipe_is_still_landing() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        let shown = Some(ShownPeriod {
+            mode: ViewMode::Week,
+            date,
+        });
+        assert_eq!(
+            quiet_redraw(false, PAGES_PER_REBUILD, shown, ViewMode::Week, date),
+            QuietRedraw::Defer
+        );
+    }
+
+    #[test]
+    fn a_quiet_redraw_rebuilds_when_the_period_or_the_view_changed() {
+        let date = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let shown = Some(ShownPeriod {
+            mode: ViewMode::Week,
+            date,
+        });
+        assert_eq!(
+            quiet_redraw(true, PAGES_PER_REBUILD, shown, ViewMode::Week, next),
+            QuietRedraw::Rebuild
+        );
+        assert_eq!(
+            quiet_redraw(true, PAGES_PER_REBUILD, shown, ViewMode::Day, date),
+            QuietRedraw::Rebuild
+        );
+        // Month and year have no hour grid to refresh in place.
+        assert_eq!(
+            quiet_redraw(
+                true,
+                PAGES_PER_REBUILD,
+                Some(ShownPeriod {
+                    mode: ViewMode::Month,
+                    date,
+                }),
+                ViewMode::Month,
+                date,
+            ),
+            QuietRedraw::Rebuild
+        );
+        // A recycle that left the carousel short is not safe to treat as the
+        // usual three pages.
+        assert_eq!(
+            quiet_redraw(true, 2, shown, ViewMode::Week, date),
+            QuietRedraw::Rebuild
+        );
+        assert_eq!(
+            quiet_redraw(true, PAGES_PER_REBUILD, None, ViewMode::Week, date),
+            QuietRedraw::Rebuild
         );
     }
 

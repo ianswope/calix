@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- Week and day view no longer flash the period you just left when a swipe lands. Moving the offscreen page across clamped the carousel back onto that period for a frame, after the title had already changed. The position is corrected before that frame paints. A sync landing on the week or day you are looking at also no longer rebuilds that page out from under you.
 - A subscribed repeat with an excluded or moved day is kept as a series, so that day stays right past the old sync window. A repeat Calix cannot read, such as a holiday file that names months, stays its first date and the sync is marked incomplete.
 
 ## 0.9.0 — 2026-10-26

@@ -76,6 +76,9 @@ fn build_days(
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.set_hexpand(true);
     root.set_vexpand(true);
+    // Opaque, so a neighbour stacked on this page for a frame cannot show
+    // through the grid. The window behind the carousel is the same colour.
+    root.add_css_class("week-page");
     let today = Local::now().date_naive();
     let gutter_size_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
@@ -152,6 +155,75 @@ fn build_days(
 
     root.append(&scrolled);
     root.upcast()
+}
+
+/// Swaps the day header, the all-day row, and the hour grid of a timed page
+/// that is already on screen, and leaves its scroll container where it is.
+///
+/// The container is what holds the scroll offset and the controllers a
+/// sideways swipe has to be able to find. Replacing the whole page destroys
+/// it, and the carousel flash that follows is the flicker a sync used to
+/// leave on the week the user was looking at.
+pub(crate) fn replace_timed_contents(
+    page: &gtk::Widget,
+    days: &[NaiveDate],
+    events: &[Event],
+    actions: PageActions,
+    hour_row_height: i32,
+) -> bool {
+    let Some(root) = page.downcast_ref::<gtk::Box>() else {
+        return false;
+    };
+    let Some(scrolled) = page.last_child().and_downcast::<gtk::ScrolledWindow>() else {
+        return false;
+    };
+
+    let kept = scrolled.vadjustment().value();
+    let today = Local::now().date_naive();
+    let gutter_size_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    let header = day_header_row(days, today, &gutter_size_group);
+    if let Some(old) = child_with_css_class(root.upcast_ref(), "week-header-row") {
+        let previous = old.prev_sibling();
+        root.remove(&old);
+        header.insert_after(root, previous.as_ref());
+    } else {
+        root.prepend(&header);
+    }
+    let all_day = all_day_row(
+        days,
+        events,
+        actions.on_edit.clone(),
+        actions.on_move.clone(),
+        actions.events.clone(),
+        &gutter_size_group,
+    );
+    if let Some(old) = child_with_css_class(root.upcast_ref(), "all-day-row") {
+        let previous = old.prev_sibling();
+        root.remove(&old);
+        all_day.insert_after(root, previous.as_ref());
+    }
+
+    let grid = build_hour_grid(days, events, actions, hour_row_height);
+    scrolled.set_child(Some(&grid));
+    // The new grid's range is not measured yet. Give it the height it will
+    // have, or the value we just read clamps to zero and the first painted
+    // frame is midnight.
+    let upper = f64::from(24 * hour_row_height);
+    let adjustment = scrolled.vadjustment();
+    adjustment.set_upper(upper.max(adjustment.page_size()));
+    adjustment.set_value(kept.clamp(0.0, (upper - adjustment.page_size()).max(0.0)));
+    true
+}
+
+fn child_with_css_class(root: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if widget.has_css_class(class) {
+            return Some(widget);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 /// What a `changed` on the timed grid's adjustment should do about the scroll
@@ -276,7 +348,7 @@ fn day_header_row(
     today: NaiveDate,
     gutter_size_group: &gtk::SizeGroup,
 ) -> gtk::Widget {
-    row_with_days(gutter_size_group, |day_area| {
+    let row = row_with_days(gutter_size_group, |day_area| {
         for (i, day) in days.iter().enumerate() {
             let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
             col.set_hexpand(true);
@@ -297,7 +369,9 @@ fn day_header_row(
             col.append(&number);
             day_area.attach(&col, i as i32, 0, 1, 1);
         }
-    })
+    });
+    row.add_css_class("week-header-row");
+    row
 }
 
 fn all_day_row(
