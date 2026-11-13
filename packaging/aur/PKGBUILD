@@ -12,7 +12,7 @@ optdepends=('gnome-keyring: store Google, iCloud, and CalDAV credentials')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 # Release checklist: replace SKIP with the SHA-256 of the immutable tagged
 # archive before publishing this PKGBUILD to the AUR.
-sha256sums=('SKIP')
+sha256sums=('bd45fc357a2457268d720ea10b53dc84162dde7f55d98f15b16aead5cb4e1852')
 
 build() {
   cd "${pkgname}-${pkgver}"
