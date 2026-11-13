@@ -38,15 +38,15 @@
   <screenshots>
     <screenshot type="default">
       <caption>Month view</caption>
-      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/month.png</image>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.10.0/docs/screenshots/month.png</image>
     </screenshot>
     <screenshot>
       <caption>Week view</caption>
-      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/week.png</image>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.10.0/docs/screenshots/week.png</image>
     </screenshot>
     <screenshot>
       <caption>Year view</caption>
-      <image>https://raw.githubusercontent.com/ianswope/calix/v0.9.0/docs/screenshots/year.png</image>
+      <image>https://raw.githubusercontent.com/ianswope/calix/v0.10.0/docs/screenshots/year.png</image>
     </screenshot>
   </screenshots>
 
@@ -58,6 +58,24 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.10.0" date="2026-11-13">
+      <description>
+        <p>
+          Calix recolors when you switch Omarchy themes, and times follow the
+          system's 12-hour or 24-hour clock.
+        </p>
+        <p>
+          Moving a repeating event keeps its exceptions, a sync that cannot
+          read every collection no longer drops calendars, and new repeats
+          hold their time across daylight saving changes. Undo follows an
+          event that was deleted and put back.
+        </p>
+        <p>
+          Week and day view no longer flash the period you just left after a
+          swipe, and only a location you are typing is sent to look up places.
+        </p>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-10-26">
       <description>
         <p>
