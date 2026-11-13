@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-11-13
+
+Calix recolors when you switch Omarchy themes, and times follow the system's
+12-hour or 24-hour clock. Most of this release fixes CalDAV sync, repeating
+events and undo: moving a series keeps its exceptions, a sync that cannot
+read every collection no longer drops calendars, and new repeats hold their
+time across daylight saving changes.
 
 ### Added
 

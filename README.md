@@ -80,7 +80,7 @@ silently failing.
   </picture>
 </details>
 
-See [what changed in Calix 0.9.0](CHANGELOG.md).
+See [what changed in Calix 0.10.0](CHANGELOG.md).
 
 ## Install (recommended)
 

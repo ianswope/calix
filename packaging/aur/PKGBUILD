@@ -1,6 +1,6 @@
 # Maintainer: Ian Swope <ian@smallswope.com>
 pkgname=calix
-pkgver=0.9.0
+pkgver=0.10.0
 pkgrel=1
 pkgdesc="Native GTK4 calendar for Linux with Google, iCloud, and CalDAV sync"
 arch=('x86_64')
@@ -12,7 +12,7 @@ optdepends=('gnome-keyring: store Google, iCloud, and CalDAV credentials')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
 # Release checklist: replace SKIP with the SHA-256 of the immutable tagged
 # archive before publishing this PKGBUILD to the AUR.
-sha256sums=('19ce397725052feb0b36e9b33739e9d0ac893f343c86dcb198a813696716612a')
+sha256sums=('SKIP')
 
 build() {
   cd "${pkgname}-${pkgver}"
