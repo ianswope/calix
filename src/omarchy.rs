@@ -10,9 +10,12 @@
 //! understands: the legacy `@define-color` names and the modern `:root`
 //! custom properties (`--accent-bg-color`, …) that 1.6+ widgets read.
 //!
-//! This is read once at startup. Switching themes while Calix is open won't
-//! recolor the running window until it's relaunched. On a machine without
-//! Omarchy the file is simply absent and we fall back to stock Adwaita.
+//! The palette is read at startup and again whenever Omarchy switches themes.
+//! `omarchy theme set` deletes and replaces the `theme` directory, then
+//! rewrites `theme.name` beside it, so the watch sits on `current/` rather
+//! than on `colors.toml` itself — a watch on the file dies with the directory
+//! it was in. On a machine without Omarchy the file is simply absent and we
+//! fall back to stock Adwaita.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,8 +32,11 @@ pub struct ThemeOverrides {
 /// Only the keys we map. Everything is optional so a partial or unfamiliar
 /// `colors.toml` degrades gracefully instead of failing the whole read.
 ///
-/// Omarchy names the semantic hues (`red`, `green`, `yellow`); the aliases
-/// accept the indexed spelling older palettes used, so either generation reads.
+/// Omarchy names the semantic hues (`red`, `green`, `yellow`). Current
+/// palettes also ship the ANSI slots (`color1`, `color2`, `color3`) with the
+/// same values. Those are separate keys: a serde alias would treat `green` and
+/// `color2` as one field and reject the file, which is what left the window
+/// stuck on the last palette that parsed.
 #[derive(serde::Deserialize)]
 struct Palette {
     /// `"dark"` or `"light"` — the theme's own declaration of which it is,
@@ -39,12 +45,20 @@ struct Palette {
     accent: Option<String>,
     background: Option<String>,
     foreground: Option<String>,
-    #[serde(alias = "color1")]
-    red: Option<String>, // -> destructive / error
-    #[serde(alias = "color2")]
-    green: Option<String>, // -> success
-    #[serde(alias = "color3")]
+    red: Option<String>,    // -> destructive / error
+    green: Option<String>,  // -> success
     yellow: Option<String>, // -> warning
+    #[serde(rename = "color1")]
+    color1: Option<String>,
+    #[serde(rename = "color2")]
+    color2: Option<String>,
+    #[serde(rename = "color3")]
+    color3: Option<String>,
+}
+
+/// The named hue when the palette has one, otherwise the older ANSI slot.
+fn hue<'a>(named: &'a Option<String>, indexed: &'a Option<String>) -> Option<&'a str> {
+    named.as_deref().or(indexed.as_deref())
 }
 
 /// Reads the active Omarchy theme and returns libadwaita color overrides, or
@@ -113,6 +127,23 @@ fn palette_paths(state_home: &Path, config_home: &Path) -> [PathBuf; 2] {
     ]
 }
 
+/// Directories to watch for a theme switch, newest layout first.
+///
+/// `omarchy theme set` removes `current/theme` and moves the staged theme into
+/// its place, then rewrites `current/theme.name`. Both of those are children of
+/// `current/`. Watching `colors.toml` itself does not survive the replace.
+/// The GTK frontend is what watches; this stays here so the path can be tested
+/// without a display.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn theme_switch_dirs(state_home: &Path, config_home: &Path) -> [PathBuf; 2] {
+    palette_paths(state_home, config_home).map(|path| {
+        path.parent()
+            .and_then(|theme| theme.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or(path)
+    })
+}
+
 fn overrides_from_toml(contents: &str) -> Option<ThemeOverrides> {
     let palette: Palette = toml::from_str(contents)
         .inspect_err(|e| eprintln!("calix: failed to parse Omarchy palette: {e}"))
@@ -174,17 +205,17 @@ fn overrides_from_toml(contents: &str) -> Option<ThemeOverrides> {
     set!("accent_bg_color", accent);
     set!("accent_fg_color", on_color(accent));
 
-    if let Some(c) = palette.red.as_deref().and_then(parse_hex) {
+    if let Some(c) = hue(&palette.red, &palette.color1).and_then(parse_hex) {
         set!("destructive_bg_color", c);
         set!("destructive_fg_color", on_color(c));
         set!("error_bg_color", c);
         set!("error_fg_color", on_color(c));
     }
-    if let Some(c) = palette.green.as_deref().and_then(parse_hex) {
+    if let Some(c) = hue(&palette.green, &palette.color2).and_then(parse_hex) {
         set!("success_bg_color", c);
         set!("success_fg_color", on_color(c));
     }
-    if let Some(c) = palette.yellow.as_deref().and_then(parse_hex) {
+    if let Some(c) = hue(&palette.yellow, &palette.color3).and_then(parse_hex) {
         set!("warning_bg_color", c);
         set!("warning_fg_color", on_color(c));
     }
@@ -219,7 +250,9 @@ const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
 
 fn parse_hex(s: &str) -> Option<Rgb> {
     let s = s.trim().trim_start_matches('#');
-    if s.len() != 6 {
+    // Checked as hex digits, not just as six bytes: byte slicing below would
+    // split a multi-byte character, and `from_str_radix` accepts a sign.
+    if s.len() != 6 || !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     Some(Rgb {
@@ -322,6 +355,15 @@ blue = "#7fbbb3"
     }
 
     #[test]
+    fn a_color_that_is_not_six_hex_digits_is_refused_without_panicking() {
+        // Six bytes, three characters: slicing by byte would split the euro
+        // sign. This runs on every theme switch, inside the running app.
+        assert!(parse_hex("#a\u{20ac}\u{e9}").is_none());
+        assert!(parse_hex("#+f+f+f").is_none());
+        assert!(parse_hex("#1A2b3c").is_some());
+    }
+
+    #[test]
     fn the_three_load_bearing_colors_reach_the_surfaces_and_the_accent() {
         let overrides = overrides_from_toml(EVERFOREST).expect("a usable palette");
         assert_eq!(
@@ -335,6 +377,65 @@ blue = "#7fbbb3"
         assert_eq!(
             color(&overrides.css, "accent_bg_color").as_deref(),
             Some("#7fbbb3")
+        );
+    }
+
+    #[test]
+    fn a_palette_that_names_a_hue_and_its_ansi_index_still_themes() {
+        // Current Omarchy palettes ship both spellings (`green` and `color2`).
+        // Reading that as one field rejects the whole file, so the window stays
+        // on whatever colors it already had.
+        let palette = r##"
+mode = "dark"
+accent = "#b2fff3"
+background = "#05080a"
+foreground = "#fff6ff"
+green = "#baf7b5"
+color2 = "#00ff00"
+red = "#ff9fbc"
+color1 = "#ff0000"
+yellow = "#fff6c3"
+color3 = "#ffff00"
+"##;
+        let overrides = overrides_from_toml(palette).expect("a usable palette");
+        // The named hue is the one Omarchy calls the semantic color.
+        assert_eq!(
+            color(&overrides.css, "success_bg_color").as_deref(),
+            Some("#baf7b5")
+        );
+        assert_eq!(
+            color(&overrides.css, "destructive_bg_color").as_deref(),
+            Some("#ff9fbc")
+        );
+        assert_eq!(
+            color(&overrides.css, "warning_bg_color").as_deref(),
+            Some("#fff6c3")
+        );
+    }
+
+    #[test]
+    fn an_indexed_palette_still_maps_color1_through_color3() {
+        // Themes older than the named hues only have the ANSI slots.
+        let palette = r##"
+accent = "#7fbbb3"
+background = "#2d353b"
+foreground = "#d3c6aa"
+color1 = "#e67e80"
+color2 = "#a7c080"
+color3 = "#dbbc7f"
+"##;
+        let overrides = overrides_from_toml(palette).expect("a usable palette");
+        assert_eq!(
+            color(&overrides.css, "destructive_bg_color").as_deref(),
+            Some("#e67e80")
+        );
+        assert_eq!(
+            color(&overrides.css, "success_bg_color").as_deref(),
+            Some("#a7c080")
+        );
+        assert_eq!(
+            color(&overrides.css, "warning_bg_color").as_deref(),
+            Some("#dbbc7f")
         );
     }
 
@@ -463,6 +564,21 @@ padding.x = 14
             paths[1],
             PathBuf::from("/home/ian/.config/omarchy/current/theme/colors.toml")
         );
+    }
+
+    #[test]
+    fn a_theme_switch_is_watched_on_the_directory_omarchy_replaces() {
+        // `colors.toml` is deleted with the theme directory. The stable path is
+        // its grandparent, which also holds `theme.name`.
+        let dirs = theme_switch_dirs(
+            Path::new("/home/ian/.local/state"),
+            Path::new("/home/ian/.config"),
+        );
+        assert_eq!(
+            dirs[0],
+            PathBuf::from("/home/ian/.local/state/omarchy/current")
+        );
+        assert_eq!(dirs[1], PathBuf::from("/home/ian/.config/omarchy/current"));
     }
 
     #[test]

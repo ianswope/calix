@@ -1,16 +1,29 @@
 use crate::store::Event;
-use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, occurrence_payload};
+use crate::views::drag::{BlockPlacement, DragKind, TimedGrid, chip_payload};
 use crate::views::{EditFn, EventSelection};
+use chrono::NaiveDate;
 use gtk::gdk;
 use gtk::prelude::*;
 use std::rc::Rc;
 
-pub fn event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
-    event_button_with_padding(event, css_class, min_height, 2, true)
+/// A chip for `event` in the cell for `day`. An event that covers several
+/// days gets one per day, and each knows which day it stands on.
+pub fn event_button(
+    event: &Event,
+    day: NaiveDate,
+    css_class: &str,
+    min_height: i32,
+) -> gtk::Button {
+    event_button_with_padding(event, css_class, min_height, 2, Some(day))
 }
 
-pub fn compact_event_button(event: &Event, css_class: &str, min_height: i32) -> gtk::Button {
-    event_button_with_padding(event, css_class, min_height, 0, true)
+pub fn compact_event_button(
+    event: &Event,
+    day: NaiveDate,
+    css_class: &str,
+    min_height: i32,
+) -> gtk::Button {
+    event_button_with_padding(event, css_class, min_height, 0, Some(day))
 }
 
 /// A timed event block for the week/day grid. Moving and resizing are driven
@@ -28,7 +41,7 @@ pub fn timed_event_widget(
     selected: &EventSelection,
 ) -> gtk::Widget {
     let overlay = gtk::Overlay::new();
-    let button = event_button_with_padding(event, css_class, min_height, 0, false);
+    let button = event_button_with_padding(event, css_class, min_height, 0, None);
     let ev = event.clone();
     let click = on_click.clone();
     button.connect_clicked(move |btn| click(ev.clone(), btn.clone().upcast()));
@@ -85,7 +98,7 @@ fn event_button_with_padding(
     css_class: &str,
     min_height: i32,
     vertical_padding: i32,
-    draggable: bool,
+    grabbed_day: Option<NaiveDate>,
 ) -> gtk::Button {
     let color = gtk::gdk::RGBA::parse(event.calendar_color.as_str())
         .unwrap_or_else(|_| gtk::gdk::RGBA::new(0.2, 0.52, 0.89, 1.0));
@@ -149,11 +162,13 @@ fn event_button_with_padding(
     }
     // Chips (month and all-day) travel by drag-and-drop. The payload names the
     // occurrence's own day, so a series move is measured from the copy that
-    // was grabbed rather than whichever copy the page listed first.
-    if draggable {
+    // was grabbed rather than whichever copy the page listed first — and the
+    // day this chip stands on, so a later day of a long event moves it by the
+    // distance dragged.
+    if let Some(grabbed_day) = grabbed_day {
         make_draggable(
             &button,
-            occurrence_payload(DragKind::Move, event.id, event.start.date_naive()),
+            chip_payload(event.id, event.start.date_naive(), grabbed_day),
         );
     }
     button

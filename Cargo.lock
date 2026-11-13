@@ -276,6 +276,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "gtk4",
+ "iana-time-zone",
  "keyring",
  "libadwaita",
  "oauth2",

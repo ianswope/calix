@@ -447,6 +447,11 @@ pub fn last_covered_day(start: DateTime<Local>, end: DateTime<Local>) -> NaiveDa
     last
 }
 
+/// The machine's IANA time zone, when it has a name chrono-tz knows.
+pub fn local_zone() -> Option<chrono_tz::Tz> {
+    iana_time_zone::get_timezone().ok()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

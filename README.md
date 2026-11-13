@@ -24,7 +24,8 @@ Calix was written to give [Omarchy](https://omarchy.org/) the kind of calendar
 macOS ships with, rather than a web app in a window.
 
 - **It follows your theme.** Calix reads the active Omarchy theme's
-  `colors.toml` at startup and recolors libadwaita to match — accent, semantic
+  `colors.toml` at startup and again when you switch themes, and recolors
+  libadwaita to match — accent, semantic
   colors, surfaces, borders, and the theme's declared light/dark mode — with
   nothing to configure. `calix --print-theme` shows what it resolved. On
   machines without Omarchy this is a no-op.
@@ -365,7 +366,7 @@ than guessing from an empty list.
 - `src/views/event_widget.rs` — the event chip/block widgets shared by the views.
 - `src/views/drag.rs` — direct-manipulation move/resize for timed blocks in the week/day grid: a `GestureDrag` controller with a snapped live preview and edge auto-scroll, committing only on release. The column is the one under the pointer; a day page can change days, and a move dragged above the hours becomes all-day (month and all-day chips use GTK's regular drag-and-drop instead).
 - `src/window.rs` — owns the `AdwCarousel` paging between prev/current/next pages, the header bar (Today / prev / next / Month-Week-Day toggle / New Event / Calendars), sidebar account actions, and the current view-mode + date state.
-- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint), plus loading the Omarchy color overrides at startup.
+- `src/style.rs` — the app's small CSS (today badge, cell borders, the "now" line, drag preview, and the compact text sizes applied below the window-width breakpoint), plus loading the Omarchy color overrides at startup and again when the theme changes.
 - `src/omarchy.rs` — reads the active Omarchy theme's `colors.toml` (from `~/.local/state/omarchy/current/theme/`, falling back to the older `~/.config/omarchy` location) and recolors libadwaita to match (accent, semantic hues, surfaces, borders, and the theme's declared light/dark mode); a no-op on machines without Omarchy. `calix --print-theme` shows what was resolved.
 - `src/lib.rs` — splits the crate: storage, sync, recurrence, alerts and date math always compile, while the GTK frontend sits behind the default-on `gui` feature. `cargo check --no-default-features` builds the backend with no GTK in the dependency graph at all.
 - `src/xdg.rs` — XDG base directories resolved from the environment, so the backend doesn't reach for `glib::user_*_dir()`.

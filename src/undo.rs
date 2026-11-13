@@ -33,6 +33,10 @@ pub struct Change {
     /// that comes back comes back with a new id, so this is updated as undo
     /// and redo move it; see [`History::commit_undo`].
     pub id: Option<i64>,
+    /// The id the row had the last time it existed, while it doesn't. This is
+    /// how a row that comes back is recognised as the one older changes were
+    /// made to.
+    pub formerly: Option<i64>,
     /// What the row held before the change; `None` when it didn't exist yet.
     pub before: Option<EventDraft>,
     /// What it held afterwards; `None` when the change deleted it.
@@ -48,6 +52,7 @@ impl Change {
         Self {
             calendar_id,
             id: Some(id),
+            formerly: None,
             before: None,
             after: Some(draft),
             overrides: Vec::new(),
@@ -59,6 +64,7 @@ impl Change {
         Self {
             calendar_id,
             id: Some(id),
+            formerly: None,
             before: Some(before),
             after: Some(after),
             overrides: Vec::new(),
@@ -70,10 +76,19 @@ impl Change {
         Self {
             calendar_id,
             id: None,
+            formerly: None,
             before: Some(draft),
             after: None,
             overrides: Vec::new(),
         }
+    }
+
+    /// Names the row a deleted event used to be. Older changes to that event
+    /// still point at it, and have to follow the event when it comes back
+    /// under a new id.
+    pub fn formerly(mut self, id: i64) -> Self {
+        self.formerly = Some(id);
+        self
     }
 
     /// The exception rows to put back with a deleted local series.
@@ -646,6 +661,9 @@ fn json_text(value: Option<&serde_json::Value>) -> String {
 pub struct History {
     done: Vec<Record>,
     undone: Vec<Record>,
+    /// While a step is in flight, how many changes have been recorded since
+    /// it began; see [`Self::hold`].
+    since_hold: Option<usize>,
 }
 
 impl History {
@@ -661,11 +679,53 @@ impl History {
     }
 
     fn push(&mut self, record: Record) {
+        if let Some(newer) = &mut self.since_hold {
+            *newer += 1;
+        }
         self.done.push(record);
         if self.done.len() > DEPTH {
             self.done.remove(0);
         }
         self.undone.clear();
+    }
+
+    /// Marks the start of an undo or redo. A step on a synced event waits on
+    /// the provider, and the user can make another change meanwhile; the
+    /// commit has to finish the step that was started, not whatever is on top
+    /// of the stack by then.
+    pub fn hold(&mut self) {
+        self.since_hold = Some(0);
+    }
+
+    /// Gives `record` the id its row has now, and has every other change to
+    /// the same event follow it there. A row that is deleted and put back
+    /// returns under a new id; without this the older changes would be left
+    /// pointing at a row that no longer exists, and could never be undone.
+    fn follow(&mut self, record: &mut Record, id: Option<i64>) {
+        let Record::Event(change) = record else {
+            return;
+        };
+        let old = change.id.or(change.formerly);
+        change.id = id;
+        if id.is_none() {
+            change.formerly = old;
+        }
+        let (Some(old), Some(new)) = (old, id) else {
+            return;
+        };
+        if old == new {
+            return;
+        }
+        for other in self.done.iter_mut().chain(self.undone.iter_mut()) {
+            if let Record::Event(other) = other {
+                if other.id == Some(old) {
+                    other.id = Some(new);
+                }
+                if other.formerly == Some(old) {
+                    other.formerly = Some(new);
+                }
+            }
+        }
     }
 
     /// The change an undo would reverse, without taking it off the stack.
@@ -683,20 +743,27 @@ impl History {
     /// a deleted row has none. A series keeps its provider identity, so `id`
     /// is ignored for one.
     pub fn commit_undo(&mut self, id: Option<i64>) {
-        if let Some(mut record) = self.done.pop() {
-            if let Record::Event(change) = &mut record {
-                change.id = id;
-            }
+        // Changes recorded since the step began sit on top of the one that
+        // was undone. They also opened a new branch of history, so the undone
+        // change is spent rather than redoable.
+        let newer = self.since_hold.take().unwrap_or(0);
+        let Some(index) = self.done.len().checked_sub(newer + 1) else {
+            return;
+        };
+        let mut record = self.done.remove(index);
+        self.follow(&mut record, id);
+        if newer == 0 {
             self.undone.push(record);
         }
     }
 
     /// Moves the top redo back to the undo side after its write went through.
+    /// A change recorded since the step began has already emptied the redo
+    /// side, and then there is nothing left to move.
     pub fn commit_redo(&mut self, id: Option<i64>) {
+        self.since_hold = None;
         if let Some(mut record) = self.undone.pop() {
-            if let Record::Event(change) = &mut record {
-                change.id = id;
-            }
+            self.follow(&mut record, id);
             self.done.push(record);
         }
     }
@@ -778,6 +845,75 @@ mod tests {
             .id
             .and_then(|id| store.event_by_id(id).expect("the query to run"))
             .map(|event| event.draft())
+    }
+
+    #[test]
+    fn an_event_that_comes_back_takes_its_older_changes_with_it() {
+        // Created as row 1, renamed, deleted — then the delete is undone and
+        // the event comes back as row 3. The rename still has to be undoable.
+        let mut history = History::default();
+        history.record(Change::created(1, 1, draft("Dentist", 15)));
+        history.record(Change::edited(
+            1,
+            1,
+            draft("Dentist", 15),
+            draft("Orthodontist", 15),
+        ));
+        history.record(Change::deleted(1, draft("Orthodontist", 15)).formerly(1));
+
+        history.hold();
+        history.commit_undo(Some(3));
+
+        let rename = history.peek_undo().and_then(Record::as_event).unwrap();
+        assert_eq!(rename.id, Some(3));
+        history.hold();
+        history.commit_undo(Some(3));
+        let creation = history.peek_undo().and_then(Record::as_event).unwrap();
+        assert_eq!(creation.id, Some(3));
+    }
+
+    #[test]
+    fn a_change_made_while_an_undo_is_in_flight_is_not_the_one_it_commits() {
+        let mut history = History::default();
+        history.record(Change::edited(
+            1,
+            1,
+            draft("Dentist", 15),
+            draft("Dentist", 16),
+        ));
+        history.hold();
+        // The provider is still answering; the user drags something else.
+        let newer = Change::edited(1, 2, draft("Lunch", 12), draft("Lunch", 13));
+        history.record(newer.clone());
+
+        history.commit_undo(Some(1));
+
+        assert_eq!(history.peek_undo().and_then(Record::as_event), Some(&newer));
+        // The newer change opened a new branch, so there is nothing to redo.
+        assert!(history.peek_redo().is_none());
+        history.discard_undo();
+        assert!(history.peek_undo().is_none(), "the undone change is spent");
+    }
+
+    #[test]
+    fn a_change_made_while_a_redo_is_in_flight_stays_where_it_was_put() {
+        let mut history = History::default();
+        history.record(Change::edited(
+            1,
+            1,
+            draft("Dentist", 15),
+            draft("Dentist", 16),
+        ));
+        history.hold();
+        history.commit_undo(Some(1));
+        history.hold();
+        let newer = Change::edited(1, 2, draft("Lunch", 12), draft("Lunch", 13));
+        history.record(newer.clone());
+
+        history.commit_redo(Some(1));
+
+        assert_eq!(history.peek_undo().and_then(Record::as_event), Some(&newer));
+        assert!(history.peek_redo().is_none());
     }
 
     #[test]

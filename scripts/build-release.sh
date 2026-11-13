@@ -74,6 +74,8 @@ rm -f "$PREFIX/bin/calix"
 rm -f "$PREFIX/share/applications/$APP_ID.desktop"
 rm -f "$PREFIX/share/icons/hicolor/scalable/apps/$APP_ID.svg"
 rm -f "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
+# The login entry Calix writes when background alerts are on.
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop"
 rm -f "$PREFIX/share/doc/calix/README.md"
 rm -f "$PREFIX/share/doc/calix/CHANGELOG.md"
 rm -f "$PREFIX/share/doc/calix/LICENSE"

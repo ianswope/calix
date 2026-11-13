@@ -9,6 +9,9 @@ rm -f "$BIN_DIR/calix"
 rm -f "$DATA_DIR/applications/$APP_ID.desktop"
 rm -f "$DATA_DIR/icons/hicolor/scalable/apps/$APP_ID.svg"
 rm -f "$DATA_DIR/metainfo/$APP_ID.metainfo.xml"
+# The login entry Calix writes when background alerts are on. Left behind, it
+# would run a binary that is no longer there at every login.
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP_ID.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$DATA_DIR/applications" >/dev/null 2>&1 || true

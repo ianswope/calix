@@ -173,10 +173,12 @@ pub fn handle_cli(args: &[String]) -> Option<i32> {
     let store = match Store::open_read_only() {
         Ok(store) => store,
         Err(error) => {
-            return Some(fail(
-                "not-set-up",
-                &format!("no calendar to read yet ({error})"),
-            ));
+            let code = open_failure_code(Store::database_exists());
+            let message = match code {
+                "not-set-up" => format!("no calendar to read yet ({error})"),
+                _ => format!("could not open the calendar ({error})"),
+            };
+            return Some(fail(code, &message));
         }
     };
     let json = match request {
@@ -192,6 +194,18 @@ pub fn handle_cli(args: &[String]) -> Option<i32> {
             "query-failed",
             &format!("could not read the calendar ({error})"),
         )),
+    }
+}
+
+/// What to call a store that would not open. Only a database that isn't
+/// there means Calix has not been set up; one that is locked, damaged or
+/// unreadable is a failure, and a widget told "not set up" would send its
+/// user off to connect a calendar they already have.
+fn open_failure_code(database_exists: bool) -> &'static str {
+    if database_exists {
+        "query-failed"
+    } else {
+        "not-set-up"
     }
 }
 
@@ -341,6 +355,12 @@ mod tests {
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).expect("a real date")
+    }
+
+    #[test]
+    fn only_a_missing_database_is_reported_as_not_set_up() {
+        assert_eq!(open_failure_code(false), "not-set-up");
+        assert_eq!(open_failure_code(true), "query-failed");
     }
 
     #[test]

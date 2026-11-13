@@ -2,7 +2,8 @@ use crate::date_util::{first_weekday, month_grid, weekdays_from};
 use crate::locale;
 use crate::store::Event;
 use crate::views::{
-    MoveFn, PageActions, Slot, SlotGrain, add_slot_menu, drag::parse_drag_payload,
+    MoveFn, PageActions, Slot, SlotGrain, add_slot_menu,
+    drag::{drop_start_day, parse_drag_payload},
     event_occurs_on_day, event_widget,
 };
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
@@ -102,7 +103,7 @@ fn day_cell(
 
     let shown = day_events.len().min(MAX_CHIPS_PER_CELL);
     for event in &day_events[..shown] {
-        let chip = event_widget::event_button(event, "event-chip", 20);
+        let chip = event_widget::event_button(event, date, "event-chip", 20);
         let ev = event.clone();
         let on_edit = on_edit.clone();
         chip.connect_clicked(move |btn| on_edit(ev.clone(), btn.clone().upcast()));
@@ -178,10 +179,11 @@ fn add_drop_target(widget: &impl IsA<gtk::Widget>, date: NaiveDate, on_move: Mov
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Some((kind, event_id, source_day)) = parse_drag_payload(&event_id) else {
+        let Some((kind, event_id, source_day, grab_offset)) = parse_drag_payload(&event_id) else {
             return false;
         };
-        on_move(kind, event_id, date, None, source_day);
+        let start_day = drop_start_day(date, grab_offset, false);
+        on_move(kind, event_id, start_day, None, source_day);
         true
     });
     widget.add_controller(drop);

@@ -91,18 +91,61 @@ fn normalize_partstat(partstat: &str) -> Option<String> {
 }
 
 pub fn discover_calendars(credentials: &Credentials) -> Result<Vec<RemoteCalendar>, String> {
+    discover(credentials).map(|(calendars, _)| calendars)
+}
+
+/// The account's calendars, and the hrefs of any collections that could not
+/// be read on the way.
+fn discover(credentials: &Credentials) -> Result<(Vec<RemoteCalendar>, Vec<String>), String> {
     let principal = current_user_principal(credentials)?;
     let home = calendar_home_set(
         credentials,
         &absolute_url(&credentials.base_url, &principal)?,
     )?;
     let mut visited = HashSet::new();
-    calendar_list(
+    let mut skipped = Vec::new();
+    let calendars = calendar_list_walk(
         credentials,
         &absolute_url(&credentials.base_url, &home)?,
         0,
         &mut visited,
-    )
+        &mut skipped,
+    )?;
+    Ok((calendars, skipped))
+}
+
+/// The cached calendars a sync may keep, or `None` when the discovery says
+/// nothing about what is gone.
+///
+/// A collection that could not be read (`skipped`) leaves the cached calendars
+/// beneath it standing: they are missing from `found` because nobody looked,
+/// not because they were deleted. And a discovery that found no calendar at
+/// all is treated as no answer, since pruning against it empties the account.
+fn calendars_to_keep(
+    found: &[String],
+    cached: &[String],
+    skipped: &[String],
+) -> Option<Vec<String>> {
+    if found.is_empty() {
+        return None;
+    }
+    let mut keep = found.to_vec();
+    for href in cached {
+        let unseen = skipped
+            .iter()
+            .any(|collection| href_path(href).starts_with(href_path(collection)));
+        if unseen && !keep.contains(href) {
+            keep.push(href.clone());
+        }
+    }
+    Some(keep)
+}
+
+/// The path of an href, which servers send either bare or as a full URL.
+fn href_path(href: &str) -> &str {
+    href.split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|slash| &rest[slash..]))
+        .unwrap_or(href)
 }
 
 /// Discovers a CalDAV account's calendars, syncs each one's events into the
@@ -116,16 +159,25 @@ pub fn sync_account(
     account_id: i64,
 ) -> Result<SyncOutcome, String> {
     let before = store.sync_revision();
-    let calendars = discover_calendars(credentials)?;
+    let (calendars, skipped) = discover(credentials)?;
     let time_min = Local::now() - Duration::days(SYNC_PAST_DAYS);
     let time_max = Local::now() + Duration::days(SYNC_FUTURE_DAYS);
-    let calendar_ids = calendars
+    let found = calendars
         .iter()
         .map(|calendar| calendar.href.clone())
         .collect::<Vec<_>>();
-    store
-        .sync_batch(|| store.prune_caldav_calendars(account_id, &calendar_ids))
-        .map_err(|e| e.to_string())?;
+    let cached = store
+        .calendars_for_account(account_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter_map(|calendar| calendar.icloud_calendar_id)
+        .collect::<Vec<_>>();
+    match calendars_to_keep(&found, &cached, &skipped) {
+        Some(keep) => store
+            .sync_batch(|| store.prune_caldav_calendars(account_id, &keep))
+            .map_err(|e| e.to_string())?,
+        None => eprintln!("calix: the server listed no calendars — keeping the cached ones"),
+    }
 
     let mut outcome = SyncOutcome::default();
     for calendar in &calendars {
@@ -603,11 +655,25 @@ fn calendar_home_set(credentials: &Credentials, principal_url: &str) -> Result<S
         .ok_or_else(|| "The server did not return a calendar home URL".to_string())
 }
 
+#[cfg(test)]
 fn calendar_list(
     credentials: &Credentials,
     collection_url: &str,
     depth: usize,
     visited: &mut HashSet<String>,
+) -> Result<Vec<RemoteCalendar>, String> {
+    calendar_list_walk(credentials, collection_url, depth, visited, &mut Vec::new())
+}
+
+/// Lists the calendars under `collection_url`. A nested collection that could
+/// not be read is left out and its href added to `skipped`, so the caller
+/// knows the list says nothing about what lives beneath it.
+fn calendar_list_walk(
+    credentials: &Credentials,
+    collection_url: &str,
+    depth: usize,
+    visited: &mut HashSet<String>,
+    skipped: &mut Vec<String>,
 ) -> Result<Vec<RemoteCalendar>, String> {
     if depth > 3 || !visited.insert(collection_url.to_string()) {
         return Ok(Vec::new());
@@ -660,10 +726,11 @@ fn calendar_list(
     let mut nested_error = None;
     for href in child_collections {
         let child_url = absolute_url(&credentials.base_url, &href)?;
-        match calendar_list(credentials, &child_url, depth + 1, visited) {
+        match calendar_list_walk(credentials, &child_url, depth + 1, visited, skipped) {
             Ok(found) => calendars.extend(found),
             Err(error) => {
                 eprintln!("calix: skipping CalDAV collection {child_url}: {error}");
+                skipped.push(href);
                 nested_error = Some(error);
             }
         }
@@ -717,6 +784,14 @@ pub fn canonical_base_url(input: &str) -> Result<String, String> {
     let url = url::Url::parse(input.trim()).map_err(|e| format!("Invalid server URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("The server URL must start with http:// or https://.".to_string());
+    }
+    // The URL is stored and shown as it is; only the password field goes to
+    // the keyring.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "Leave the username and password out of the server URL — enter them in their own fields."
+                .to_string(),
+        );
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
@@ -1203,22 +1278,31 @@ fn parse_ics_duration(value: &str) -> Option<IcsDuration> {
         return None;
     }
 
+    // A feed is public input, and chrono's arithmetic panics out of range.
+    // Nothing on a calendar runs for a century, so anything longer is treated
+    // as unreadable rather than added to a date.
+    const MAX_DAYS: i64 = 36_600;
     let mut days = 0i64;
     for (count, unit) in measures(date_part)? {
-        match unit {
-            'W' => days += count * 7,
-            'D' => days += count,
+        let counted = match unit {
+            'W' => count.checked_mul(7)?,
+            'D' => count,
             _ => return None,
-        }
+        };
+        days = days.checked_add(counted)?;
     }
     let mut seconds = 0i64;
     for (count, unit) in measures(time_part.unwrap_or_default())? {
-        match unit {
-            'H' => seconds += count * 3600,
-            'M' => seconds += count * 60,
-            'S' => seconds += count,
+        let counted = match unit {
+            'H' => count.checked_mul(3600)?,
+            'M' => count.checked_mul(60)?,
+            'S' => count,
             _ => return None,
-        }
+        };
+        seconds = seconds.checked_add(counted)?;
+    }
+    if days > MAX_DAYS || seconds > MAX_DAYS * 86_400 {
+        return None;
     }
 
     Some(IcsDuration {
@@ -1420,7 +1504,6 @@ fn replace_recurrence_instance(
     recurrence_id: &str,
     draft: &EventDraft,
 ) -> Result<String, String> {
-    let (_, recurrence_value) = split_recurrence_id(recurrence_id);
     let lines = unfold_ics(ics);
     let uid = lines
         .iter()
@@ -1435,6 +1518,8 @@ fn replace_recurrence_instance(
     let mut result = Vec::new();
     let mut component = Vec::new();
     let mut in_event = false;
+    let mut master: Option<Vec<String>> = None;
+    let mut replaced: Option<Vec<String>> = None;
     for line in lines {
         if is_component_boundary(&line, "BEGIN", "VEVENT") {
             in_event = true;
@@ -1446,29 +1531,140 @@ fn replace_recurrence_instance(
             result.push(line.clone());
         }
         if is_component_boundary(&line, "END", "VEVENT") {
-            let is_replaced_instance = component.iter().any(|component_line| {
-                property_name(component_line)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
-                    && component_line
-                        .split_once(':')
-                        .is_some_and(|(_, value)| value == recurrence_value)
-            });
-            if !is_replaced_instance {
-                result.append(&mut component);
+            match recurrence_id_line(&component) {
+                Some(line) if same_occurrence(line, recurrence_id) => {
+                    replaced = Some(std::mem::take(&mut component));
+                }
+                Some(_) => result.append(&mut component),
+                None => {
+                    master.get_or_insert_with(|| component.clone());
+                    result.append(&mut component);
+                }
             }
             in_event = false;
         }
     }
 
+    // An override stands alone: it inherits nothing from the series, so the
+    // guests, alarms and everything else Calix has no field for have to be
+    // carried into it — from the override being replaced when there is one,
+    // from the series otherwise.
+    let exception = match replaced.or(master) {
+        Some(base) => override_from(&base, recurrence_id, draft),
+        None => recurrence_exception_lines(&uid, recurrence_id, draft),
+    };
     let insert_at = result
         .iter()
         .position(|line| is_component_boundary(line, "END", "VCALENDAR"))
         .ok_or_else(|| "Event is missing VCALENDAR closing data".to_string())?;
-    result.splice(
-        insert_at..insert_at,
-        recurrence_exception_lines(&uid, recurrence_id, draft),
-    );
+    result.splice(insert_at..insert_at, exception);
     Ok(result.join("\r\n") + "\r\n")
+}
+
+/// The `RECURRENCE-ID` line of a `VEVENT`, if it is an override.
+fn recurrence_id_line(component: &[String]) -> Option<&String> {
+    component.iter().find(|line| {
+        property_name(line).is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
+    })
+}
+
+/// Whether a `RECURRENCE-ID` line names the occurrence `recurrence_id` does.
+///
+/// The same occurrence is written as a UTC instant by a server's expansion and
+/// as a wall-clock time in the series' zone by the client that stored it, so
+/// the two are compared as instants whenever both can be read as one. Bare
+/// dates and floating times have no instant and match only as written.
+fn same_occurrence(line: &str, recurrence_id: &str) -> bool {
+    let Some((head, value)) = split_content_line(line) else {
+        return false;
+    };
+    let (wanted_tzid, wanted) = split_recurrence_id(recurrence_id);
+    if value == wanted {
+        return true;
+    }
+    let tzid = head.split(';').skip(1).find_map(|parameter| {
+        let (name, zone) = parameter.split_once('=')?;
+        name.eq_ignore_ascii_case("TZID").then_some(zone)
+    });
+    match (
+        recurrence_instant(tzid, value),
+        recurrence_instant(wanted_tzid, wanted),
+    ) {
+        (Some(this), Some(wanted)) => this == wanted,
+        _ => false,
+    }
+}
+
+fn recurrence_instant(tzid: Option<&str>, value: &str) -> Option<DateTime<chrono::Utc>> {
+    const STAMP: &str = "%Y%m%dT%H%M%S";
+    if let Some(stamp) = value.strip_suffix('Z') {
+        return NaiveDateTime::parse_from_str(stamp, STAMP)
+            .ok()
+            .map(|naive| naive.and_utc());
+    }
+    let zone = tzid?.trim_matches('"').parse::<Tz>().ok()?;
+    let naive = NaiveDateTime::parse_from_str(value, STAMP).ok()?;
+    Some(crate::date_util::resolve_forward(&zone, naive).with_timezone(&chrono::Utc))
+}
+
+/// An override `VEVENT` for one occurrence, built from `base` (the series
+/// master, or the override it replaces) with the draft's fields written over
+/// it. What makes `base` a series — its rule and exclusions — is left out.
+fn override_from(base: &[String], recurrence_id: &str, draft: &EventDraft) -> Vec<String> {
+    let (start_key, start_value, end_key, end_value) = event_time_fields(draft);
+    let recurrence_line = recurrence_id_line(base)
+        .cloned()
+        .unwrap_or_else(|| recurrence_property_line("RECURRENCE-ID", recurrence_id));
+    let mut lines = vec![
+        "BEGIN:VEVENT".to_string(),
+        recurrence_line,
+        format!("DTSTAMP:{}", caldav_timestamp(Local::now())),
+        format!("SUMMARY:{}", escape_ics_text(&draft.title)),
+        format!("{start_key}:{start_value}"),
+        format!("{end_key}:{end_value}"),
+    ];
+    if let Some(location) = &draft.location {
+        lines.push(format!("LOCATION:{}", escape_ics_text(location)));
+    }
+    if let Some(notes) = &draft.notes {
+        lines.push(format!("DESCRIPTION:{}", escape_ics_text(notes)));
+    }
+    // Nested components (an alarm) carry their own DESCRIPTION and the like;
+    // only the VEVENT's own properties are replaced.
+    let mut nested_depth = 0usize;
+    for line in base.iter().skip(1) {
+        if is_component_boundary(line, "END", "VEVENT") {
+            lines.push(line.clone());
+            continue;
+        }
+        if is_component_keyword(line, "BEGIN") {
+            nested_depth += 1;
+        } else if is_component_keyword(line, "END") {
+            nested_depth = nested_depth.saturating_sub(1);
+        } else if nested_depth == 0
+            && property_name(line).is_some_and(|name| {
+                matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "DTSTAMP"
+                        | "SUMMARY"
+                        | "DTSTART"
+                        | "DTEND"
+                        | "DURATION"
+                        | "LOCATION"
+                        | "DESCRIPTION"
+                        | "RECURRENCE-ID"
+                        | "RRULE"
+                        | "EXRULE"
+                        | "EXDATE"
+                        | "RDATE"
+                )
+            })
+        {
+            continue;
+        }
+        lines.push(line.clone());
+    }
+    lines
 }
 
 /// Edits every occurrence of a series (an "all events" edit made from one
@@ -1515,9 +1711,10 @@ fn edit_master_series(ics: &str, shift: SeriesShift, draft: &EventDraft) -> Resu
 }
 
 /// Rewrites the master `VEVENT`'s lines for an "all events" edit: refreshes the
-/// summary/location/notes right after `BEGIN:VEVENT`, shifts `DTSTART`/`DTEND`
-/// by `shift` in place (keeping their form), and leaves the `RRULE`, any
-/// nested `VALARM`, and other properties untouched.
+/// summary/location/notes right after `BEGIN:VEVENT`, shifts `DTSTART`/`DTEND`,
+/// the `EXDATE`s and the rule's `UNTIL` by `shift` in place (keeping their
+/// form), and leaves the rest of the `RRULE`, any nested `VALARM`, and other
+/// properties untouched.
 fn rewrite_master_vevent(
     component: &[String],
     shift: SeriesShift,
@@ -1572,6 +1769,39 @@ fn rewrite_master_vevent(
                 out.push(format!("{key}:{}", shift_ics_value(value, shift)));
                 continue;
             }
+            // The dates a rule excludes, and the date it ends on, are named
+            // by the occurrences' own start times. They move with the series
+            // or they stop meaning anything: an exclusion left behind matches
+            // no occurrence, and the deleted date is back.
+            if (name == "EXDATE" || name == "RDATE")
+                && !shift.is_zero()
+                && let Some((key, value)) = split_content_line(line)
+            {
+                let shifted = value
+                    .split(',')
+                    .map(|value| shift_ics_value(value, shift))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push(format!("{key}:{shifted}"));
+                continue;
+            }
+            if name == "RRULE"
+                && !shift.is_zero()
+                && let Some((key, value)) = split_content_line(line)
+            {
+                let shifted = value
+                    .split(';')
+                    .map(|part| match part.split_once('=') {
+                        Some((part_name, until)) if part_name.eq_ignore_ascii_case("UNTIL") => {
+                            format!("{part_name}={}", shift_ics_value(until, shift))
+                        }
+                        _ => part.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                out.push(format!("{key}:{shifted}"));
+                continue;
+            }
         }
         out.push(line.clone());
     }
@@ -1608,7 +1838,6 @@ fn shift_ics_value(value: &str, shift: SeriesShift) -> String {
 /// `recurrence_id` to the master `VEVENT` and drops any override `VEVENT` that
 /// redefined that same instance, so the occurrence disappears entirely.
 fn exclude_recurrence_instance(ics: &str, recurrence_id: &str) -> Result<String, String> {
-    let (_, recurrence_value) = split_recurrence_id(recurrence_id);
     let lines = unfold_ics(ics);
 
     let mut result = Vec::new();
@@ -1627,20 +1856,16 @@ fn exclude_recurrence_instance(ics: &str, recurrence_id: &str) -> Result<String,
         }
         if is_component_boundary(&line, "END", "VEVENT") {
             in_event = false;
-            let this_recurrence_id = component.iter().find_map(|component_line| {
-                property_name(component_line)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("RECURRENCE-ID"))
-                    .then(|| component_line.split_once(':').map(|(_, value)| value))
-                    .flatten()
-            });
-            match this_recurrence_id {
+            let overridden =
+                recurrence_id_line(&component).map(|line| same_occurrence(line, recurrence_id));
+            match overridden {
                 // An override that redefined the cancelled instance — drop it.
-                Some(value) if value == recurrence_value => {
+                Some(true) => {
                     excluded = true;
                     component.clear();
                 }
                 // An override for some other instance — leave it untouched.
-                Some(_) => result.append(&mut component),
+                Some(false) => result.append(&mut component),
                 // The series master — record the exclusion on it.
                 None => {
                     excluded = true;
@@ -1712,18 +1937,35 @@ fn event_time_fields(draft: &EventDraft) -> (&'static str, String, &'static str,
 }
 
 fn new_event_ics(uid: &str, draft: &EventDraft) -> String {
+    new_event_ics_in(uid, draft, crate::date_util::local_zone())
+}
+
+/// A repeating timed event is anchored to `zone`'s wall clock: a rule hung on
+/// a UTC instant repeats at that instant, which is an hour off for half the
+/// year and can put `BYDAY` on the neighbouring weekday. A one-off has no rule
+/// to drift, and with no zone name a correct instant is the best there is.
+fn new_event_ics_in(uid: &str, draft: &EventDraft, zone: Option<Tz>) -> String {
     let (start_key, start_value, end_key, end_value) = if draft.all_day {
         (
-            "DTSTART;VALUE=DATE",
+            "DTSTART;VALUE=DATE".to_string(),
             draft.start.format("%Y%m%d").to_string(),
-            "DTEND;VALUE=DATE",
+            "DTEND;VALUE=DATE".to_string(),
             draft.end.format("%Y%m%d").to_string(),
+        )
+    } else if let Some(zone) = zone.filter(|_| draft.recurrence.is_some()) {
+        let wall =
+            |at: DateTime<Local>| at.with_timezone(&zone).format("%Y%m%dT%H%M%S").to_string();
+        (
+            format!("DTSTART;TZID={}", zone.name()),
+            wall(draft.start),
+            format!("DTEND;TZID={}", zone.name()),
+            wall(draft.end),
         )
     } else {
         (
-            "DTSTART",
+            "DTSTART".to_string(),
             caldav_timestamp(draft.start),
-            "DTEND",
+            "DTEND".to_string(),
             caldav_timestamp(draft.end),
         )
     };
@@ -1969,6 +2211,14 @@ ATTENDEE;CN=\"Smith: Jo; Work\";PARTSTAT=ACCEPTED:mailto:jo@example.com\r\nEND:V
             canonical_base_url(" https://host.example.com/dav/ ").as_deref(),
             Ok("https://host.example.com/dav")
         );
+    }
+
+    #[test]
+    fn a_server_url_carrying_a_password_is_refused() {
+        // It would be stored in the accounts table, used in the keyring entry
+        // name and printed in errors — everywhere but the keyring's secret.
+        assert!(canonical_base_url("https://me:secret@host.example.com/dav").is_err());
+        assert!(canonical_base_url("https://me@host.example.com/dav").is_err());
     }
 
     #[test]
@@ -2322,6 +2572,163 @@ ATTENDEE;CN=\"Smith: Jo; Work\";PARTSTAT=ACCEPTED:mailto:jo@example.com\r\nEND:V
             error.contains("501"),
             "the server status has to stay visible: {error}"
         );
+    }
+
+    #[test]
+    fn a_new_repeating_timed_event_is_anchored_in_its_zone_not_in_utc() {
+        // 9:00 in New York in July is 13:00Z. Written as a UTC instant the
+        // series would repeat at 13:00Z forever — 8:00 once the clocks go back.
+        let start = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 6, 13, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Local);
+        let mut draft = timed_draft(start, start + chrono::Duration::minutes(30));
+        draft.recurrence = Some(crate::recurrence::Frequency::Weekly);
+
+        let ics = new_event_ics_in("uid-1", &draft, Some(chrono_tz::America::New_York));
+
+        assert!(
+            ics.contains("DTSTART;TZID=America/New_York:20260706T090000\r\n"),
+            "{ics}"
+        );
+        assert!(
+            ics.contains("DTEND;TZID=America/New_York:20260706T093000\r\n"),
+            "{ics}"
+        );
+    }
+
+    #[test]
+    fn a_new_one_off_or_zoneless_event_is_still_written_as_a_utc_instant() {
+        let start = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 6, 13, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Local);
+        let mut draft = timed_draft(start, start + chrono::Duration::minutes(30));
+
+        let one_off = new_event_ics_in("uid-1", &draft, Some(chrono_tz::America::New_York));
+        assert!(
+            one_off.contains("DTSTART:20260706T130000Z\r\n"),
+            "{one_off}"
+        );
+
+        // No zone name to be had: a correct instant beats no event at all.
+        draft.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let zoneless = new_event_ics_in("uid-1", &draft, None);
+        assert!(
+            zoneless.contains("DTSTART:20260706T130000Z\r\n"),
+            "{zoneless}"
+        );
+    }
+
+    fn timed_draft(start: DateTime<Local>, end: DateTime<Local>) -> EventDraft {
+        EventDraft {
+            title: "Standup".to_string(),
+            start,
+            end,
+            all_day: false,
+            location: None,
+            notes: None,
+            recurrence: None,
+            reminder_minutes: None,
+            additional_reminders: Vec::new(),
+            attendees: Vec::new(),
+            instance_of: None,
+            original_start: None,
+            cancelled: false,
+        }
+    }
+
+    fn hrefs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|href| href.to_string()).collect()
+    }
+
+    #[test]
+    fn a_complete_discovery_keeps_only_what_the_server_listed() {
+        let keep = calendars_to_keep(
+            &hrefs(&["/dav/me/personal/"]),
+            &hrefs(&["/dav/me/personal/", "/dav/me/deleted/"]),
+            &[],
+        );
+
+        assert_eq!(keep, Some(hrefs(&["/dav/me/personal/"])));
+    }
+
+    #[test]
+    fn a_collection_that_failed_keeps_the_cached_calendars_beneath_it() {
+        // One nested collection timed out. Its calendars are not in `found`,
+        // but nothing says they are gone, so they and their events stay.
+        let keep = calendars_to_keep(
+            &hrefs(&["/dav/me/personal/"]),
+            &hrefs(&[
+                "/dav/me/personal/",
+                "/dav/me/shared/team/",
+                "/dav/me/deleted/",
+            ]),
+            &hrefs(&["https://dav.example.com/dav/me/shared/"]),
+        );
+
+        assert_eq!(
+            keep,
+            Some(hrefs(&["/dav/me/personal/", "/dav/me/shared/team/"]))
+        );
+    }
+
+    #[test]
+    fn a_discovery_that_found_no_calendars_prunes_nothing() {
+        // A 2xx body with no calendars in it is far likelier to be a proxy
+        // page or a hiccup than an account emptied on purpose, and pruning
+        // against it would drop every cached calendar and event.
+        assert_eq!(
+            calendars_to_keep(&[], &hrefs(&["/dav/me/personal/"]), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_broken_neighbor_collection_is_reported_as_skipped() {
+        let server = spawn_propfind_server(|path| {
+            let path = path.trim_end_matches('/');
+            if path.ends_with("/legacy") {
+                (501, sabre_not_implemented())
+            } else if path.ends_with("/calendars/with-broken") {
+                (
+                    207,
+                    propfind_document(&[
+                        dav_response(
+                            "/dav/calendars/with-broken/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/with-broken/personal/",
+                            "<d:displayname>Personal</d:displayname>\
+                             <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>",
+                        ),
+                        dav_response(
+                            "/dav/calendars/with-broken/legacy/",
+                            "<d:resourcetype><d:collection/></d:resourcetype>",
+                        ),
+                    ]),
+                )
+            } else {
+                (404, format!("no fixture for {path}"))
+            }
+        });
+
+        let mut visited = HashSet::new();
+        let mut skipped = Vec::new();
+        let calendars = calendar_list_walk(
+            &credentials_for(&server.base_url),
+            &format!("{}/dav/calendars/with-broken/", server.base_url),
+            0,
+            &mut visited,
+            &mut skipped,
+        )
+        .unwrap();
+
+        assert_eq!(calendar_names(&calendars), vec!["Personal"]);
+        assert_eq!(skipped, vec!["/dav/calendars/with-broken/legacy/"]);
     }
 
     fn list_calendars_at(server: &PropfindServer, path: &str) -> Vec<RemoteCalendar> {
@@ -3136,6 +3543,98 @@ END:VCALENDAR"#;
         assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
     }
 
+    /// A weekly series whose 9 July occurrence Apple Calendar already moved:
+    /// the override names that occurrence in the series' zone, 09:00 New York.
+    const SERIES_WITH_A_ZONED_OVERRIDE: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260702T090000\r\nDTEND;TZID=America/New_York:20260702T093000\r\nRRULE:FREQ=WEEKLY\r\nORGANIZER:mailto:boss@example.com\r\nATTENDEE;CN=Sam:mailto:sam@example.com\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER:-PT10M\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nRECURRENCE-ID;TZID=America/New_York:20260709T090000\r\nSUMMARY:Old exception\r\nDTSTART;TZID=America/New_York:20260709T100000\r\nDTEND;TZID=America/New_York:20260709T103000\r\nX-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    fn exception_draft() -> EventDraft {
+        let start = Local
+            .with_ymd_and_hms(2026, 7, 9, 15, 0, 0)
+            .single()
+            .unwrap();
+        let mut draft = timed_draft(start, start + chrono::Duration::minutes(30));
+        draft.title = "New exception".to_string();
+        draft
+    }
+
+    #[test]
+    fn an_override_is_found_by_its_instant_whatever_form_names_it() {
+        // The server's expansion names the occurrence in UTC; the stored
+        // override names the same instant in the series' zone. Compared as
+        // text they differ, and the edit used to add a second override.
+        let updated = replace_recurrence_instance(
+            SERIES_WITH_A_ZONED_OVERRIDE,
+            "20260709T130000Z",
+            &exception_draft(),
+        )
+        .unwrap();
+
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2, "{updated}");
+        assert!(!updated.contains("Old exception"));
+        assert!(updated.contains("SUMMARY:New exception"));
+    }
+
+    #[test]
+    fn deleting_an_occurrence_drops_an_override_named_in_another_form() {
+        let updated =
+            exclude_recurrence_instance(SERIES_WITH_A_ZONED_OVERRIDE, "20260709T130000Z").unwrap();
+
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 1, "{updated}");
+        assert!(!updated.contains("Old exception"));
+        assert!(updated.contains("EXDATE"));
+    }
+
+    #[test]
+    fn an_edited_occurrence_keeps_the_guests_and_alarm_of_its_series() {
+        // An override does not inherit from the master: what it does not
+        // carry, that occurrence does not have.
+        let updated = replace_recurrence_instance(
+            SERIES_WITH_A_ZONED_OVERRIDE,
+            "TZID=America/New_York:20260716T090000",
+            &exception_draft(),
+        )
+        .unwrap();
+
+        assert_eq!(updated.matches("BEGIN:VEVENT").count(), 3, "{updated}");
+        assert_eq!(updated.matches("ATTENDEE;CN=Sam").count(), 2, "{updated}");
+        assert_eq!(updated.matches("ORGANIZER:").count(), 2, "{updated}");
+        assert_eq!(updated.matches("BEGIN:VALARM").count(), 2, "{updated}");
+        // The alarm's own description survives; the rule is the series' alone.
+        assert_eq!(
+            updated.matches("DESCRIPTION:Reminder").count(),
+            2,
+            "{updated}"
+        );
+        assert_eq!(updated.matches("RRULE").count(), 1, "{updated}");
+        assert!(
+            updated.contains("RECURRENCE-ID;TZID=America/New_York:20260716T090000\r\n"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn re_editing_an_override_keeps_what_the_override_already_carried() {
+        let updated = replace_recurrence_instance(
+            SERIES_WITH_A_ZONED_OVERRIDE,
+            "TZID=America/New_York:20260709T090000",
+            &exception_draft(),
+        )
+        .unwrap();
+
+        assert!(
+            updated.contains("X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC"),
+            "{updated}"
+        );
+        assert!(updated.contains("SUMMARY:New exception"));
+        assert!(!updated.contains("Old exception"));
+        assert_eq!(
+            updated
+                .matches("RECURRENCE-ID;TZID=America/New_York:20260709T090000")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn replacing_recurrence_instance_replaces_an_existing_tzid_exception() {
         let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260709T090000\r\nDTEND;TZID=America/New_York:20260709T093000\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:weekly-standup\r\nRECURRENCE-ID;TZID=America/New_York:20260709T090000\r\nSUMMARY:Old exception\r\nDTSTART;TZID=America/New_York:20260709T100000\r\nDTEND;TZID=America/New_York:20260709T103000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -3201,6 +3700,21 @@ END:VCALENDAR"#;
         let lines = recurrence_exception_lines("uid", "20260709", &draft);
 
         assert!(lines.contains(&"RECURRENCE-ID;VALUE=DATE:20260709".to_string()));
+    }
+
+    #[test]
+    fn a_duration_too_long_to_be_a_calendar_event_is_unreadable_not_a_panic() {
+        // These overflow chrono's arithmetic. A feed is public input, and a
+        // panic here takes the whole account's sync down on every pass.
+        for value in [
+            "P99999999D",
+            "PT9999999999999999S",
+            "P9999999999999W",
+            "-P99999999D",
+        ] {
+            assert!(parse_ics_duration(value).is_none(), "{value}");
+        }
+        assert!(parse_ics_duration("P52W").is_some());
     }
 
     #[test]
@@ -3333,6 +3847,36 @@ END:VCALENDAR"#;
         assert!(updated.contains("SUMMARY:Moved one"));
         assert!(updated.contains("DTSTART;TZID=America/New_York:20260708T100000"));
         assert_eq!(updated.matches("BEGIN:VEVENT").count(), 2);
+    }
+
+    #[test]
+    fn moving_all_events_takes_the_excluded_dates_and_the_end_of_the_rule_along() {
+        // Left behind, the EXDATEs no longer name an occurrence, so the dates
+        // that were deleted come back; and an UNTIL an hour short of the new
+        // start drops the last occurrence.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART;TZID=America/New_York:20260701T090000\r\nDTEND;TZID=America/New_York:20260701T093000\r\nRRULE:FREQ=WEEKLY;UNTIL=20260729T130000Z;BYDAY=WE\r\nEXDATE;TZID=America/New_York:20260708T090000,20260715T090000\r\nEXDATE:20260722T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = edit_master_series(ics, shift_of_hours(1), &series_draft("Standup")).unwrap();
+
+        assert!(
+            updated.contains("EXDATE;TZID=America/New_York:20260708T100000,20260715T100000\r\n"),
+            "{updated}"
+        );
+        assert!(updated.contains("EXDATE:20260722T140000Z\r\n"), "{updated}");
+        assert!(
+            updated.contains("RRULE:FREQ=WEEKLY;UNTIL=20260729T140000Z;BYDAY=WE\r\n"),
+            "{updated}"
+        );
+    }
+
+    #[test]
+    fn an_all_events_edit_that_moves_nothing_leaves_the_rule_and_exclusions_alone() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:s\r\nSUMMARY:Standup\r\nDTSTART:20260701T130000Z\r\nDTEND:20260701T133000Z\r\nRRULE:FREQ=WEEKLY;UNTIL=20260729\r\nEXDATE:20260708T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let updated = edit_master_series(ics, shift_of_hours(0), &series_draft("Renamed")).unwrap();
+
+        assert!(updated.contains("RRULE:FREQ=WEEKLY;UNTIL=20260729\r\n"));
+        assert!(updated.contains("EXDATE:20260708T130000Z\r\n"));
     }
 
     #[test]

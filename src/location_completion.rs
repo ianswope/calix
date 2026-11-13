@@ -52,6 +52,9 @@ struct Completion {
     /// Set while a suggestion is being written into the entry, so the change it
     /// causes doesn't start a fresh search for the text just accepted.
     accepting: Cell<bool>,
+    /// Whether the keyboard focus is in the field, which is what tells typing
+    /// from the dialog filling the field in.
+    focused: Cell<bool>,
     /// What the list currently holds, in the order shown.
     shown: RefCell<Vec<String>>,
 }
@@ -85,6 +88,7 @@ pub fn attach(row: &adw::EntryRow, store: Rc<Store>) {
         endpoint,
         generation: Cell::new(0),
         accepting: Cell::new(false),
+        focused: Cell::new(false),
         shown: RefCell::new(Vec::new()),
     });
 
@@ -100,10 +104,13 @@ pub fn attach(row: &adw::EntryRow, store: Rc<Store>) {
         move |_, row| completion.accept(row.index())
     ));
 
+    // A change while the field has the focus is the user typing. One without
+    // it is the dialog filling the field in from the event being opened, and
+    // that text is not sent anywhere.
     row.connect_changed(clone!(
         #[strong]
         completion,
-        move |_| completion.text_changed()
+        move |_| completion.text_changed(completion.focused.get())
     ));
 
     // Focus is what dismisses the list: moving to another field, or out of the
@@ -113,12 +120,20 @@ pub fn attach(row: &adw::EntryRow, store: Rc<Store>) {
     focus.connect_leave(clone!(
         #[strong]
         completion,
-        move |_| completion.dismiss()
+        move |_| {
+            completion.focused.set(false);
+            completion.dismiss();
+        }
     ));
+    // Arriving in the field offers what this calendar already knows. Nothing
+    // has been typed yet, so nothing is asked of the geocoder.
     focus.connect_enter(clone!(
         #[strong]
         completion,
-        move |_| completion.text_changed()
+        move |_| {
+            completion.focused.set(true);
+            completion.text_changed(false);
+        }
     ));
     row.add_controller(focus);
 
@@ -141,7 +156,7 @@ pub fn attach(row: &adw::EntryRow, store: Rc<Store>) {
 impl Completion {
     /// A keystroke landed in the field: answer from what this calendar already
     /// knows straight away, and start the clock on asking the geocoder.
-    fn text_changed(self: &Rc<Self>) {
+    fn text_changed(self: &Rc<Self>, typed: bool) {
         let Some(row) = self.row.upgrade() else {
             return;
         };
@@ -165,7 +180,7 @@ impl Completion {
         let Some(endpoint) = self.endpoint.clone() else {
             return;
         };
-        if !places::should_search(&query) {
+        if !places::may_send(&query, typed) {
             return;
         }
         glib::timeout_add_local_once(
