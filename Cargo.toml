@@ -20,6 +20,7 @@ adw = { version = "0.9.2", package = "libadwaita", features = ["v1_5"], optional
 gtk = { version = "0.11.4", package = "gtk4", features = ["v4_14"], optional = true }
 chrono = "0.4"
 chrono-tz = "0.10"
+iana-time-zone = "0.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"

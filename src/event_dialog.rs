@@ -813,7 +813,7 @@ pub(crate) fn build(
         // What deleting one ordinary row takes away. A local series builds its
         // own entry at click time: this draft is one occurrence, and its id is
         // the master's, so recording it would undo the wrong row.
-        let deleted = undo::Change::deleted(event.calendar_id, event.draft());
+        let deleted = undo::Change::deleted(event.calendar_id, event.draft()).formerly(event.id);
         let event_for_delete = event.clone();
         let delete_button = gtk::Button::builder()
             .label("Delete Event")
@@ -893,6 +893,7 @@ pub(crate) fn build(
                                 Ok(()) => {
                                     on_change(undo::Record::Event(
                                         undo::Change::deleted(master.calendar_id, master.draft())
+                                            .formerly(master.id)
                                             .with_overrides(overrides),
                                     ));
                                     on_saved(Saved::Cached);
@@ -1001,11 +1002,21 @@ pub(crate) fn build(
         error_label,
         move |_| {
             let all_day = all_day_row.is_active();
-            let Some(start) = parse_datetime(&start_row.text(), all_day) else {
+            // Only an event that was all-day (or timed) when it was opened
+            // filled these fields in from its own start and end.
+            let shown = editing.as_ref().filter(|event| event.all_day == all_day);
+            let Some(start) = parse_datetime_in(
+                &Local,
+                &start_row.text(),
+                all_day,
+                shown.map(|event| &event.start),
+            ) else {
                 error_label.set_label(&invalid_date_message(all_day));
                 return;
             };
-            let Some(end) = parse_datetime(&end_row.text(), all_day) else {
+            let Some(end) =
+                parse_datetime_in(&Local, &end_row.text(), all_day, shown.map(|event| &event.end))
+            else {
                 error_label.set_label(&invalid_date_message(all_day));
                 return;
             };
@@ -1034,6 +1045,10 @@ pub(crate) fn build(
             } else {
                 Frequency::from_picker_index(repeat_row.selected())
             };
+            if recurrence.is_some_and(|rule| rule.ends_before(start.date_naive())) {
+                error_label.set_label("The repeat ends before the event starts");
+                return;
+            }
             let mut reminders = alert_buttons.iter().filter(|(_, button)| button.is_active()).map(|(minutes, _)| *minutes);
             let draft = EventDraft {
                 title,
@@ -1346,7 +1361,30 @@ fn invalid_date_message(all_day: bool) -> String {
 }
 
 fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {
+    parse_datetime_in(&Local, text, all_day, None)
+}
+
+/// Reads a date or date-time field in `tz`. `shown` is the instant the field
+/// was filled in from, when it was: a field still showing that text means that
+/// instant, which matters in the hour the clocks repeat — 01:30 happens twice
+/// that night, and an untouched event must not hop to the other one.
+fn parse_datetime_in<Tz: TimeZone>(
+    tz: &Tz,
+    text: &str,
+    all_day: bool,
+    shown: Option<&DateTime<Tz>>,
+) -> Option<DateTime<Tz>> {
     let text = text.trim();
+    let format = if all_day {
+        DATE_FORMAT
+    } else {
+        DATETIME_FORMAT
+    };
+    if let Some(shown) = shown
+        && shown.naive_local().format(format).to_string() == text
+    {
+        return Some(shown.clone());
+    }
     let naive = if all_day {
         NaiveDate::parse_from_str(text, DATE_FORMAT)
             .ok()
@@ -1354,7 +1392,7 @@ fn parse_datetime(text: &str, all_day: bool) -> Option<DateTime<Local>> {
     } else {
         NaiveDateTime::parse_from_str(text, DATETIME_FORMAT).ok()
     }?;
-    naive.and_local_timezone(Local).single()
+    Some(crate::date_util::resolve_forward(tz, naive))
 }
 
 /// The dialog's notes field: a caption over a multi-line text box that grows
@@ -1904,6 +1942,35 @@ mod tests {
             }
             other => panic!("expected the event id as the series id, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_time_the_clocks_skipped_or_repeated_is_still_a_time() {
+        let zone = chrono_tz::America::New_York;
+        // 02:30 on the spring-forward night does not exist; it is read with
+        // the offset before the gap, the instant that shows as 03:30.
+        let skipped = parse_datetime_in(&zone, "2026-03-08 02:30", false, None).unwrap();
+        assert_eq!(skipped.to_utc().to_rfc3339(), "2026-03-08T07:30:00+00:00");
+        // 01:30 on the fall-back night happens twice; typed fresh, the first.
+        let repeated = parse_datetime_in(&zone, "2026-11-01 01:30", false, None).unwrap();
+        assert_eq!(repeated.to_utc().to_rfc3339(), "2026-11-01T05:30:00+00:00");
+    }
+
+    #[test]
+    fn an_untouched_field_keeps_the_instant_it_was_filled_in_from() {
+        let zone = chrono_tz::America::New_York;
+        // The second 01:30 of the fall-back night.
+        let second = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 1, 6, 30, 0)
+            .unwrap()
+            .with_timezone(&zone);
+
+        let kept = parse_datetime_in(&zone, "2026-11-01 01:30", false, Some(&second)).unwrap();
+        assert_eq!(kept, second);
+
+        // Retyped to another time, the old instant has no say.
+        let moved = parse_datetime_in(&zone, "2026-11-01 09:00", false, Some(&second)).unwrap();
+        assert_eq!(moved.to_utc().to_rfc3339(), "2026-11-01T14:00:00+00:00");
     }
 
     #[test]

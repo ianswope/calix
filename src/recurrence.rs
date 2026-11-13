@@ -206,6 +206,7 @@ impl CustomRule {
             until: None,
         };
         let mut seen_freq = false;
+        let mut week_start = "MO";
         let mut seen = std::collections::HashSet::new();
         for part in text.split(';') {
             let (key, value) = part.split_once('=')?;
@@ -231,6 +232,12 @@ impl CustomRule {
                     rule.count = Some(count);
                 }
                 "UNTIL" => rule.until = Some(parse_until_date(value)?),
+                "WKST" => {
+                    if !["MO", "TU", "WE", "TH", "FR", "SA", "SU"].contains(&value) {
+                        return None;
+                    }
+                    week_start = value;
+                }
                 "BYDAY" => {
                     if value.is_empty() {
                         return None;
@@ -262,7 +269,15 @@ impl CustomRule {
                 _ => return None,
             }
         }
+        // Where the week starts only decides anything when weeks are skipped
+        // and a week holds several days of the rule. Weeks here are counted
+        // from Monday, so any other start is declined in exactly that case.
+        let week_start_matters = rule.frequency == CustomFreq::Weekly
+            && rule.interval > 1
+            && rule.weekdays != 0
+            && week_start != "MO";
         if !seen_freq
+            || week_start_matters
             || (rule.count.is_some() && rule.until.is_some())
             || (rule.ordinal != 0 && rule.frequency != CustomFreq::Monthly)
             || (rule.frequency == CustomFreq::Yearly && rule.weekdays != 0)
@@ -409,12 +424,24 @@ impl CustomRule {
     }
 }
 
+/// The last day a rule runs. A bare date is that day. A date-time — the form
+/// RFC 5545 requires on a timed event — is the day its instant falls on here,
+/// which is exact for the usual "start of the last occurrence" and can admit
+/// one occurrence too many when the stamp is a UTC end-of-day.
 fn parse_until_date(value: &str) -> Option<NaiveDate> {
-    let date = value.get(..8).filter(|text| text.len() == 8)?;
-    if value.len() != 8 {
-        return None;
+    if value.len() == 8 {
+        return NaiveDate::parse_from_str(value, "%Y%m%d").ok();
     }
-    NaiveDate::parse_from_str(date, "%Y%m%d").ok()
+    let (stamp, utc) = match value.strip_suffix('Z') {
+        Some(stamp) => (stamp, true),
+        None => (value, false),
+    };
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S").ok()?;
+    Some(if utc {
+        naive.and_utc().with_timezone(&chrono::Local).date_naive()
+    } else {
+        naive.date()
+    })
 }
 
 fn week_from_month_end(date: NaiveDate) -> Option<i64> {
@@ -524,6 +551,16 @@ impl Frequency {
             Frequency::Custom(rule) => return rule.to_rrule(),
         };
         format!("FREQ={freq}")
+    }
+
+    /// Whether the rule stops before `start`, the day its event begins. Such
+    /// a rule has no occurrence at all: the event would be saved and then
+    /// appear nowhere.
+    pub fn ends_before(self, start: NaiveDate) -> bool {
+        match self {
+            Frequency::Custom(rule) => rule.until.is_some_and(|until| until < start),
+            _ => false,
+        }
     }
 
     /// The `RRULE` value to send a provider. A timed event's `UNTIL` has to be
@@ -960,6 +997,61 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn a_date_time_until_is_read_as_the_day_it_falls_on() {
+        // RFC 5545 requires this form for a timed event, and it is what
+        // Google and Outlook feeds carry. Refusing it showed such a series as
+        // its first occurrence only.
+        let by_date = Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20261231");
+        assert!(by_date.is_some());
+        assert_eq!(
+            Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20261231T235959"),
+            by_date
+        );
+        // Noon UTC is still the 31st everywhere a calendar is likely to run.
+        assert_eq!(
+            Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20261231T120000Z"),
+            by_date
+        );
+        assert_eq!(Frequency::from_rrule("FREQ=WEEKLY;UNTIL=20261231T25"), None);
+        assert_eq!(Frequency::from_rrule("FREQ=WEEKLY;UNTIL=2026-12-31"), None);
+    }
+
+    #[test]
+    fn a_week_start_that_cannot_change_the_dates_is_accepted() {
+        assert_eq!(
+            Frequency::from_rrule("FREQ=WEEKLY;BYDAY=MO,WE;WKST=SU"),
+            Frequency::from_rrule("FREQ=WEEKLY;BYDAY=MO,WE")
+        );
+        assert_eq!(
+            Frequency::from_rrule("FREQ=MONTHLY;INTERVAL=2;WKST=SU"),
+            Frequency::from_rrule("FREQ=MONTHLY;INTERVAL=2")
+        );
+        // Monday is the week start the expansion already uses.
+        assert!(Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;WKST=MO").is_some());
+    }
+
+    #[test]
+    fn a_week_start_that_would_move_the_dates_is_still_declined() {
+        // Every other week on several days: which days share a week depends
+        // on where the week starts, and Calix counts weeks from Monday.
+        assert_eq!(
+            Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;BYDAY=SU,MO;WKST=SU"),
+            None
+        );
+        assert_eq!(Frequency::from_rrule("FREQ=WEEKLY;WKST=XX"), None);
+    }
+
+    #[test]
+    fn a_rule_that_stops_before_its_event_starts_has_no_occurrences() {
+        let until_july =
+            Frequency::from_rrule("FREQ=WEEKLY;INTERVAL=2;UNTIL=20260731").expect("custom rule");
+        assert!(until_july.ends_before(d(2026, 8, 1)));
+        // The last day still counts.
+        assert!(!until_july.ends_before(d(2026, 7, 31)));
+        assert!(!Frequency::Weekly.ends_before(d(2026, 8, 1)));
     }
 
     #[test]

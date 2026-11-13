@@ -121,6 +121,22 @@ pub fn fallback_name(url: &str) -> String {
         .unwrap_or_else(|| "Subscribed calendar".to_string())
 }
 
+/// Reads a body of at most `max` bytes. The limit is enforced while reading,
+/// not afterwards: a feed that never ends would otherwise be held in memory
+/// in full before anyone looked at how big it was.
+fn read_capped(body: impl std::io::Read, max: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    // One byte past the limit is enough to know the body is over it.
+    body.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("couldn't download the calendar: {error}"))?;
+    if bytes.len() > max {
+        return Err("that calendar is larger than Calix will download".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Downloads `url` and returns the body. The caller checks that it is a calendar.
 pub fn fetch_document(url: &str) -> Result<String, String> {
     let response = crate::http::client()?
@@ -132,13 +148,8 @@ pub fn fetch_document(url: &str) -> Result<String, String> {
     if !status.is_success() {
         return Err(format!("the calendar link answered {status}"));
     }
-    let bytes = response
-        .bytes()
-        .map_err(|error| format!("couldn't download the calendar: {error}"))?;
     const MAX_FEED_BYTES: usize = 16 * 1024 * 1024;
-    if bytes.len() > MAX_FEED_BYTES {
-        return Err("that calendar is larger than Calix will download".to_string());
-    }
+    let bytes = read_capped(response, MAX_FEED_BYTES)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -159,9 +170,10 @@ pub fn parse_document(url: &str, ics: &str) -> Result<SubscribedDocument, String
 }
 
 fn is_calendar_document(ics: &str) -> bool {
-    caldav::unfold_ics(ics)
+    // Some servers lead with a byte-order mark or leave a space on the line.
+    caldav::unfold_ics(ics.trim_start_matches('\u{feff}'))
         .iter()
-        .any(|line| line.eq_ignore_ascii_case("BEGIN:VCALENDAR"))
+        .any(|line| line.trim().eq_ignore_ascii_case("BEGIN:VCALENDAR"))
 }
 
 fn calendar_metadata(ics: &str) -> (Option<String>, Option<String>) {
@@ -606,6 +618,7 @@ pub fn apply_document(
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use std::io::Read;
 
     fn window(start: NaiveDate, end: NaiveDate) -> (DateTime<Local>, DateTime<Local>) {
         (store::day_start(start), store::day_start(end))
@@ -625,6 +638,31 @@ mod tests {
             .join("\r\n");
         body.push_str("\r\n");
         body
+    }
+
+    #[test]
+    fn a_feed_that_opens_with_a_byte_order_mark_is_still_a_calendar() {
+        assert!(is_calendar_document(
+            "\u{feff}BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+        ));
+        assert!(is_calendar_document(
+            "BEGIN:VCALENDAR \r\nEND:VCALENDAR\r\n"
+        ));
+        assert!(!is_calendar_document("<html>BEGIN:VCALENDAR</html>"));
+    }
+
+    #[test]
+    fn a_feed_larger_than_the_limit_is_refused_without_reading_it_all() {
+        // Well past the limit, but finite: before the fix this is read whole.
+        let oversized = std::io::repeat(b'x').take(64 * 1024);
+        assert!(read_capped(oversized, 1024).is_err());
+        // An endless body has to stop too, which only reading with a limit does.
+        assert!(read_capped(std::io::repeat(b'x'), 1024).is_err());
+    }
+
+    #[test]
+    fn a_feed_within_the_limit_is_read_whole() {
+        assert_eq!(read_capped(&b"BEGIN:VCALENDAR"[..], 15).unwrap().len(), 15);
     }
 
     #[test]

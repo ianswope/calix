@@ -3,7 +3,7 @@ use crate::locale;
 use crate::store::Event;
 use crate::views::{
     EditFn, EventSelection, MoveFn, PageActions, Slot, SlotGrain, add_slot_menu,
-    drag::{BlockPlacement, TimedGrid, parse_drag_payload},
+    drag::{BlockPlacement, TimedGrid, drop_start_day, parse_drag_payload},
     event_occurs_on_day, event_widget, smooth_scroll,
 };
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, Timelike};
@@ -393,7 +393,7 @@ fn all_day_row(
                 .iter()
                 .filter(|event| event.all_day && event_occurs_on_day(event, *day))
             {
-                let chip = event_widget::compact_event_button(event, "event-chip", 14);
+                let chip = event_widget::compact_event_button(event, *day, "event-chip", 14);
                 chip.add_css_class("all-day-event");
                 chip.set_halign(gtk::Align::Fill);
                 chip.set_hexpand(true);
@@ -730,11 +730,12 @@ fn add_drop_target(
         let Ok(event_id) = value.get::<String>() else {
             return false;
         };
-        let Some((kind, event_id, source_day)) = parse_drag_payload(&event_id) else {
+        let Some((kind, event_id, source_day, grab_offset)) = parse_drag_payload(&event_id) else {
             return false;
         };
         let time = hour_height.and_then(|hour_height| time_for_y(y, hour_height));
-        on_move(kind, event_id, date, time, source_day);
+        let start_day = drop_start_day(date, grab_offset, time.is_some());
+        on_move(kind, event_id, start_day, time, source_day);
         true
     });
     widget.add_controller(drop);
@@ -817,7 +818,11 @@ fn timed_event_layouts(day: NaiveDate, events: &[Event]) -> Vec<TimedEventLayout
             } else {
                 hour_fraction(event.end)
             };
-            (end_hour > start_hour).then_some(TimedEventLayout {
+            // An event that ends the moment it starts has no height, but it
+            // is still an event on the day it starts — unlike one that merely
+            // ended at this day's midnight, which has nothing left to show.
+            let instant_today = end_hour == start_hour && event.start.date_naive() == day;
+            (end_hour > start_hour || instant_today).then_some(TimedEventLayout {
                 event,
                 start_hour,
                 end_hour,
@@ -966,6 +971,30 @@ mod tests {
             original_start: None,
             cancelled: false,
         }
+    }
+
+    #[test]
+    fn an_event_that_ends_the_moment_it_starts_still_gets_a_block() {
+        // A reminder-style event from a provider: start and end are the same
+        // instant. Month view shows it; the hour grid has to as well, or it
+        // can't be clicked there.
+        let day = NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let events = vec![event(1, 9, 9)];
+
+        let layouts = timed_event_layouts(day, &events);
+
+        assert_eq!(layouts.len(), 1);
+        assert_eq!(layouts[0].start_hour, 9.0);
+    }
+
+    #[test]
+    fn an_event_that_ended_at_midnight_does_not_spill_into_the_next_day() {
+        let events = [event(1, 22, 23)];
+        let mut overnight = events[0].clone();
+        overnight.end = overnight.start + chrono::Duration::hours(2);
+        let next_day = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+
+        assert!(timed_event_layouts(next_day, &[overnight]).is_empty());
     }
 
     #[test]

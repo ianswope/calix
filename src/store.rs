@@ -254,6 +254,22 @@ impl Store {
         Ok(result)
     }
 
+    /// Runs a local write that takes several statements as one: all of it
+    /// lands or none of it does. Inside a transaction already under way it
+    /// simply joins that one.
+    fn atomic<T>(&self, write: impl FnOnce() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+        if !self.conn.is_autocommit() {
+            return write();
+        }
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let result = write()?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn open() -> rusqlite::Result<Self> {
         Self::open_at(&data_file_path())
     }
@@ -279,6 +295,12 @@ impl Store {
     /// widget's refresh timer — once a minute, against the same file a running
     /// Calix has open — so it must never be the thing that migrates the schema
     /// or takes a write lock behind the app's back.
+    /// Whether there is a database on disk at all, as opposed to one that
+    /// cannot be opened right now.
+    pub fn database_exists() -> bool {
+        data_file_path().exists()
+    }
+
     pub fn open_read_only() -> rusqlite::Result<Self> {
         Self::open_read_only_at(&data_file_path())
     }
@@ -971,6 +993,10 @@ impl Store {
     }
 
     pub fn update_event(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
+        self.atomic(|| self.update_event_rows(id, draft))
+    }
+
+    fn update_event_rows(&self, id: i64, draft: &EventDraft) -> rusqlite::Result<()> {
         let previous = self.event_by_id(id)?;
         self.conn.execute(
             "UPDATE events SET title = ?1, start_at = ?2, end_at = ?3, all_day = ?4,
@@ -1102,10 +1128,21 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(&format!("{EVENT_SELECT} WHERE events.series_event_id = ?1"))?;
-        let overrides = stmt
+        let mut overrides = stmt
             .query_map(params![previous.id], row_to_event)?
-            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?;
-        for event in overrides.into_iter().flatten() {
+            .collect::<rusqlite::Result<Vec<Option<Event>>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // No two exceptions of a series may claim the same occurrence, and the
+        // rows move one at a time. Leading with the one furthest along in the
+        // direction of travel means each lands on a slot already vacated.
+        overrides.sort_by_key(|event| event.original_start);
+        let later = day_delta > 0 || (day_delta == 0 && clock_delta > Duration::zero());
+        if later {
+            overrides.reverse();
+        }
+        for event in overrides {
             let mut override_draft = event.draft();
             override_draft.start = shift_wall(override_draft.start, day_delta, clock_delta);
             override_draft.end = shift_wall(override_draft.end, day_delta, clock_delta);
@@ -1151,11 +1188,13 @@ impl Store {
     pub fn delete_event(&self, id: i64) -> rusqlite::Result<()> {
         // Exceptions point at the series. Drop them with it, or deleting the
         // series would leave those dates behind as ordinary events.
-        self.conn
-            .execute("DELETE FROM events WHERE series_event_id = ?1", params![id])?;
-        self.conn
-            .execute("DELETE FROM events WHERE id = ?1", params![id])?;
-        Ok(())
+        self.atomic(|| {
+            self.conn
+                .execute("DELETE FROM events WHERE series_event_id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM events WHERE id = ?1", params![id])?;
+            Ok(())
+        })
     }
 
     /// Creates or updates a Google-sourced event by its Google event id.
@@ -3085,6 +3124,121 @@ mod tests {
         let master = store.event_by_id(id).unwrap().unwrap();
         assert_eq!(master.location.as_deref(), Some("Room 2"));
         assert_eq!(master.recurrence, Some(Frequency::Weekly));
+    }
+
+    /// A weekly series whose second and third weeks are each renamed.
+    fn standup_with_two_neighbouring_exceptions(store: &Store, first: i64, second: i64) -> i64 {
+        let (id, base) = weekly_standup(store);
+        for week in [first, second] {
+            let at = base + Duration::weeks(week);
+            let special = draft(&format!("Special {week}"), at, at + Duration::hours(1));
+            store.save_occurrence(id, at, &special).unwrap();
+        }
+        id
+    }
+
+    fn july_titles(store: &Store) -> Vec<(NaiveDate, String)> {
+        titles_between(
+            store,
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 24).unwrap(),
+        )
+    }
+
+    fn july(day: u32, title: &str) -> (NaiveDate, String) {
+        (
+            NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
+            title.to_string(),
+        )
+    }
+
+    #[test]
+    fn moving_a_series_onto_its_next_exception_takes_both_exceptions_along() {
+        // The exceptions sit a week apart and the series moves a week later,
+        // so the first one lands exactly where the second one was.
+        let store = Store::open_in_memory().unwrap();
+        let id = standup_with_two_neighbouring_exceptions(&store, 1, 2);
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let mut moved = master.draft();
+        moved.start = master.start + Duration::weeks(1);
+        moved.end = master.end + Duration::weeks(1);
+
+        store.update_event(id, &moved).unwrap();
+
+        assert_eq!(
+            july_titles(&store),
+            vec![
+                july(9, "Standup"),
+                july(16, "Special 1"),
+                july(23, "Special 2")
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_a_series_back_onto_an_earlier_exception_takes_both_along() {
+        // Same collision from the other side: the later exception was written
+        // first, so it is the first row the shift reaches.
+        let store = Store::open_in_memory().unwrap();
+        let id = standup_with_two_neighbouring_exceptions(&store, 3, 2);
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let mut moved = master.draft();
+        moved.start = master.start - Duration::weeks(1);
+        moved.end = master.end - Duration::weeks(1);
+
+        store.update_event(id, &moved).unwrap();
+
+        assert_eq!(
+            july_titles(&store),
+            vec![
+                july(2, "Standup"),
+                july(9, "Special 2"),
+                july(16, "Special 3"),
+                july(23, "Standup")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_series_move_that_cannot_shift_its_exceptions_moves_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let id = standup_with_two_neighbouring_exceptions(&store, 1, 2);
+        let before = july_titles(&store);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_exceptions BEFORE UPDATE ON events
+                 WHEN OLD.series_event_id IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        let master = store.event_by_id(id).unwrap().unwrap();
+        let mut moved = master.draft();
+        moved.start = master.start + Duration::days(1);
+        moved.end = master.end + Duration::days(1);
+
+        assert!(store.update_event(id, &moved).is_err());
+
+        assert_eq!(july_titles(&store), before);
+    }
+
+    #[test]
+    fn a_series_delete_that_fails_keeps_its_exceptions() {
+        let store = Store::open_in_memory().unwrap();
+        let id = standup_with_two_neighbouring_exceptions(&store, 1, 2);
+        let before = july_titles(&store);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_series BEFORE DELETE ON events
+                 WHEN OLD.recurrence IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+
+        assert!(store.delete_event(id).is_err());
+
+        assert_eq!(july_titles(&store), before);
     }
 
     #[test]

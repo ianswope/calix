@@ -63,6 +63,36 @@ enum KeyCommand {
 /// controller sits on the window, so an unmodified letter reaching it would be
 /// a letter the user was typing into an event title. Requiring a modifier is
 /// what keeps a global shortcut from eating text entry.
+/// The command a key press means for the grid. A dialog on screen takes all of
+/// them: it sits inside the window, so a chord its focused widget doesn't
+/// claim bubbles up here, and Ctrl+X on a switch would otherwise delete the
+/// event behind the dialog.
+fn grid_command(key: gdk::Key, state: gdk::ModifierType, dialog_open: bool) -> Option<KeyCommand> {
+    if dialog_open {
+        return None;
+    }
+    key_command(key, state)
+}
+
+/// The selected event as the store holds it now. The selection is taken at
+/// click time and outlives edits, drags and syncs, so what goes on the
+/// clipboard — and into the undo record of a cut — is read fresh. `None`
+/// means the row is gone.
+fn current_selection(snapshot: &Event, stored: Option<Event>) -> Option<Event> {
+    let stored = stored?;
+    // A local series is one row drawn many times. The row says what the event
+    // is; the click says which day of it was meant.
+    if stored.recurrence.is_some() {
+        let length = stored.end - stored.start;
+        return Some(Event {
+            start: snapshot.start,
+            end: snapshot.start + length,
+            ..stored
+        });
+    }
+    Some(stored)
+}
+
 fn key_command(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyCommand> {
     // Escape is the one binding that takes no modifier. It can afford to:
     // nothing on the grid is a text field, and an Escape meant for a popover,
@@ -718,6 +748,14 @@ struct Ui {
     // lands. Without this a second Ctrl+Z during that window would try the same
     // change again and double-write it.
     history_busy: Rc<Cell<bool>>,
+    // Set once a date has been asked for from outside (`calix <date>`), so the
+    // first draw of a background session doesn't put it back on today.
+    date_requested: Cell<bool>,
+    // The header's Day toggle. A view change has to go through the toggle so
+    // the header and the zoom controls follow it; the year page's day pick is
+    // the one view change that starts away from the header. Empty until the
+    // header is built.
+    day_toggle: glib::WeakRef<gtk::ToggleButton>,
     // The event whose inspector was opened last, and the one Ctrl+C put on the
     // clipboard. Neither can live on a widget: every change rebuilds the grid,
     // so a selection marked on a chip is gone by the next redraw. The clipboard
@@ -765,7 +803,7 @@ impl HistoryStep {
 
 impl Ui {
     fn toast(&self, message: &str) {
-        self.toast_overlay.add_toast(adw::Toast::new(message));
+        self.toast_overlay.add_toast(plain_toast(message));
     }
 
     /// Takes back the last change the user made, or puts it back again.
@@ -778,6 +816,7 @@ impl Ui {
         if self.history_busy.get() {
             return;
         }
+        self.history.borrow_mut().hold();
         let change = {
             let history = self.history.borrow();
             match step {
@@ -894,6 +933,9 @@ impl Ui {
             .into_iter()
             .find(|choice| choice.target.calendar_id() == calendar_id)
         else {
+            // The calendar is gone for good, so this change can never be
+            // applied. Dropped, so the ones behind it can still be reached.
+            self.discard(step);
             self.toast("That event's calendar is no longer available");
             return;
         };
@@ -1061,11 +1103,32 @@ impl Ui {
 
     /// Puts the event whose inspector was opened last on the clipboard.
     fn copy_selected_event(self: &Rc<Self>) {
-        let Some(event) = self.selected_event.borrow().clone() else {
-            self.toast("Click an event first, then Ctrl+C to copy it");
-            return;
+        if let Some(event) = self.selection("Click an event first, then Ctrl+C to copy it") {
+            self.copy_event(event);
+        }
+    }
+
+    /// The selected event, read back from the store. Says why when there is
+    /// none: `nothing_selected` if nothing was clicked, and its own message if
+    /// the event that was clicked has since been deleted.
+    fn selection(self: &Rc<Self>, nothing_selected: &str) -> Option<Event> {
+        let Some(snapshot) = self.selected_event.borrow().clone() else {
+            self.toast(nothing_selected);
+            return None;
         };
-        self.copy_event(event);
+        let stored = match self.store.event_by_id(snapshot.id) {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.toast(&format!("Couldn't read that event: {error}"));
+                return None;
+            }
+        };
+        let current = current_selection(&snapshot, stored);
+        if current.is_none() {
+            self.clear_selection();
+            self.toast("That event is no longer there");
+        }
+        current
     }
 
     fn copy_event(&self, event: Event) {
@@ -1077,8 +1140,7 @@ impl Ui {
     /// Cuts the selected event: the copy goes on the clipboard, then the event
     /// is deleted the same way the dialog deletes it.
     fn cut_selected_event(self: &Rc<Self>) {
-        let Some(event) = self.selected_event.borrow().clone() else {
-            self.toast("Click an event first, then Ctrl+X to cut it");
+        let Some(event) = self.selection("Click an event first, then Ctrl+X to cut it") else {
             return;
         };
         let remote = remote_event_handler(self, &event);
@@ -1102,7 +1164,7 @@ impl Ui {
             self.store.clone(),
             remote,
             event.id,
-            undo::Change::deleted(event.calendar_id, event.draft()),
+            undo::Change::deleted(event.calendar_id, event.draft()).formerly(event.id),
             Rc::new(move |change| ui_for_change.record(change)),
             // A cut takes the one event that was selected, never a series —
             // `cut_refusal` has already turned those away.
@@ -1831,8 +1893,16 @@ impl Ui {
                             return;
                         };
                         ui.state.borrow_mut().current_date = picked;
-                        set_view_mode(&ui, ViewMode::Day);
-                        ui.reset();
+                        // Through the header's toggle, so the header and the
+                        // zoom controls change with the grid. Its handler
+                        // sets the mode and redraws.
+                        match ui.day_toggle.upgrade() {
+                            Some(day_toggle) => day_toggle.set_active(true),
+                            None => {
+                                set_view_mode(&ui, ViewMode::Day);
+                                ui.reset();
+                            }
+                        }
                     }),
                 )
             }
@@ -1955,6 +2025,23 @@ fn session_keeps_running() -> bool {
     BACKGROUND_SESSION.with(Cell::get) || autostart::enabled()
 }
 
+/// The day a window opens on once it can first draw. A session built without
+/// a date re-reads the clock, since it may have been built long before it was
+/// shown — unless a date has been asked for in the meantime, which is what
+/// the first `calix <date>` to a background session is.
+fn startup_date(
+    built_for: Option<NaiveDate>,
+    asked_since: bool,
+    current: NaiveDate,
+    today: NaiveDate,
+) -> NaiveDate {
+    if built_for.is_none() && !asked_since {
+        today
+    } else {
+        current
+    }
+}
+
 /// Shows Calix on `date`, or wherever it already was when no date was asked
 /// for. Every activation lands here: the first builds the window, and a second
 /// `calix` invocation moves the one on screen instead of opening another.
@@ -1964,6 +2051,7 @@ pub fn open(app: &adw::Application, date: Option<NaiveDate>) {
         SessionAction::Reuse => {
             let ui = live.expect("Reuse requires a live session");
             if let Some(date) = date {
+                ui.date_requested.set(true);
                 ui.state.borrow_mut().current_date = date;
                 ui.reset();
             }
@@ -2047,6 +2135,8 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         refresh_accounts_button: refresh_accounts_button.clone(),
         history: Rc::new(RefCell::new(undo::History::default())),
         history_busy: Rc::new(Cell::new(false)),
+        date_requested: Cell::new(false),
+        day_toggle: glib::WeakRef::new(),
         selected_event: Rc::new(RefCell::new(None)),
         clipboard: Rc::new(RefCell::new(None)),
         slots: SlotSelection::default(),
@@ -2132,6 +2222,7 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         .group(&year_toggle)
         .active(initial_view_mode == ViewMode::Day)
         .build();
+    ui.day_toggle.set(Some(&day_toggle));
     year_toggle.set_tooltip_text(Some("Year view (Ctrl+1)"));
     month_toggle.set_tooltip_text(Some("Month view (Ctrl+2)"));
     week_toggle.set_tooltip_text(Some("Week view (Ctrl+3)"));
@@ -2167,7 +2258,9 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     let search_button = gtk::Button::from_icon_name("system-search-symbolic");
     search_button.set_tooltip_text(Some("Search events (Ctrl+F)"));
     search_button.connect_clicked(clone!(
-        #[strong]
+        // Weak: the button lives under the window `Ui` owns, so a strong
+        // capture here is a cycle that keeps the whole window alive.
+        #[weak]
         ui,
         move |button| {
             let ui_for_pick = ui.clone();
@@ -2189,7 +2282,9 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     let new_event_button = gtk::Button::from_icon_name("list-add-symbolic");
     new_event_button.set_tooltip_text(Some("New Event (Ctrl+N)"));
     new_event_button.connect_clicked(clone!(
-        #[strong]
+        // Weak: the button lives under the window `Ui` owns, so a strong
+        // capture here is a cycle that keeps the whole window alive.
+        #[weak]
         ui,
         move |_| {
             let start = next_half_hour();
@@ -2216,7 +2311,9 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
     connect_account_button.add_css_class("suggested-action");
     connect_account_button.set_hexpand(true);
     connect_account_button.connect_clicked(clone!(
-        #[strong]
+        // Weak: the button lives under the window `Ui` owns, so a strong
+        // capture here is a cycle that keeps the whole window alive.
+        #[weak]
         ui,
         move |_| open_account_chooser(&ui, false)
     ));
@@ -2231,7 +2328,9 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         .build();
     manage_accounts_button.set_tooltip_text(Some("View and remove connected accounts"));
     manage_accounts_button.connect_clicked(clone!(
-        #[strong]
+        // Weak: the button lives under the window `Ui` owns, so a strong
+        // capture here is a cycle that keeps the whole window alive.
+        #[weak]
         ui,
         move |_| open_manage_accounts_dialog(&ui)
     ));
@@ -2416,8 +2515,12 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
         week_toggle,
         #[strong]
         day_toggle,
-        move |_, key, _, state| {
-            let Some(command) = key_command(key, state) else {
+        move |controller, key, _, state| {
+            let dialog_open = controller
+                .widget()
+                .and_downcast::<adw::ApplicationWindow>()
+                .is_some_and(|window| window.visible_dialog().is_some());
+            let Some(command) = grid_command(key, state, dialog_open) else {
                 return glib::Propagation::Proceed;
             };
             match command {
@@ -2546,9 +2649,13 @@ fn build(app: &adw::Application, date: Option<NaiveDate>, show_window: bool) {
             // was built with: a window realizing slowly (or a machine waking
             // into a new day) should still open on today. A date asked for on
             // the command line is left alone — it was asked for.
-            if date.is_none() {
-                ui.state.borrow_mut().current_date = Local::now().date_naive();
-            }
+            let current = ui.state.borrow().current_date;
+            ui.state.borrow_mut().current_date = startup_date(
+                date,
+                ui.date_requested.get(),
+                current,
+                Local::now().date_naive(),
+            );
             // Installed before the rebuild so the settle loop can find it.
             // If something supersedes this rebuild before it lands, the
             // replacement inherits the pending action and connects instead —
@@ -2911,6 +3018,8 @@ fn wire_a_ui_and_drop_it() -> std::rc::Weak<Ui> {
         refresh_accounts_button: refresh_accounts_button.clone(),
         history: Rc::new(RefCell::new(undo::History::default())),
         history_busy: Rc::new(Cell::new(false)),
+        date_requested: Cell::new(false),
+        day_toggle: glib::WeakRef::new(),
         selected_event: Rc::new(RefCell::new(None)),
         clipboard: Rc::new(RefCell::new(None)),
         slots: SlotSelection::default(),
@@ -3403,15 +3512,19 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
             };
             if subscription::is_read_only(occurrence.account_provider.as_deref()) {
                 ui.toast_overlay
-                    .add_toast(adw::Toast::new(subscription::READ_ONLY));
+                    .add_toast(plain_toast(subscription::READ_ONLY));
                 return;
             }
             let Some(draft) = drag_draft(&occurrence, kind, target_date, target_time) else {
-                ui.toast_overlay.add_toast(adw::Toast::new(
-                    "Resize needs a timed slot in week or day view",
-                ));
+                ui.toast_overlay
+                    .add_toast(plain_toast("Resize needs a timed slot in week or day view"));
                 return;
             };
+            // Dropped where it was picked up: nothing to write, nothing to
+            // push to the provider, nothing to undo.
+            if draft == occurrence.draft() {
+                return;
+            }
             // A local series is one row. The draft describes the grabbed
             // occurrence; the stored master has to move by the same delta, or
             // the series would be replanted on the day that was dragged.
@@ -3421,7 +3534,7 @@ fn move_handler(ui: &Rc<Ui>, events: Vec<Event>) -> MoveFn {
                     Ok(Some(master)) => master,
                     _ => {
                         ui.toast_overlay
-                            .add_toast(adw::Toast::new("Couldn't load the repeating event"));
+                            .add_toast(plain_toast("Couldn't load the repeating event"));
                         return;
                     }
                 };
@@ -3466,7 +3579,7 @@ fn apply_occurrence_drag(ui: &Rc<Ui>, occurrence: Event, draft: EventDraft) {
     let (Some(master_id), Some(original)) = (occurrence.instance_of, occurrence.original_start)
     else {
         ui.toast_overlay
-            .add_toast(adw::Toast::new("Couldn't tell which occurrence this is"));
+            .add_toast(plain_toast("Couldn't tell which occurrence this is"));
         return;
     };
     match ui.store.save_occurrence(master_id, original, &draft) {
@@ -3479,7 +3592,7 @@ fn apply_occurrence_drag(ui: &Rc<Ui>, occurrence: Event, draft: EventDraft) {
         }
         Err(error) => {
             ui.toast_overlay
-                .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+                .add_toast(plain_toast(&format!("Couldn't move event: {error}")));
         }
     }
 }
@@ -3488,11 +3601,11 @@ fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
     let original = event.draft();
     match remote_event_handler(ui, &event) {
         Some(event_dialog::RemoteEvent::Unavailable(error)) => {
-            ui.toast_overlay.add_toast(adw::Toast::new(&error));
+            ui.toast_overlay.add_toast(plain_toast(&error));
         }
         Some(remote_event) => {
             if let Err(error) = ui.store.update_event(event.id, &draft) {
-                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                ui.toast_overlay.add_toast(plain_toast(&format!(
                     "Couldn't move event locally: {error}"
                 )));
                 return;
@@ -3523,16 +3636,15 @@ fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
                         }
                         Ok(Err(error)) => {
                             undo_failed_drag(&ui, event.id, &draft, &original);
-                            ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                                "Couldn't move event: {error}"
-                            )));
+                            ui.toast_overlay
+                                .add_toast(plain_toast(&format!("Couldn't move event: {error}")));
                             glib::ControlFlow::Break
                         }
                         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
                         Err(mpsc::TryRecvError::Disconnected) => {
                             undo_failed_drag(&ui, event.id, &draft, &original);
                             ui.toast_overlay
-                                .add_toast(adw::Toast::new("Event move stopped unexpectedly"));
+                                .add_toast(plain_toast("Event move stopped unexpectedly"));
                             glib::ControlFlow::Break
                         }
                     }
@@ -3542,7 +3654,7 @@ fn apply_drag(ui: &Rc<Ui>, event: Event, draft: EventDraft) {
         None => {
             if let Err(error) = ui.store.update_event(event.id, &draft) {
                 ui.toast_overlay
-                    .add_toast(adw::Toast::new(&format!("Couldn't move event: {error}")));
+                    .add_toast(plain_toast(&format!("Couldn't move event: {error}")));
             } else {
                 ui.record(undo::Record::Event(undo::Change::edited(
                     event.calendar_id,
@@ -3676,11 +3788,12 @@ fn moved_draft(
             ..event.draft()
         };
     }
-    let start = target_date
-        .and_time(target_time.unwrap_or_else(|| event.start.time()))
-        .and_local_timezone(Local)
-        .single()
-        .unwrap_or(event.start);
+    // A slot the clocks skip or repeat is still a slot: resolved forward, as
+    // everywhere else, rather than refused and the event left where it was.
+    let start = resolve_forward(
+        &Local,
+        target_date.and_time(target_time.unwrap_or_else(|| event.start.time())),
+    );
     // An all-day span is a count of calendar days, not elapsed hours: a DST
     // transition inside the original span would otherwise pull the moved end
     // off midnight and corrupt the exclusive end date.
@@ -3688,11 +3801,7 @@ fn moved_draft(
         let span_days = (event.end.date_naive() - event.start.date_naive())
             .num_days()
             .max(1);
-        (start.date_naive() + ChronoDuration::days(span_days))
-            .and_time(NaiveTime::MIN)
-            .and_local_timezone(Local)
-            .single()
-            .unwrap_or(start + (event.end - event.start))
+        local_day_start(start.date_naive() + ChronoDuration::days(span_days))
     } else {
         start + (event.end - event.start)
     };
@@ -3730,7 +3839,7 @@ fn paste_target(selected: Option<Slot>, anchored: NaiveDate) -> Slot {
 /// have. A local series shares one row across every occurrence drawn, and a
 /// synced instance stands for a rule on the server.
 fn cut_refusal(event: &Event, series_instance: bool) -> Option<&'static str> {
-    if event.recurrence.is_some() || series_instance {
+    if event.recurrence.is_some() || event.instance_of.is_some() || series_instance {
         return Some("Cut isn't available for a repeating event — open it to delete the series");
     }
     None
@@ -3768,10 +3877,7 @@ fn resized_start_draft(
         return None;
     }
     let target_time = target_time?;
-    let new_start = target_date
-        .and_time(target_time)
-        .and_local_timezone(Local)
-        .single()?;
+    let new_start = resolve_forward(&Local, target_date.and_time(target_time));
     // Matches the interactive resize's 15-minute floor (drag::MIN_BLOCK_MINUTES)
     // so a committed resize never snaps away from its preview.
     let latest_start = event.end - ChronoDuration::minutes(15);
@@ -3802,10 +3908,7 @@ fn resized_end_draft(
         return None;
     }
     let target_time = target_time?;
-    let new_end = target_date
-        .and_time(target_time)
-        .and_local_timezone(Local)
-        .single()?;
+    let new_end = resolve_forward(&Local, target_date.and_time(target_time));
     let earliest_end = event.start + ChronoDuration::minutes(15);
     let end = new_end.max(earliest_end);
     Some(EventDraft {
@@ -3847,6 +3950,18 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }
 
+/// A toast's title is Pango markup, and what goes into one here is event
+/// titles, calendar names and provider error bodies — none of it ours. Left
+/// raw, "Q&A" renders as a blank toast and a title from a shared calendar can
+/// draw a link. Every toast is built through this.
+fn toast_markup(message: &str) -> String {
+    glib::markup_escape_text(first_line(message)).to_string()
+}
+
+fn plain_toast(message: &str) -> adw::Toast {
+    adw::Toast::new(&toast_markup(message))
+}
+
 /// Toast text for a completed Add. The account is stored before its first sync
 /// runs, so a sync failure reports as an added account whose calendars are
 /// still empty — not as a failed connection.
@@ -3864,7 +3979,7 @@ fn add_summary(outcome: &Result<SyncOutcome, String>, display_name: &str, noun: 
 /// to the Accounts dialog, where Update sign-in lives; a toast that faded after
 /// five seconds while nobody was at the machine told them nothing.
 fn announce_sync(ui: &Rc<Ui>, message: &str, needs_the_user: bool) {
-    let toast = adw::Toast::new(&glib::markup_escape_text(message));
+    let toast = plain_toast(message);
     if needs_the_user {
         toast.set_timeout(0);
         toast.set_button_label(Some("Accounts"));
@@ -3913,7 +4028,7 @@ struct GoogleAddResult {
 /// create a second account instead of updating the one the user picked.
 fn add_google_account(ui: &Rc<Ui>, expected_account: Option<String>) {
     let Some(google_config) = ui.config.borrow().google.clone() else {
-        ui.toast_overlay.add_toast(adw::Toast::new(
+        ui.toast_overlay.add_toast(plain_toast(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
         ));
         return;
@@ -3923,14 +4038,13 @@ fn add_google_account(ui: &Rc<Ui>, expected_account: Option<String>) {
     // own, so the guard and the toast are the only things telling the user a
     // sign-in is already under way.
     if !ui.activity.start_sign_in() {
-        ui.toast_overlay.add_toast(adw::Toast::new(
+        ui.toast_overlay.add_toast(plain_toast(
             "A Google sign-in is already open in your browser",
         ));
         return;
     }
-    ui.toast_overlay.add_toast(adw::Toast::new(
-        "Opening your browser to sign in to Google…",
-    ));
+    ui.toast_overlay
+        .add_toast(plain_toast("Opening your browser to sign in to Google…"));
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -3989,8 +4103,7 @@ fn add_google_account(ui: &Rc<Ui>, expected_account: Option<String>) {
                     }
                 };
                 ui.activity.finish_sign_in();
-                ui.toast_overlay
-                    .add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                ui.toast_overlay.add_toast(plain_toast(&message));
                 glib::ControlFlow::Break
             }
         ),
@@ -4430,7 +4543,7 @@ fn open_manage_accounts_dialog(ui: &Rc<Ui>) {
                 // asked for. Show that answer, which is also the previous
                 // position when nothing was saved.
                 row.set_active(crate::autostart::enabled());
-                ui.toast_overlay.add_toast(adw::Toast::new(&format!(
+                ui.toast_overlay.add_toast(plain_toast(&format!(
                     "Could not update background startup: {error}"
                 )));
             }
@@ -4658,7 +4771,7 @@ fn retry_account_provider(ui: &Rc<Ui>, account: &store::Account) {
         "icloud" => sync_icloud_accounts(ui, false),
         "caldav" => sync_caldav_accounts(ui, false),
         "webcal" => sync_webcal_accounts(ui, false),
-        _ => ui.toast_overlay.add_toast(adw::Toast::new(
+        _ => ui.toast_overlay.add_toast(plain_toast(
             "This account type cannot be refreshed by this version of Calix",
         )),
     }
@@ -4676,7 +4789,7 @@ fn update_account_credentials(ui: &Rc<Ui>, account: &store::Account) {
                 Some(&account.provider_account_id),
             );
         }
-        _ => ui.toast_overlay.add_toast(adw::Toast::new(
+        _ => ui.toast_overlay.add_toast(plain_toast(
             "This account type cannot be updated by this version of Calix",
         )),
     }
@@ -4709,10 +4822,8 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
                 }
                 match disconnect_account(&ui.store, &account) {
                     Ok(()) => {
-                        ui.toast_overlay.add_toast(adw::Toast::new(&format!(
-                            "Removed {}",
-                            account.display_name
-                        )));
+                        ui.toast_overlay
+                            .add_toast(plain_toast(&format!("Removed {}", account.display_name)));
                         ui.reset_calendar_sidebar();
                         ui.reset_keeping_scroll();
                         parent.close();
@@ -4722,8 +4833,7 @@ fn confirm_disconnect_account(ui: &Rc<Ui>, parent: &adw::Dialog, account: &store
                         // avoid retaining stale sync controls in this callback.
                     }
                     Err(error) => {
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&error)));
+                        ui.toast_overlay.add_toast(plain_toast(&error));
                     }
                 }
             }
@@ -4949,12 +5059,11 @@ fn add_icloud_account(
                 };
                 match rx.try_recv() {
                     Ok(Ok(result)) => {
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
-                                &result.outcome,
-                                &result.display_name,
-                                "iCloud calendar",
-                            ))));
+                        ui.toast_overlay.add_toast(plain_toast(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "iCloud calendar",
+                        )));
                         restore();
                         dialog.close();
                         ui.reset_calendar_sidebar();
@@ -5000,7 +5109,7 @@ fn sync_connected_accounts_with_reporting(ui: &Rc<Ui>) {
         .all_accounts()
         .is_ok_and(|accounts| accounts.is_empty())
     {
-        ui.toast_overlay.add_toast(adw::Toast::new(
+        ui.toast_overlay.add_toast(plain_toast(
             "Connect an account before refreshing online calendars",
         ));
         return;
@@ -5065,8 +5174,7 @@ where
                     Err(mpsc::TryRecvError::Disconnected) => {
                         let message = provider.sync_failed("it stopped unexpectedly");
                         eprintln!("calix: {message}");
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&message)));
+                        ui.toast_overlay.add_toast(plain_toast(&message));
                         ui.activity.finish_sync(provider);
                         update_refresh_affordance(&ui);
                         return glib::ControlFlow::Break;
@@ -5124,7 +5232,7 @@ where
 
 fn sync_google_accounts(ui: &Rc<Ui>, quiet: bool) {
     let Some(google_config) = ui.config.borrow().google.clone() else {
-        ui.toast_overlay.add_toast(adw::Toast::new(
+        ui.toast_overlay.add_toast(plain_toast(
             "Add a Google OAuth client to ~/.config/calix/config.toml first — see the README",
         ));
         return;
@@ -5425,12 +5533,11 @@ fn add_caldav_account(
                 };
                 match rx.try_recv() {
                     Ok(Ok(result)) => {
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
-                                &result.outcome,
-                                &result.display_name,
-                                "calendar",
-                            ))));
+                        ui.toast_overlay.add_toast(plain_toast(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "calendar",
+                        )));
                         restore();
                         dialog.close();
                         ui.reset_calendar_sidebar();
@@ -5660,12 +5767,11 @@ fn add_subscription(
                 };
                 match rx.try_recv() {
                     Ok(Ok(result)) => {
-                        ui.toast_overlay
-                            .add_toast(adw::Toast::new(&glib::markup_escape_text(&add_summary(
-                                &result.outcome,
-                                &result.display_name,
-                                "calendar",
-                            ))));
+                        ui.toast_overlay.add_toast(plain_toast(&add_summary(
+                            &result.outcome,
+                            &result.display_name,
+                            "calendar",
+                        )));
                         restore();
                         dialog.close();
                         ui.reset_calendar_sidebar();
@@ -6106,6 +6212,135 @@ mod tests {
             .with_ymd_and_hms(year, month, day, hour, 0, 0)
             .single()
             .expect("unambiguous local time")
+    }
+
+    #[test]
+    fn a_dialog_on_screen_takes_every_shortcut_away_from_the_grid() {
+        for key in [gdk::Key::x, gdk::Key::z, gdk::Key::v, gdk::Key::n] {
+            assert!(grid_command(key, CTRL, false).is_some());
+            assert_eq!(grid_command(key, CTRL, true), None);
+        }
+        assert_eq!(grid_command(gdk::Key::Escape, NONE, true), None);
+    }
+
+    #[test]
+    fn a_selection_is_read_back_as_the_store_holds_it_now() {
+        let clicked = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 10), false);
+        let mut edited = test_event(local_at(2026, 7, 9, 14), local_at(2026, 7, 9, 15), false);
+        edited.title = "Renamed".to_string();
+
+        let current = current_selection(&clicked, Some(edited.clone())).unwrap();
+
+        assert_eq!(current.title, "Renamed");
+        assert_eq!(current.start, edited.start);
+    }
+
+    #[test]
+    fn a_selection_whose_row_is_gone_is_no_selection() {
+        let clicked = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 10), false);
+
+        assert!(current_selection(&clicked, None).is_none());
+    }
+
+    #[test]
+    fn a_selected_occurrence_of_a_local_series_keeps_its_own_day() {
+        // A local series is one row; the row's start is the first occurrence.
+        let mut clicked = test_event(local_at(2026, 7, 16, 9), local_at(2026, 7, 16, 10), false);
+        clicked.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        let mut master = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 11), false);
+        master.recurrence = Some(crate::recurrence::Frequency::Weekly);
+        master.title = "Renamed".to_string();
+
+        let current = current_selection(&clicked, Some(master)).unwrap();
+
+        assert_eq!(current.title, "Renamed");
+        assert_eq!(current.start, clicked.start);
+        assert_eq!(current.end, local_at(2026, 7, 16, 11));
+    }
+
+    #[test]
+    fn a_moved_occurrence_of_a_local_series_cannot_be_cut() {
+        // Deleting an exception row puts the occurrence back on its original
+        // slot — the opposite of a cut. The dialog writes a tombstone instead.
+        let mut exception = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 10), false);
+        exception.instance_of = Some(7);
+
+        assert!(cut_refusal(&exception, false).is_some());
+    }
+
+    #[test]
+    fn toast_text_is_shown_as_written_not_read_as_markup() {
+        assert_eq!(
+            toast_markup("Copied \u{201c}Q&A <a href=\"x\">here</a>\u{201d}"),
+            "Copied \u{201c}Q&amp;A &lt;a href=&quot;x&quot;&gt;here&lt;/a&gt;\u{201d}"
+        );
+    }
+
+    #[test]
+    fn a_toast_shows_only_the_first_line_of_a_provider_error() {
+        assert_eq!(
+            toast_markup("Couldn't move event: Google API error (404)\n<!DOCTYPE html>\n<html>"),
+            "Couldn&apos;t move event: Google API error (404)"
+        );
+    }
+
+    /// A half-hour slot this machine's clock skips in 2026, if its zone has
+    /// one. Zones without daylight saving have none, and the tests that need
+    /// one have nothing to check there.
+    fn skipped_local_slot() -> Option<(NaiveDate, NaiveTime)> {
+        let mut day = NaiveDate::from_ymd_opt(2026, 1, 1)?;
+        while chrono::Datelike::year(&day) == 2026 {
+            for half_hour in 0..48 {
+                let time = NaiveTime::from_hms_opt(half_hour / 2, (half_hour % 2) * 30, 0)?;
+                if matches!(
+                    Local.from_local_datetime(&day.and_time(time)),
+                    chrono::LocalResult::None
+                ) {
+                    return Some((day, time));
+                }
+            }
+            day = day.succ_opt()?;
+        }
+        None
+    }
+
+    #[test]
+    fn a_drop_or_resize_onto_a_time_the_clocks_skip_still_lands() {
+        let Some((day, time)) = skipped_local_slot() else {
+            return;
+        };
+        let event = test_event(local_at(2026, 7, 9, 9), local_at(2026, 7, 9, 10), false);
+
+        let moved = moved_draft(&event, day, Some(time));
+        assert_eq!(
+            moved.start.date_naive(),
+            day,
+            "the event stayed where it was"
+        );
+        assert_eq!(moved.end - moved.start, ChronoDuration::hours(1));
+
+        let noon = resolve_forward(&Local, day.and_hms_opt(12, 0, 0).unwrap());
+        let later = test_event(noon, noon + ChronoDuration::hours(1), false);
+        assert!(resized_start_draft(&later, day, Some(time)).is_some());
+        let dawn = resolve_forward(&Local, day.and_hms_opt(0, 0, 0).unwrap());
+        let earlier = test_event(dawn, dawn + ChronoDuration::minutes(30), false);
+        assert!(resized_end_draft(&earlier, day, Some(time)).is_some());
+    }
+
+    #[test]
+    fn a_date_asked_of_a_background_session_survives_its_first_draw() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let christmas = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
+        let built_yesterday = NaiveDate::from_ymd_opt(2026, 11, 8).unwrap();
+        // Autostarted with no date, then `calix 2026-12-25` before any frame.
+        assert_eq!(startup_date(None, true, christmas, today), christmas);
+        // Autostarted and merely shown later: the clock decides.
+        assert_eq!(startup_date(None, false, built_yesterday, today), today);
+        // Launched on a date: that date.
+        assert_eq!(
+            startup_date(Some(christmas), false, christmas, today),
+            christmas
+        );
     }
 
     fn test_event(start: DateTime<Local>, end: DateTime<Local>, all_day: bool) -> Event {

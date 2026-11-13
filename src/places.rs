@@ -33,6 +33,14 @@ pub fn should_search(query: &str) -> bool {
     query.trim().chars().count() >= MIN_QUERY_LEN
 }
 
+/// Whether `query` may leave the machine at all. Only what the user is typing
+/// into the field right now does: a location the dialog filled in from a saved
+/// event — a home address, a meeting link with its password — was never
+/// offered to the geocoder by anyone. A link is not a place either way.
+pub fn may_send(query: &str, typed: bool) -> bool {
+    typed && should_search(query) && !query.contains("://")
+}
+
 /// The geocoder request for `query`, with the typed text encoded rather than
 /// pasted into the URL — a location can hold `&`, `#` or a space, and every one
 /// of those would otherwise change which request gets made.
@@ -202,6 +210,21 @@ mod tests {
                 {{"type":"Feature","geometry":{{"type":"Point","coordinates":[-122.2,37.8]}},
                  "properties":{properties}}}]}}"#
         )
+    }
+
+    #[test]
+    fn only_text_the_user_is_typing_goes_to_the_geocoder() {
+        assert!(may_send("Blue Bottle", true));
+        // Filled in by the dialog from the saved event, or merely focused.
+        assert!(!may_send("12 Home Street, Springfield", false));
+        // Too short is still too short.
+        assert!(!may_send("Bl", true));
+    }
+
+    #[test]
+    fn a_link_is_never_sent_to_the_geocoder() {
+        assert!(!may_send("https://zoom.us/j/123?pwd=secret", true));
+        assert!(!may_send("Call: tel://5551234", true));
     }
 
     #[test]

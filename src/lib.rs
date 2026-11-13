@@ -55,6 +55,14 @@ mod window;
 #[cfg(all(test, feature = "gui"))]
 mod gui_leaks;
 
+/// The command line as text. An argument that is not valid Unicode — a file
+/// path from a launcher, say — is kept with the bad bytes replaced, where
+/// `std::env::args` would panic before anything had started.
+#[cfg(feature = "gui")]
+fn lossy_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    args.map(|arg| arg.to_string_lossy().into_owned()).collect()
+}
+
 /// Runs the GTK application, argv handling and all.
 #[cfg(feature = "gui")]
 pub fn run() -> gtk::glib::ExitCode {
@@ -67,7 +75,8 @@ pub fn run() -> gtk::glib::ExitCode {
     // Handled before GTK sees argv: the installed binary is a copy, so knowing
     // which commit it came from is the only way to tell a stale install from a
     // real bug. `scripts/check-installed.sh` reads this.
-    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+    let args = lossy_args(std::env::args_os());
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("calix {}", build_info::stamp());
         return glib::ExitCode::SUCCESS;
     }
@@ -76,7 +85,7 @@ pub fn run() -> gtk::glib::ExitCode {
     // once it's wrong — a missing palette and a palette that parsed to stock
     // colors look identical. This prints what was actually resolved, without
     // needing a display.
-    if std::env::args().any(|arg| arg == "--print-theme") {
+    if args.iter().any(|arg| arg == "--print-theme") {
         match omarchy::theme_overrides() {
             Some(overrides) => {
                 println!("# resolved Omarchy theme (dark = {})", overrides.dark);
@@ -90,7 +99,6 @@ pub fn run() -> gtk::glib::ExitCode {
     // Both agenda command lines are answered here, before GTK: they exist for
     // a status-bar widget to read on a timer, and reading the day's meetings
     // must never be the thing that opens a window or holds the app alive.
-    let args: Vec<String> = std::env::args().collect();
     if let Some(code) = agenda::handle_cli(&args) {
         return match code {
             0 => glib::ExitCode::SUCCESS,
@@ -208,5 +216,23 @@ mod tests {
     fn a_background_command_line_does_not_present_a_window() {
         assert!(!super::command_line_presents_window(true));
         assert!(super::command_line_presents_window(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_argument_that_is_not_unicode_does_not_stop_the_launch() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![
+            OsString::from("calix"),
+            OsString::from_vec(vec![b'f', 0xff, b'o']),
+            OsString::from("--version"),
+        ];
+
+        let args = super::lossy_args(args.into_iter());
+
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2], "--version");
     }
 }

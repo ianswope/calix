@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Calix recolors when you switch Omarchy themes. It used to keep the palette it started with until it was restarted.
+
 ### Changed
 
 - The Homebrew formula installs the tagged release. `--HEAD` still builds master.
@@ -11,6 +15,20 @@
 
 - Week and day view no longer flash the period you just left when a swipe lands. Moving the offscreen page across clamped the carousel back onto that period for a frame, after the title had already changed. The position is corrected before that frame paints. A sync landing on the week or day you are looking at also no longer rebuilds that page out from under you.
 - A subscribed repeat with an excluded or moved day is kept as a series, so that day stays right past the old sync window. A repeat Calix cannot read, such as a holiday file that names months, stays its first date and the sync is marked incomplete.
+- A CalDAV collection that could not be read no longer takes the cached calendars beneath it with it. A discovery that finds no calendars at all prunes nothing, since it is far more likely a proxy page than an emptied account.
+- Editing or deleting one occurrence of a CalDAV series finds the override already stored for it, even when the server names that occurrence in UTC and the client in the series' zone. The edited occurrence keeps the guests and alarms of its series.
+- Moving all events of a series moves its excluded dates, its end date and its changed occurrences with it. Before, the deleted dates came back and the last occurrence could drop off.
+- A new repeating timed event is anchored to the local time zone, so it keeps its wall-clock time across daylight saving changes.
+- A time in the hour the clocks skip or repeat is read as a real time, and an event opened and saved untouched keeps the instant it had.
+- Undo follows an event that was deleted and put back under a new id, and a change made while an undo or redo waits on the provider is no longer the one it commits.
+- Dragging a multi-day event by a later day's chip moves it by the distance dragged, not from that day.
+- A theme whose `colors.toml` lists both the named hues and the ANSI slots themes Calix again, instead of leaving it on the last palette that parsed.
+- Only a location you are typing is sent to the geocoder. Locations filled in from a saved event, and links, never leave the machine.
+- A subscribed feed over the size limit is refused before it is read in full, a feed that opens with a byte order mark is read, and a duration too long to be an event is marked unreadable instead of crashing the sync.
+- A server URL with a password in it is refused, since it would be stored and shown outside the keyring.
+- A database that is locked or damaged is reported as a failure, not as Calix never having been set up.
+- A command-line argument that is not valid Unicode no longer stops Calix from starting.
+- Uninstalling removes the login entry that background alerts write.
 
 ## 0.9.0 — 2026-10-26
 

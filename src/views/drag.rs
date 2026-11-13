@@ -52,19 +52,47 @@ pub(crate) fn occurrence_payload(kind: DragKind, event_id: i64, day: NaiveDate) 
     )
 }
 
-pub(crate) fn parse_drag_payload(value: &str) -> Option<(DragKind, i64, Option<NaiveDate>)> {
+/// A chip is drawn on every day its event covers, so its payload also says
+/// how many days into the event the grabbed copy sits. Without that, dropping
+/// the Wednesday chip of a Monday–Wednesday event on Thursday would start the
+/// event on Thursday — three days on, for a drag of one.
+pub(crate) fn chip_payload(event_id: i64, start_day: NaiveDate, grabbed_day: NaiveDate) -> String {
+    format!(
+        "{}:{}",
+        occurrence_payload(DragKind::Move, event_id, start_day),
+        (grabbed_day - start_day).num_days()
+    )
+}
+
+/// The day a dropped event starts on. A drop on a day cell keeps the grabbed
+/// chip under the pointer; a drop on a timed slot names its own start.
+pub(crate) fn drop_start_day(cell: NaiveDate, grab_offset: i64, timed_slot: bool) -> NaiveDate {
+    if timed_slot {
+        return cell;
+    }
+    chrono::Duration::try_days(grab_offset)
+        .and_then(|offset| cell.checked_sub_signed(offset))
+        .unwrap_or(cell)
+}
+
+/// The kind, event id, occurrence day and grab offset (in days) of a payload.
+pub(crate) fn parse_drag_payload(value: &str) -> Option<(DragKind, i64, Option<NaiveDate>, i64)> {
     let (kind, rest) = value.split_once(':')?;
     let kind = DragKind::from_prefix(kind)?;
-    let (id_text, day_text) = match rest.split_once(':') {
-        Some((id, day)) => (id, Some(day)),
-        None => (rest, None),
-    };
-    let event_id = id_text.parse().ok()?;
-    let day = match day_text {
+    let mut fields = rest.split(':');
+    let event_id = fields.next()?.parse().ok()?;
+    let day = match fields.next() {
         Some(text) => Some(NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?),
         None => None,
     };
-    Some((kind, event_id, day))
+    let grab_offset = match fields.next() {
+        Some(text) => text.parse().ok()?,
+        None => 0,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((kind, event_id, day, grab_offset))
 }
 
 /// Snap granularity for interactive drag/resize, in minutes.
@@ -891,7 +919,7 @@ mod tests {
             DragKind::ToAllDay,
         ] {
             let payload = drag_payload(kind, 42);
-            assert_eq!(parse_drag_payload(&payload), Some((kind, 42, None)));
+            assert_eq!(parse_drag_payload(&payload), Some((kind, 42, None, 0)));
         }
     }
 
@@ -901,8 +929,33 @@ mod tests {
         let payload = occurrence_payload(DragKind::Move, 42, day);
         assert_eq!(
             parse_drag_payload(&payload),
-            Some((DragKind::Move, 42, Some(day)))
+            Some((DragKind::Move, 42, Some(day), 0))
         );
+    }
+
+    #[test]
+    fn a_chip_payload_says_how_far_into_the_event_it_was_grabbed() {
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let wednesday = NaiveDate::from_ymd_opt(2026, 7, 8).unwrap();
+        assert_eq!(
+            parse_drag_payload(&chip_payload(42, monday, wednesday)),
+            Some((DragKind::Move, 42, Some(monday), 2))
+        );
+        // A week that opens mid-event draws a chip before nothing, but a
+        // malformed offset is still refused rather than read as zero.
+        assert!(parse_drag_payload("move:42:2026-07-06:two").is_none());
+        assert!(parse_drag_payload("move:42:2026-07-06:2:extra").is_none());
+    }
+
+    #[test]
+    fn a_day_drop_keeps_the_grabbed_chip_under_the_pointer() {
+        let thursday = NaiveDate::from_ymd_opt(2026, 7, 9).unwrap();
+        let tuesday = NaiveDate::from_ymd_opt(2026, 7, 7).unwrap();
+        // The Wednesday chip of a Monday–Wednesday event, dropped on Thursday:
+        // the event moves one day, so it now starts on Tuesday.
+        assert_eq!(drop_start_day(thursday, 2, false), tuesday);
+        // On a timed slot the event becomes an hour at that slot.
+        assert_eq!(drop_start_day(thursday, 2, true), thursday);
     }
 
     #[test]

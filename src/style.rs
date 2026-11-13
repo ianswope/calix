@@ -370,20 +370,106 @@ pub fn load() {
     // (theme-priority) color definitions, and force the matching color scheme
     // so symbolic icons and dark-aware widgets line up with the palette. The
     // layout CSS above keeps referencing the same color names either way.
-    if let Some(overrides) = crate::omarchy::theme_overrides() {
-        let color_provider = gtk::CssProvider::new();
-        color_provider.load_from_string(&overrides.css);
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &color_provider,
-            gtk::STYLE_PROVIDER_PRIORITY_USER,
-        );
-        adw::StyleManager::default().set_color_scheme(if overrides.dark {
-            adw::ColorScheme::ForceDark
-        } else {
-            adw::ColorScheme::ForceLight
-        });
+    // The provider stays for the life of the process: a later theme switch
+    // loads new CSS into it rather than stacking another provider on top.
+    let color_provider = gtk::CssProvider::new();
+    let applied = std::rc::Rc::new(std::cell::RefCell::new(None));
+    apply_theme(&color_provider, &applied);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &color_provider,
+        gtk::STYLE_PROVIDER_PRIORITY_USER,
+    );
+    watch_theme_switches(color_provider, applied);
+}
+
+/// Colors last painted from an Omarchy palette. `None` is stock Adwaita.
+struct PaintedTheme {
+    css: String,
+    dark: bool,
+}
+
+fn apply_theme(provider: &gtk::CssProvider, painted: &std::cell::RefCell<Option<PaintedTheme>>) {
+    let next = crate::omarchy::theme_overrides().map(|overrides| PaintedTheme {
+        css: overrides.css,
+        dark: overrides.dark,
+    });
+    let unchanged = match (painted.borrow().as_ref(), next.as_ref()) {
+        (Some(prev), Some(next)) => prev.css == next.css && prev.dark == next.dark,
+        (None, None) => true,
+        _ => false,
+    };
+    if unchanged {
+        return;
     }
+    match &next {
+        Some(theme) => {
+            provider.load_from_string(&theme.css);
+            adw::StyleManager::default().set_color_scheme(if theme.dark {
+                adw::ColorScheme::ForceDark
+            } else {
+                adw::ColorScheme::ForceLight
+            });
+        }
+        None => {
+            provider.load_from_string("");
+            adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+        }
+    }
+    *painted.borrow_mut() = next;
+}
+
+/// How long a theme switch has to settle before we read `colors.toml`.
+///
+/// `omarchy theme set` deletes the theme directory and moves the new one in,
+/// and a change event can arrive in the gap. The same pause the shell uses.
+const THEME_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+thread_local! {
+    static THEME_MONITORS: std::cell::RefCell<Vec<gtk::gio::FileMonitor>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn watch_theme_switches(
+    provider: gtk::CssProvider,
+    painted: std::rc::Rc<std::cell::RefCell<Option<PaintedTheme>>>,
+) {
+    use gtk::gio::prelude::{FileExt, FileMonitorExt};
+    use gtk::gio::{self, Cancellable, FileMonitorFlags};
+    use gtk::glib;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    // Bumped on every event. A queued reload whose generation is no longer
+    // current belongs to an earlier event in the same switch and does nothing.
+    let generation = Rc::new(Cell::new(0u64));
+    let mut monitors = Vec::new();
+    for dir in
+        crate::omarchy::theme_switch_dirs(&crate::xdg::state_home(), &crate::xdg::config_home())
+    {
+        let Ok(monitor) = gio::File::for_path(&dir)
+            .monitor_directory(FileMonitorFlags::WATCH_MOVES, Cancellable::NONE)
+        else {
+            continue;
+        };
+        let provider = provider.clone();
+        let painted = painted.clone();
+        let generation = generation.clone();
+        monitor.connect_changed(move |_, _, _, _| {
+            let generation_now = generation.get().wrapping_add(1);
+            generation.set(generation_now);
+            let provider = provider.clone();
+            let painted = painted.clone();
+            let generation = generation.clone();
+            glib::timeout_add_local_once(THEME_SETTLE, move || {
+                if generation.get() == generation_now {
+                    apply_theme(&provider, &painted);
+                }
+            });
+        });
+        monitors.push(monitor);
+    }
+    THEME_MONITORS.with(|slot| *slot.borrow_mut() = monitors);
 }
 
 #[cfg(test)]
